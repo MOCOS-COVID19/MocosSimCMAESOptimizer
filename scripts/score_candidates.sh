@@ -50,6 +50,12 @@ echo "[$(date)] candidate=$CAND_DIR"
 echo "[$(date)] Instantiating MocosSimLauncher for this task"
 "$JULIA_BIN" --project="$PROJECT_DIR" -e 'using Pkg; Pkg.instantiate()'
 
+echo "[$(date)] Preparing uv environment for plotting"
+if command -v uv >/dev/null 2>&1; then
+  uv venv .venv >/dev/null 2>&1 || true
+  uv pip install matplotlib numpy h5py >/dev/null 2>&1 || true
+fi
+
 "$JULIA_BIN" --project="$PROJECT_DIR" --threads=4 "$ADVANCED_CLI" "$CFG" \
   --output-daily "$OUT_DAILY" --output-summary "$OUT_SUMMARY"
 

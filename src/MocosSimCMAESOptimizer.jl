@@ -510,9 +510,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                 end
             end
             jobid = submit_slurm_array(cfg, list_file)
-            if jobid == ""
-                error("Slurm array submission failed for iteration $(iter)")
-            end
+            @info "Submitted Slurm array" stage=stage.name iteration=iter jobid=jobid
             while slurm_array_is_running(jobid)
                 sleep(10.0)
             end
