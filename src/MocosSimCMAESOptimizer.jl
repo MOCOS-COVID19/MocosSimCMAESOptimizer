@@ -338,7 +338,7 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
         end
         metrics[metric] = rmse_series(s, g)
     end
-    combined = metrics["daily_detections"] + metrics["daily_hospitalizations"] + metrics["daily_deaths"]
+    combined = 0.2 * metrics["daily_detections"] + 0.05 * metrics["daily_hospitalizations"] + 1.0 * metrics["daily_deaths"]
     return combined, metrics
 end
 
@@ -360,19 +360,16 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
     metrics["daily_detections"] = rm(det, "daily_detections")
     metrics["daily_hospitalizations"] = rm(hosp, "daily_hospitalizations")
     metrics["daily_deaths"] = rm(deaths, "daily_deaths")
-    combined = metrics["daily_detections"] + metrics["daily_hospitalizations"] + metrics["daily_deaths"]
+    combined = 0.2 * metrics["daily_detections"] + 0.05 * metrics["daily_hospitalizations"] + 1.0 * metrics["daily_deaths"]
     return combined, metrics
 end
 
-function wait_for_slurm(jobid::String; poll::Float64=10.0)
-    while true
-        try
-            out = read(`squeue -h -j $jobid`, String)
-            isempty(strip(out)) && break
-        catch
-            break
-        end
-        sleep(poll)
+function slurm_array_is_running(jobid::String)
+    try
+        out = read(`squeue -h -j $jobid`, String)
+        return !isempty(strip(out))
+    catch
+        return false
     end
 end
 
@@ -383,21 +380,12 @@ function submit_slurm_array(cfg::OptimizerConfig, list_file::String)
     n == 0 && return ""
     opts = String[]
     push!(opts, "-c 4")
-    push!(opts, "-t 06:00:00")
-    if haskey(ENV, "SLURM_PARTITION")
-        push!(opts, "-p", ENV["SLURM_PARTITION"])
-    end
-    if haskey(ENV, "SLURM_ACCOUNT")
-        push!(opts, "-A", ENV["SLURM_ACCOUNT"])
-    end
+    push!(opts, "-t 02:00:00")  # adjust if needed
     cmd = `sbatch --parsable $(opts...) --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir)`
-    try
-        out = read(cmd, String)
-        return strip(out)
-    catch err
-        @warn "sbatch submission failed; falling back to local scoring" err
-        return ""
-    end
+    out = read(cmd, String)
+    jobid = strip(out)
+    isempty(jobid) && error("Slurm submission returned empty jobid")
+    return jobid
 end
 
 function build_reference(seed::Dict{String,Any}, days::Int)
@@ -522,7 +510,12 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                 end
             end
             jobid = submit_slurm_array(cfg, list_file)
-            jobid != "" && wait_for_slurm(jobid; poll=10.0)
+            if jobid == ""
+                error("Slurm array submission failed for iteration $(iter)")
+            end
+            while slurm_array_is_running(jobid)
+                sleep(10.0)
+            end
 
             # collect scores from generated output_daily.jld2
             for (ci, cand) in enumerate(candidates)
