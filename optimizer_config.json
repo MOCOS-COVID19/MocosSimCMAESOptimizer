@@ -1,0 +1,45 @@
+{
+  "seed_config": "/Users/marcinbodych/Workspace/saxocov/MocosSimCMAESOptimizer/seed/config2.json",
+  "output_dir": "/Users/marcinbodych/Workspace/saxocov/MocosSimCMAESOptimizer/runs/default",
+  "monthly_days": 30,
+  "stages": [
+    {"name": "stage_01", "fit_months": 3, "max_iterations": 12, "population_size": 12, "sigma": 0.18},
+    {"name": "stage_02", "fit_months": 4, "max_iterations": 10, "population_size": 12, "sigma": 0.12},
+    {"name": "stage_03", "fit_months": 5, "max_iterations": 10, "population_size": 12, "sigma": 0.12}
+  ],
+  "scalar_bounds": {
+    "mild_detection_delay": [1.0, 4.0],
+    "contact_tracing.testing_time": [0.5, 1.0],
+    "contact_tracing.detection_delay": [1.0, 3.0],
+    "transmission_probabilities.age_coupling_param": [0.5, 0.6],
+    "transmission_probabilities.school": [0.05, 0.15],
+    "transmission_probabilities.class": [0.15, 0.3],
+    "initial_conditions.hospitalization_multiplier": [1.0, 3.0],
+    "screening.precision": [0.5, 0.8],
+    "household_params.trace_prob": [0.1, 0.5],
+    "household_params.quarantine_prob": [0.1, 0.5],
+    "mild_detection_prob": [0.2, 0.95],
+    "contact_tracing.probability": [0.005, 0.2]
+  },
+  "temporal_bounds": {
+    "infection_modulation.params.interval_values": [0.2, 1.2],
+    "mild_detection_modulation.params.interval_values": [0.05, 1.2],
+    "tracing_modulation.params.interval_values": [0.05, 1.2]
+  },
+  "objective": {
+    "weights": {
+      "full_daily": 1.0,
+      "recent_daily": 1.5,
+      "cumulative": 0.35,
+      "peak_height": 0.5,
+      "peak_timing": 0.5,
+      "slope": 0.25
+    },
+    "recent_days": 21,
+    "early_reject_multiplier": 2.2
+  },
+  "gt_dir": "./gt",
+  "julia_bin": "/Users/marcinbodych/Workspace/saxocov/julia-1.7.0/bin/julia",
+  "project_dir": "/Users/marcinbodych/Workspace/saxocov/MocosSimLauncher",
+  "advanced_cli": "/Users/marcinbodych/Workspace/saxocov/MocosSimLauncher/advanced_cli.jl"
+}
