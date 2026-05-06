@@ -12,6 +12,9 @@
 
 set -euo pipefail
 
+echo "[INFO] Instantiating MocosSimLauncher environment"
+/home/mbodych/1.7.0-school_class/julia-1.7.0/bin/julia --project=/home/mbodych/1.7.0-school_class/MocosSimLauncher/ -e 'using Pkg; Pkg.instantiate()'
+
 JULIA_BIN="/home/mbodych/1.7.0-school_class/julia-1.7.0/bin/julia"
 REPO="/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer"
 GT_DIR="$REPO/gt"
@@ -19,7 +22,7 @@ GT_DIR="$REPO/gt"
 mkdir -p "$REPO/logs"
 cd "$REPO"
 
-echo "[INFO] Running CMA-ES (per-iteration Slurm arrays handled inside run_optimizer with --slurm)"
-"$JULIA_BIN" --project=. run_optimizer.jl --slurm
+echo "[INFO] Running CMA-ES with srun (no nested sbatch), enabling internal per-iteration arrays"
+srun --cpu-bind=cores "$JULIA_BIN" --project=. run_optimizer.jl --slurm
 
 echo "[INFO] Done"

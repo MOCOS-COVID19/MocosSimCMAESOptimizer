@@ -383,17 +383,21 @@ function submit_slurm_array(cfg::OptimizerConfig, list_file::String)
     n == 0 && return ""
     opts = String[]
     push!(opts, "-c 4")
+    push!(opts, "-t 06:00:00")
     if haskey(ENV, "SLURM_PARTITION")
         push!(opts, "-p", ENV["SLURM_PARTITION"])
     end
     if haskey(ENV, "SLURM_ACCOUNT")
         push!(opts, "-A", ENV["SLURM_ACCOUNT"])
     end
-    cmd = `sbatch -t 06:00:00 $(opts...) --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir)`
-    out = read(cmd, String)
-    m = match(r"Submitted batch job (\\d+)", out)
-    jobid = m === nothing ? "" : m.captures[1]
-    jobid
+    cmd = `sbatch --parsable $(opts...) --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir)`
+    try
+        out = read(cmd, String)
+        return strip(out)
+    catch err
+        @warn "sbatch submission failed; falling back to local scoring" err
+        return ""
+    end
 end
 
 function build_reference(seed::Dict{String,Any}, days::Int)
