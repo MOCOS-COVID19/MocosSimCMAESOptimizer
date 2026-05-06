@@ -305,6 +305,21 @@ function rmse_series(a::Vector{Float64}, b::Vector{Float64})
     return sqrt(sum((a[i] - b[i])^2 for i in 1:n) / n)
 end
 
+function rolling_sum(series::Vector{Float64}, window::Int)
+    length(series) == 0 && return Float64[]
+    w = max(window, 1)
+    out = similar(series)
+    acc = 0.0
+    for i in 1:length(series)
+        acc += series[i]
+        if i > w
+            acc -= series[i - w]
+        end
+        out[i] = acc
+    end
+    return out
+end
+
 function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, days::Int; workdir::String)
     sim_ok, daily_path = run_external_sim(cfg, candidate, days; workdir=workdir)
     sim_ok || return Inf, Dict("sim_failed" => true)
@@ -314,9 +329,14 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
         simvals = read_daily_metric(daily_path, metric)
         if simvals === nothing
             metrics[metric] = Inf
-        else
-            metrics[metric] = rmse_series(Float64.(simvals[1:min(end, days)]), Float64.(gtvals[1:min(end, days)]))
+            continue
         end
+        g = Float64.(gtvals[1:min(end, days)])
+        s = Float64.(simvals[1:min(end, days)])
+        if metric == "daily_hospitalizations"
+            s = rolling_sum(s, 7)  # roll only simulated series
+        end
+        metrics[metric] = rmse_series(s, g)
     end
     combined = metrics["daily_detections"] + metrics["daily_hospitalizations"] + metrics["daily_deaths"]
     return combined, metrics
@@ -330,7 +350,12 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
     deaths = read_daily_metric(daily_path, "daily_deaths")
     function rm(v, gkey)
         v === nothing && return Inf
-        rmse_series(Float64.(v[1:min(end, days)]), Float64.(gt[gkey][1:min(end, days)]))
+        g = Float64.(gt[gkey][1:min(end, days)])
+        s = Float64.(v[1:min(end, days)])
+        if gkey == "daily_hospitalizations"
+            s = rolling_sum(s, 7)  # roll only simulated series
+        end
+        rmse_series(s, g)
     end
     metrics["daily_detections"] = rm(det, "daily_detections")
     metrics["daily_hospitalizations"] = rm(hosp, "daily_hospitalizations")

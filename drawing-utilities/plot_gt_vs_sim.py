@@ -135,7 +135,7 @@ def read_daily_metric(path: str, metric: str):
 
 def plot(gt: Dict[str, np.ndarray], sim: Dict[str, np.ndarray], out_path: Path):
     metrics = [("detections", "Daily Detections", "#2196F3"),
-               ("hospitalizations", "Daily Hospitalizations", "#FF9800"),
+               ("hospitalizations", "7-day Hospitalizations (roll sum)", "#FF9800"),
                ("deaths", "Daily Deaths", "#F44336")]
 
     total_days = max(len(gt[m]) for m, *_ in metrics)
@@ -147,6 +147,8 @@ def plot(gt: Dict[str, np.ndarray], sim: Dict[str, np.ndarray], out_path: Path):
     for ax, (key, title, color) in zip(axes, metrics):
         g = pad(gt[key], total_days)
         s = pad(sim[key], total_days)
+        if key == "hospitalizations":
+            s = np.convolve(s, np.ones(7), "full")[:total_days]
         ax.bar(days, g, color=color, alpha=0.25, width=1.0, label="GT raw")
         ax.plot(days, rolling_avg(g), color=color, lw=2, label="GT 7d avg")
         ax.bar(days, s, color="#607D8B", alpha=0.18, width=1.0, label="Sim raw")
