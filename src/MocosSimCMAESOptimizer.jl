@@ -420,23 +420,38 @@ end
 
 function wait_for_iteration_outputs(list_file::String; poll::Float64=10.0)
     cand_dirs = [strip(x) for x in readlines(list_file) if !isempty(strip(x))]
+    last_done = -1
     while true
-        all_done = true
-        any_failed = false
+        done_count = 0
+        failed_count = 0
+        pending = String[]
         for d in cand_dirs
             done_ok = isfile(joinpath(d, "done.ok"))
             failed_ok = isfile(joinpath(d, "failed.ok"))
-            if failed_ok
-                any_failed = true
-            end
-            if !(done_ok || failed_ok)
-                all_done = false
-                break
+            if done_ok
+                done_count += 1
+            elseif failed_ok
+                failed_count += 1
+            else
+                push!(pending, d)
             end
         end
-        any_failed && error("At least one candidate task failed in iteration list $(list_file)")
-        all_done && return
-        sleep(poll)
+
+        if done_count + failed_count == length(cand_dirs)
+            return
+        end
+
+        if done_count > 0 && done_count == last_done
+            # no new completions for 1 minute -> mark remaining as failed and continue
+            for d in pending
+                failed_ok = joinpath(d, "failed.ok")
+                isfile(failed_ok) || touch(failed_ok)
+            end
+            return
+        end
+
+        last_done = done_count
+        sleep(60.0)
     end
 end
 
