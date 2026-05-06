@@ -423,13 +423,10 @@ function submit_slurm_array(cfg::OptimizerConfig, list_file::String)
     lines = readlines(list_file)
     n = length(lines)
     n == 0 && return ""
-    opts = String[]
-    push!(opts, "-c 4")
-    push!(opts, "-t 02:00:00")  # adjust if needed
-    cmd = `sbatch --parsable $(opts...) --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir)`
+    cmd = `sbatch -c 4 -t 01:00:00 --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir)`
     out = read(cmd, String)
-    jobid = strip(out)
-    isempty(jobid) && error("Slurm submission returned empty jobid")
+    m = match(r"Submitted batch job (\\d+)", out)
+    jobid = m === nothing ? "" : m.captures[1]
     return jobid
 end
 
