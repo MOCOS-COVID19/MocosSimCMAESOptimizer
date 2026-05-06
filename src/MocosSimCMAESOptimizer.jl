@@ -6,6 +6,7 @@ using Random
 using Statistics
 using Dates
 using HDF5
+using Printf
 
 const MANAGER_ROOT = abspath(joinpath(@__DIR__, ".."))
 
@@ -321,6 +322,44 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     return combined, metrics
 end
 
+function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
+    gt = load_gt_series(cfg.external_sim.gt_dir)
+    metrics = Dict{String,Float64}()
+    det = read_daily_metric(daily_path, "daily_detections")
+    hosp = read_daily_metric(daily_path, "daily_hospitalizations")
+    deaths = read_daily_metric(daily_path, "daily_deaths")
+    function rm(v, gkey)
+        v === nothing && return Inf
+        rmse_series(Float64.(v[1:min(end, days)]), Float64.(gt[gkey][1:min(end, days)]))
+    end
+    metrics["daily_detections"] = rm(det, "daily_detections")
+    metrics["daily_hospitalizations"] = rm(hosp, "daily_hospitalizations")
+    metrics["daily_deaths"] = rm(deaths, "daily_deaths")
+    combined = metrics["daily_detections"] + metrics["daily_hospitalizations"] + metrics["daily_deaths"]
+    return combined, metrics
+end
+
+function wait_for_slurm(jobid::String; poll::Float64=10.0)
+    while true
+        try
+            out = read(`squeue -h -j $jobid`, String)
+            isempty(strip(out)) && break
+        catch
+            break
+        end
+        sleep(poll)
+    end
+end
+
+function submit_slurm_array(cfg::OptimizerConfig, list_file::String)
+    simcfg = cfg.external_sim
+    cmd = `sbatch --array=0-$(countlines(list_file)-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir)`
+    out = read(cmd, String)
+    m = match(r"Submitted batch job (\\d+)", out)
+    jobid = m === nothing ? "" : m.captures[1]
+    jobid
+end
+
 function build_reference(seed::Dict{String,Any}, days::Int)
     return synthetic_simulation(seed, days)
 end
@@ -407,7 +446,7 @@ function update_state(state::CMAState, ranked::Vector{Tuple{Float64,Vector{Float
     return CMAState(new_mean, clamp(new_sigma, 0.02, 0.5), new_cov)
 end
 
-function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{ParamSpec}, cfg::OptimizerConfig, stage::StageConfig, state::Union{Nothing,CMAState})
+function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{ParamSpec}, cfg::OptimizerConfig, stage::StageConfig, state::Union{Nothing,CMAState}; use_slurm::Bool=false)
     active_months = stage.fit_months
     days = active_months * cfg.monthly_days
     reference = build_reference(seed, days)
@@ -427,24 +466,72 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
     for iter in 1:stage.max_iterations
         candidates, zs = cma_candidates(rng, state, stage.population_size)
         ranked = Tuple{Float64,Vector{Float64},Vector{Float64}}[]
-        for (ci, cand) in enumerate(candidates)
-            x = clip!(copy(cand), specs)
-            candidate_cfg = vector_to_config(seed, specs, x, active_months)
-            metrics = score_candidate(candidate_cfg, reference, cfg, days; workdir=joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"))
-            score = metrics["score"]
-            push!(history, Dict(
-                "stage" => stage.name,
-                "iteration" => iter,
-                "candidate" => ci,
-                "fit_months" => active_months,
-                "score" => score,
-                "metrics" => metrics,
-            ))
-            push!(ranked, (score, x, zs[ci]))
-            if score < best_score
-                best_score = score
-                best_vector = copy(x)
-                best_candidate = deepcopy(candidate_cfg)
+        # If external sim configured and slurm enabled, dispatch via Slurm array; otherwise score inline
+        if cfg.external_sim !== nothing && use_slurm
+            iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
+            mkpath(iter_root)
+            list_file = joinpath(iter_root, "candidate_list.txt")
+            open(list_file, "w") do io
+                for (ci, cand) in enumerate(candidates)
+                    x = clip!(copy(cand), specs)
+                    candidate_cfg = vector_to_config(seed, specs, x, active_months)
+                    cand_dir = joinpath(iter_root, @sprintf("cand_%02d", ci))
+                    mkpath(cand_dir)
+                    save_json(joinpath(cand_dir, "config.json"), candidate_cfg)
+                    println(io, cand_dir)
+                end
+            end
+            jobid = submit_slurm_array(cfg, list_file)
+            jobid != "" && wait_for_slurm(jobid; poll=10.0)
+
+            # collect scores from generated output_daily.jld2
+            for (ci, cand) in enumerate(candidates)
+                x = clip!(copy(cand), specs)
+                cand_dir = joinpath(iter_root, @sprintf("cand_%02d", ci))
+                daily_path = joinpath(cand_dir, "output_daily.jld2")
+                cand_cfg = vector_to_config(seed, specs, x, active_months)
+                metrics = if isfile(daily_path)
+                    combined, comp = score_from_daily(cfg, daily_path, days)
+                    Dict("score" => combined, "metrics" => comp, "simulated" => "real")
+                else
+                    Dict("score" => Inf, "metrics" => Dict(), "simulated" => "real_missing")
+                end
+                score = metrics["score"]
+                push!(history, Dict(
+                    "stage" => stage.name,
+                    "iteration" => iter,
+                    "candidate" => ci,
+                    "fit_months" => active_months,
+                    "score" => score,
+                    "metrics" => metrics,
+                ))
+                push!(ranked, (score, x, zs[ci]))
+                if score < best_score
+                    best_score = score
+                    best_vector = copy(x)
+                    best_candidate = deepcopy(cand_cfg)
+                end
+            end
+        else
+            for (ci, cand) in enumerate(candidates)
+                x = clip!(copy(cand), specs)
+                candidate_cfg = vector_to_config(seed, specs, x, active_months)
+                metrics = score_candidate(candidate_cfg, reference, cfg, days; workdir=joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"))
+                score = metrics["score"]
+                push!(history, Dict(
+                    "stage" => stage.name,
+                    "iteration" => iter,
+                    "candidate" => ci,
+                    "fit_months" => active_months,
+                    "score" => score,
+                    "metrics" => metrics,
+                ))
+                push!(ranked, (score, x, zs[ci]))
+                if score < best_score
+                    best_score = score
+                    best_vector = copy(x)
+                    best_candidate = deepcopy(candidate_cfg)
+                end
             end
         end
         sort!(ranked, by=first)
@@ -464,7 +551,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
     ), state
 end
 
-function run_optimizer(config_path::String)
+function run_optimizer(config_path::String; use_slurm::Bool=false)
     cfg = load_config(config_path)
     seed = load_json(cfg.seed_config)
     specs = build_specs(seed, cfg)
@@ -476,7 +563,7 @@ function run_optimizer(config_path::String)
     current_seed = deepcopy(seed)
 
     for stage in cfg.stages
-        result, state = run_stage(rng, current_seed, specs, cfg, stage, state)
+        result, state = run_stage(rng, current_seed, specs, cfg, stage, state; use_slurm=use_slurm)
         current_seed = result["best_candidate"]
         push!(stage_outputs, Dict(
             "stage" => result["stage"],
@@ -495,8 +582,10 @@ function run_optimizer(config_path::String)
 end
 
 function main()
-    config_path = length(ARGS) >= 1 ? ARGS[1] : joinpath(dirname(@__DIR__), "optimizer_config.json")
-    result = run_optimizer(config_path)
+    use_slurm = "--slurm" in ARGS
+    config_args = filter(arg -> arg != "--slurm", ARGS)
+    config_path = length(config_args) >= 1 ? config_args[1] : joinpath(dirname(@__DIR__), "optimizer_config.json")
+    result = run_optimizer(config_path; use_slurm=use_slurm)
     println(JSON.json(result))
 end
 

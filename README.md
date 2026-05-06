@@ -37,3 +37,16 @@ julia --project=. tests/smoke_test.jl
 ```
 
 This script runs the optimizer against the default configuration and prints the summary dictionary.
+
+## Running on Slurm
+
+Use the thin wrapper, which enables per-iteration Slurm array dispatch inside `run_optimizer.jl`:
+
+```sh
+sbatch scripts/run_cmaes.slurm
+```
+
+If invoking manually on a Slurm node:
+```sh
+/home/mbodych/1.7.0-school_class/julia-1.7.0/bin/julia --project=. run_optimizer.jl --slurm
+```
