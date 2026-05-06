@@ -411,10 +411,32 @@ end
 
 function slurm_array_is_running(jobid::String)
     try
-        out = read(`squeue -h -j $jobid`, String)
+        out = read(`squeue -h -j $jobid -o "%.18i %.2t %.10M %.R"`, String)
         return !isempty(strip(out))
     catch
         return false
+    end
+end
+
+function wait_for_iteration_outputs(list_file::String; poll::Float64=10.0)
+    cand_dirs = [strip(x) for x in readlines(list_file) if !isempty(strip(x))]
+    while true
+        all_done = true
+        any_failed = false
+        for d in cand_dirs
+            done_ok = isfile(joinpath(d, "done.ok"))
+            failed_ok = isfile(joinpath(d, "failed.ok"))
+            if failed_ok
+                any_failed = true
+            end
+            if !(done_ok || failed_ok)
+                all_done = false
+                break
+            end
+        end
+        any_failed && error("At least one candidate task failed in iteration list $(list_file)")
+        all_done && return
+        sleep(poll)
     end
 end
 
@@ -423,11 +445,9 @@ function submit_slurm_array(cfg::OptimizerConfig, list_file::String)
     lines = readlines(list_file)
     n = length(lines)
     n == 0 && return ""
-    cmd = `sbatch -c 4 -t 01:00:00 --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir)`
-    out = read(cmd, String)
-    m = match(r"Submitted batch job (\\d+)", out)
-    jobid = m === nothing ? "" : m.captures[1]
-    return jobid
+    cmd = `sbatch --parsable -c 4 -t 01:00:00 --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir)`
+    out = strip(read(cmd, String))
+    return out
 end
 
 function build_reference(seed::Dict{String,Any}, days::Int)
@@ -555,9 +575,8 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
             end
             jobid = submit_slurm_array(cfg, list_file)
             @info "Submitted Slurm array" stage=stage.name iteration=iter jobid=jobid
-            while slurm_array_is_running(jobid)
-                sleep(10.0)
-            end
+            wait_for_iteration_outputs(list_file; poll=10.0)
+            @info "Slurm array finished" stage=stage.name iteration=iter jobid=jobid
 
             # collect scores from generated output_daily.jld2
             for (ci, cand) in enumerate(candidates)

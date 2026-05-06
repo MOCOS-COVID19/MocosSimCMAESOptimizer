@@ -44,6 +44,10 @@ fi
 CFG="$CAND_DIR/config.json"
 OUT_DAILY="$CAND_DIR/output_daily.jld2"
 OUT_SUMMARY="$CAND_DIR/summary.jld2"
+DONE_OK="$CAND_DIR/done.ok"
+FAILED_OK="$CAND_DIR/failed.ok"
+
+rm -f "$DONE_OK" "$FAILED_OK"
 
 echo "[$(date)] candidate=$CAND_DIR"
 
@@ -56,8 +60,11 @@ if command -v uv >/dev/null 2>&1; then
   uv pip install matplotlib numpy h5py >/dev/null 2>&1 || true
 fi
 
-"$JULIA_BIN" --project="$PROJECT_DIR" --threads=4 "$ADVANCED_CLI" "$CFG" \
-  --output-daily "$OUT_DAILY" --output-summary "$OUT_SUMMARY"
+if ! "$JULIA_BIN" --project="$PROJECT_DIR" --threads=4 "$ADVANCED_CLI" "$CFG" \
+  --output-daily "$OUT_DAILY" --output-summary "$OUT_SUMMARY"; then
+  touch "$FAILED_OK"
+  exit 1
+fi
 
 # Optional plotting per candidate (non-fatal on failure)
 if command -v uv >/dev/null 2>&1; then
@@ -73,5 +80,7 @@ else
     --daily "$OUT_DAILY" \
     --out "$CAND_DIR/gt_vs_sim.png" || true
 fi
+
+touch "$DONE_OK"
 
 echo "[$(date)] done candidate=$CAND_DIR"
