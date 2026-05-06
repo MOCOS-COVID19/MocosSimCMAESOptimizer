@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-echo "[INFO] Instantiating MocosSimLauncher environment"
+echo "[INFO] Instantiating MocosSimLauncher environment (fresh each job)"
 /home/mbodych/1.7.0-school_class/julia-1.7.0/bin/julia --project=/home/mbodych/1.7.0-school_class/MocosSimLauncher/ -e 'using Pkg; Pkg.instantiate()'
 
 JULIA_BIN="/home/mbodych/1.7.0-school_class/julia-1.7.0/bin/julia"

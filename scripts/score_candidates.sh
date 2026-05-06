@@ -47,6 +47,9 @@ OUT_SUMMARY="$CAND_DIR/summary.jld2"
 
 echo "[$(date)] candidate=$CAND_DIR"
 
+echo "[$(date)] Instantiating MocosSimLauncher for this task"
+"$JULIA_BIN" --project="$PROJECT_DIR" -e 'using Pkg; Pkg.instantiate()'
+
 "$JULIA_BIN" --project="$PROJECT_DIR" --threads=4 "$ADVANCED_CLI" "$CFG" \
   --output-daily "$OUT_DAILY" --output-summary "$OUT_SUMMARY"
 
