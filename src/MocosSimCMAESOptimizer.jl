@@ -42,6 +42,7 @@ struct OptimizerConfig
     temporal_bounds::Dict{String,Tuple{Float64,Float64}}
     objective::ObjectiveConfig
     external_sim::Union{Nothing,ExternalSimConfig}
+    stage_freeze::Dict{String,Vector{String}}
 end
 
 struct ParamSpec
@@ -91,7 +92,13 @@ function load_config(path::String)
     external_sim = haskey(raw, "gt_dir") && haskey(raw, "julia_bin") && haskey(raw, "project_dir") && haskey(raw, "advanced_cli") ?
         ExternalSimConfig(String(raw["gt_dir"]), String(raw["julia_bin"]), String(raw["project_dir"]), String(raw["advanced_cli"])) :
         nothing
-    return OptimizerConfig(raw["seed_config"], raw["output_dir"], Int(raw["monthly_days"]), stages, scalar_bounds, temporal_bounds, objective, external_sim)
+    stage_freeze = Dict{String,Vector{String}}()
+    if haskey(raw, "stage_freeze")
+        for (k, v) in raw["stage_freeze"]
+            stage_freeze[String(k)] = [String(x) for x in v]
+        end
+    end
+    return OptimizerConfig(raw["seed_config"], raw["output_dir"], Int(raw["monthly_days"]), stages, scalar_bounds, temporal_bounds, objective, external_sim, stage_freeze)
 end
 
 function get_nested(config::Dict{String,Any}, path::String)
@@ -126,6 +133,32 @@ function build_specs(seed::Dict{String,Any}, cfg::OptimizerConfig)
         push!(specs, ParamSpec(name, :temporal, length(arr), lo, hi))
     end
     return specs
+end
+
+function stage_specs(specs::Vector{ParamSpec}, cfg::OptimizerConfig, stage::StageConfig)
+    freeze = get(cfg.stage_freeze, stage.name, String[])
+    isempty(freeze) && return specs
+    return [spec for spec in specs if !(spec.name in freeze)]
+end
+
+function update_stage_freeze!(cfg::OptimizerConfig, stage::StageConfig, history::Vector{Any}, specs::Vector{ParamSpec}; min_calls::Int=5)
+    counts = Dict{String,Int}(spec.name => 0 for spec in specs)
+    for rec in history
+        rec["stage"] == stage.name || continue
+        score = get(rec, "score", Inf)
+        isfinite(Float64(score)) || continue
+        for spec in specs
+            counts[spec.name] += 1
+        end
+    end
+    movable = [name for (name, c) in counts if c >= min_calls]
+    if length(movable) < 5
+        freeze = String[]
+    else
+        freeze = [name for (name, c) in counts if c < min_calls]
+    end
+    cfg.stage_freeze[stage.name] = freeze
+    return freeze
 end
 
 function initial_vector(seed::Dict{String,Any}, specs::Vector{ParamSpec})
@@ -177,10 +210,22 @@ function vector_to_config(seed::Dict{String,Any}, specs::Vector{ParamSpec}, x::V
     return cfg
 end
 
+function inject_frozen!(cfg_out::Dict{String,Any}, seed::Dict{String,Any}, specs::Vector{ParamSpec}, frozen_names::Vector{String})
+    for spec in specs
+        spec.name in frozen_names || continue
+        set_nested!(cfg_out, spec.name, get_nested(seed, spec.name))
+    end
+end
+
 function rmse(a::Vector{Float64}, b::Vector{Float64})
     n = min(length(a), length(b))
     n == 0 && return Inf
     return sqrt(sum((a[i] - b[i])^2 for i in 1:n) / n)
+end
+
+function normalize_rmse(v::Float64, days::Int)
+    isfinite(v) || return v
+    return v / sqrt(max(days, 1))
 end
 
 function recent_weighted_rmse(a::Vector{Float64}, b::Vector{Float64}, recent_days::Int)
@@ -336,9 +381,9 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
         if metric == "daily_hospitalizations"
             s = rolling_sum(s, 7)  # roll only simulated series
         end
-        metrics[metric] = rmse_series(s, g)
+        metrics[metric] = normalize_rmse(rmse_series(s, g), min(length(s), length(g)))
     end
-    combined = 0.2 * metrics["daily_detections"] + 0.05 * metrics["daily_hospitalizations"] + 1.0 * metrics["daily_deaths"]
+    combined = 0.5 * metrics["daily_detections"] + 0.0 * metrics["daily_hospitalizations"] + 1.0 * metrics["daily_deaths"]
     return combined, metrics
 end
 
@@ -355,12 +400,12 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
         if gkey == "daily_hospitalizations"
             s = rolling_sum(s, 7)  # roll only simulated series
         end
-        rmse_series(s, g)
+        normalize_rmse(rmse_series(s, g), min(length(s), length(g)))
     end
     metrics["daily_detections"] = rm(det, "daily_detections")
     metrics["daily_hospitalizations"] = rm(hosp, "daily_hospitalizations")
     metrics["daily_deaths"] = rm(deaths, "daily_deaths")
-    combined = 0.2 * metrics["daily_detections"] + 0.05 * metrics["daily_hospitalizations"] + 1.0 * metrics["daily_deaths"]
+    combined = 0.5 * metrics["daily_detections"] + 0.0 * metrics["daily_hospitalizations"] + 1.0 * metrics["daily_deaths"]
     return combined, metrics
 end
 
@@ -478,9 +523,10 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
     active_months = stage.fit_months
     days = active_months * cfg.monthly_days
     reference = build_reference(seed, days)
-    dim = sum(spec.length for spec in specs)
+    specs_stage = stage_specs(specs, cfg, stage)
+    dim = sum(spec.length for spec in specs_stage)
     if state === nothing
-        x0 = initial_vector(seed, specs)
+        x0 = initial_vector(seed, specs_stage)
         state = CMAState(copy(x0), stage.sigma, Matrix{Float64}(I, dim, dim))
     else
         state = CMAState(copy(state.mean), stage.sigma, copy(state.covariance))
@@ -501,8 +547,9 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
             list_file = joinpath(iter_root, "candidate_list.txt")
             open(list_file, "w") do io
                 for (ci, cand) in enumerate(candidates)
-                    x = clip!(copy(cand), specs)
-                    candidate_cfg = vector_to_config(seed, specs, x, active_months)
+                    x = clip!(copy(cand), specs_stage)
+                    candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
+                    inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
                     cand_dir = joinpath(iter_root, @sprintf("cand_%02d", ci))
                     mkpath(cand_dir)
                     save_json(joinpath(cand_dir, "config.json"), candidate_cfg)
@@ -517,14 +564,25 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
 
             # collect scores from generated output_daily.jld2
             for (ci, cand) in enumerate(candidates)
-                x = clip!(copy(cand), specs)
+                x = clip!(copy(cand), specs_stage)
                 cand_dir = joinpath(iter_root, @sprintf("cand_%02d", ci))
                 daily_path = joinpath(cand_dir, "output_daily.jld2")
-                cand_cfg = vector_to_config(seed, specs, x, active_months)
+                cand_cfg = vector_to_config(seed, specs_stage, x, active_months)
+                inject_frozen!(cand_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
                 metrics = if isfile(daily_path)
                     combined, comp = score_from_daily(cfg, daily_path, days)
+                    metrics_payload = Dict(
+                        "score" => combined,
+                        "daily_detections" => comp["daily_detections"],
+                        "daily_hospitalizations" => comp["daily_hospitalizations"],
+                        "daily_deaths" => comp["daily_deaths"],
+                        "simulated" => "real",
+                    )
+                    save_json(joinpath(cand_dir, "metrics.json"), metrics_payload)
                     Dict("score" => combined, "metrics" => comp, "simulated" => "real")
                 else
+                    metrics_payload = Dict("score" => Inf, "simulated" => "real_missing")
+                    save_json(joinpath(cand_dir, "metrics.json"), metrics_payload)
                     Dict("score" => Inf, "metrics" => Dict(), "simulated" => "real_missing")
                 end
                 score = metrics["score"]
@@ -545,9 +603,11 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
             end
         else
             for (ci, cand) in enumerate(candidates)
-                x = clip!(copy(cand), specs)
-                candidate_cfg = vector_to_config(seed, specs, x, active_months)
+                x = clip!(copy(cand), specs_stage)
+                candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
+                inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
                 metrics = score_candidate(candidate_cfg, reference, cfg, days; workdir=joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"))
+                save_json(joinpath(joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"), "metrics.json"), metrics)
                 score = metrics["score"]
                 push!(history, Dict(
                     "stage" => stage.name,
@@ -596,6 +656,7 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
     for stage in cfg.stages
         result, state = run_stage(rng, current_seed, specs, cfg, stage, state; use_slurm=use_slurm)
         current_seed = result["best_candidate"]
+        update_stage_freeze!(cfg, stage, result["history"], specs)
         push!(stage_outputs, Dict(
             "stage" => result["stage"],
             "fit_months" => result["fit_months"],

@@ -1,11 +1,13 @@
 {
-  "seed_config": "/Users/marcinbodych/Workspace/saxocov/MocosSimCMAESOptimizer/seed/config2.json",
-  "output_dir": "/Users/marcinbodych/Workspace/saxocov/MocosSimCMAESOptimizer/runs/default",
+  "seed_config": "/Users/marcinbodych/Workspace/saxocov/MocosSimCMAESOptimizer/seed/config3.json",
+  "output_dir": "/Users/marcinbodych/Workspace/saxocov/MocosSimCMAESOptimizer/runs/neat-local-test",
   "monthly_days": 30,
   "stages": [
-    {"name": "stage_01", "fit_months": 3, "max_iterations": 12, "population_size": 12, "sigma": 0.18},
-    {"name": "stage_02", "fit_months": 4, "max_iterations": 10, "population_size": 12, "sigma": 0.12},
-    {"name": "stage_03", "fit_months": 5, "max_iterations": 10, "population_size": 12, "sigma": 0.12}
+    {"name": "stage_01", "fit_months": 3, "max_iterations": 5, "population_size": 4, "sigma": 0.24},
+    {"name": "stage_02", "fit_months": 6, "max_iterations": 5, "population_size": 4, "sigma": 0.22},
+    {"name": "stage_03", "fit_months": 9, "max_iterations": 5, "population_size": 4, "sigma": 0.20},
+ {"name": "stage_04", "fit_months": 12, "max_iterations": 5, "population_size": 4, "sigma": 0.18},
+ {"name": "stage_05", "fit_months": 15, "max_iterations": 5, "population_size": 4, "sigma": 0.16}
   ],
   "scalar_bounds": {
     "mild_detection_delay": [1.0, 4.0],
@@ -19,12 +21,12 @@
     "household_params.trace_prob": [0.1, 0.5],
     "household_params.quarantine_prob": [0.1, 0.5],
     "mild_detection_prob": [0.2, 0.95],
-    "contact_tracing.probability": [0.005, 0.2]
+    "contact_tracing.probability": [0.005, 0.4]
   },
   "temporal_bounds": {
-    "infection_modulation.params.interval_values": [0.2, 1.2],
-    "mild_detection_modulation.params.interval_values": [0.05, 1.2],
-    "tracing_modulation.params.interval_values": [0.05, 1.2]
+    "infection_modulation.params.interval_values": [0.2, 1.0],
+    "mild_detection_modulation.params.interval_values": [0.05, 1.0],
+    "tracing_modulation.params.interval_values": [0.05, 1.0]
   },
   "objective": {
     "weights": {
