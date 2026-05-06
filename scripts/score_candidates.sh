@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Slurm array helper: run one candidate simulation + optional GT-vs-sim plot.
 # Usage (example):
-#   sbatch --array=0-$((N-1)) scripts/score_candidates.sh \
+#   sbatch -t 06:00:00 -c 4 --array=0-$((N-1)) scripts/score_candidates.sh \
 #     runs/default/real_sims/stage_01/iter_3 \
 #     /path/to/julia-1.7.0/bin/julia \
 #     /path/to/MocosSimLauncher \
@@ -9,7 +9,7 @@
 #     ./gt
 #
 # Or using a candidate list file (one directory per line):
-#   sbatch --array=0-$((N-1)) scripts/score_candidates.sh \
+#   sbatch -t 06:00:00 -c 4 --array=0-$((N-1)) scripts/score_candidates.sh \
 #     /path/to/candidate_list.txt \
 #     /path/to/julia-1.7.0/bin/julia \
 #     /path/to/MocosSimLauncher \

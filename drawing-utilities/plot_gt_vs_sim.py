@@ -186,14 +186,19 @@ def main():
     if cfg_path is None:
         cand_cfg = base / "config_candidate.json"
         final_cfg = base / "final_best_candidate.json"
+        plain_cfg = base / "config.json"
         if cand_cfg.exists():
             cfg_path = cand_cfg
         elif final_cfg.exists():
             cfg_path = final_cfg
-    if cfg_path is None or not cfg_path.exists():
-        raise SystemExit("Config JSON not found (config_candidate.json or final_best_candidate.json)")
+        elif plain_cfg.exists():
+            cfg_path = plain_cfg
 
-    cfg = json.loads(cfg_path.read_text())
+    cfg = None
+    if cfg_path is not None and cfg_path.exists():
+        cfg = json.loads(cfg_path.read_text())
+    elif args.daily is None:
+        raise SystemExit("Config JSON not found (config_candidate.json/final_best_candidate.json/config.json) and no --daily provided")
     gt = load_gt(args.gt_dir.resolve())
     max_days = args.days or len(gt["detections"])
 

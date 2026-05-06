@@ -382,15 +382,14 @@ function submit_slurm_array(cfg::OptimizerConfig, list_file::String)
     n = length(lines)
     n == 0 && return ""
     opts = String[]
-    push!(opts, "--time=06:00:00")
-    push!(opts, "--cpus-per-task=4")
+    push!(opts, "-c 4")
     if haskey(ENV, "SLURM_PARTITION")
         push!(opts, "-p", ENV["SLURM_PARTITION"])
     end
     if haskey(ENV, "SLURM_ACCOUNT")
         push!(opts, "-A", ENV["SLURM_ACCOUNT"])
     end
-    cmd = `sbatch $(opts...) --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir)`
+    cmd = `sbatch -t 06:00:00 $(opts...) --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir)`
     out = read(cmd, String)
     m = match(r"Submitted batch job (\\d+)", out)
     jobid = m === nothing ? "" : m.captures[1]
