@@ -1,3 +1,12 @@
+## Parameter evolution plots
+
+To plot how selected parameters evolve across a search tree:
+
+```bash
+uv run -- python drawing-utilities/plot_param_evolution.py \
+  --search-dir runs/wcss3m/real_sims \
+  --out-dir runs/wcss3m/real_sims/plots
+```
 # MocosSimCMAESOptimizer
 
 This package runs a synthetic CMA-ES optimizer against a configurable epidemic simulation seed and records the best parameter combinations per stage.
@@ -28,7 +37,8 @@ julia --project=. run_optimizer.jl [path/to/optimizer_config.json]
 ## Inspecting results
 
 - Each stage emits `<stage>_best_candidate.json` with the optimized configuration for that stage.
-- The optimizer also drops `optimizer_history.json`, `stage_summary.json`, and `final_best_candidate.json` under `output_dir`.
+- The optimizer also drops `optimizer_history.json`, `stage_summary.json`, `final_best_candidate.json`, and `<stage>_summary.json` under `output_dir`.
+- Per-stage runtime logs are written under `output_dir/real_sims/<stage>/` as `stage_state.json` and `iter_metrics.jsonl`.
 
 ## Testing
 

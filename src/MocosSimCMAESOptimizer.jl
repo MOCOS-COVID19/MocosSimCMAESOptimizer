@@ -59,6 +59,23 @@ struct CMAState
     covariance::Matrix{Float64}
 end
 
+function stage_transition_state(prev::CMAState, stage::StageConfig, specs_stage::Vector{ParamSpec}; sigma_floor::Float64=0.08, sigma_scale::Float64=2.0)
+    dim = length(prev.mean)
+    cov = copy(prev.covariance)
+    if size(cov, 1) != dim || size(cov, 2) != dim
+        cov = Matrix{Float64}(I, dim, dim)
+    end
+    cov = 0.5 .* cov .+ 0.5 .* Matrix{Float64}(I, dim, dim)
+    return CMAState(copy(prev.mean), max(stage.sigma, max(prev.sigma * sigma_scale, sigma_floor)), cov)
+end
+
+function append_jsonl(path::String, value)
+    mkpath(dirname(path))
+    open(path, "a") do io
+        println(io, JSON.json(value))
+    end
+end
+
 function normalize_json(value)
     if value isa AbstractDict
         return Dict(k => normalize_json(v) for (k, v) in value)
@@ -572,13 +589,15 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
         x0 = initial_vector(seed, specs_stage)
         state = CMAState(copy(x0), stage.sigma, Matrix{Float64}(I, dim, dim))
     else
-        state = CMAState(copy(state.mean), stage.sigma, copy(state.covariance))
+        state = stage_transition_state(state, stage, specs_stage)
     end
 
     history = Any[]
+    iter_log = Any[]
     best_score = Inf
     best_vector = copy(state.mean)
     best_candidate = deepcopy(seed)
+    stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
 
     for iter in 1:stage.max_iterations
         candidates, zs = cma_candidates(rng, state, stage.population_size)
@@ -628,6 +647,16 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     Dict("score" => Inf, "metrics" => Dict(), "simulated" => "real_missing")
                 end
                 score = metrics["score"]
+                append_jsonl(joinpath(stage_root, "iter_metrics.jsonl"), Dict(
+                    "stage" => stage.name,
+                    "iteration" => iter,
+                    "candidate" => ci,
+                    "score" => score,
+                    "simulated" => metrics["simulated"],
+                    "has_output_daily" => isfile(daily_path),
+                    "sigma" => state.sigma,
+                    "best_score_so_far" => best_score,
+                ))
                 push!(history, Dict(
                     "stage" => stage.name,
                     "iteration" => iter,
@@ -669,7 +698,26 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
         end
         sort!(ranked, by=first)
         state = update_state(state, ranked)
-        state.mean .= best_vector
+        if state.sigma > stage.sigma
+            state = CMAState(copy(best_vector), state.sigma, state.covariance)
+        else
+            state.mean .= best_vector
+        end
+        push!(iter_log, Dict(
+            "stage" => stage.name,
+            "iteration" => iter,
+            "best_score" => best_score,
+            "sigma" => state.sigma,
+            "covariance_trace" => tr(state.covariance),
+        ))
+        save_json(joinpath(stage_root, "stage_state.json"), Dict(
+            "stage" => stage.name,
+            "fit_months" => active_months,
+            "best_score" => best_score,
+            "sigma" => state.sigma,
+            "covariance_trace" => tr(state.covariance),
+            "best_vector" => best_vector,
+        ))
     end
 
     return Dict(
@@ -681,6 +729,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
         "sigma" => state.sigma,
         "covariance" => state.covariance,
         "history" => history,
+        "iter_log" => iter_log,
     ), state
 end
 
@@ -707,6 +756,13 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
         ))
         append!(all_history, result["history"])
         save_json(joinpath(cfg.output_dir, "$(stage.name)_best_candidate.json"), result["best_candidate"])
+        save_json(joinpath(cfg.output_dir, "$(stage.name)_summary.json"), Dict(
+            "stage" => result["stage"],
+            "fit_months" => result["fit_months"],
+            "best_score" => result["best_score"],
+            "sigma" => result["sigma"],
+            "iter_log" => result["iter_log"],
+        ))
     end
 
     save_json(joinpath(cfg.output_dir, "optimizer_history.json"), all_history)

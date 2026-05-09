@@ -1,125 +1,114 @@
 #!/usr/bin/env python3
-"""Plot evolution of all temporal param buckets across every config.json in the search."""
+"""Plot evolution of all scalar parameters across config.json files in a search tree."""
 
-import glob, json, os, re
-import numpy as np
+import argparse
+import glob
+import json
+import math
+import os
+import re
+from pathlib import Path
+
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
+import numpy as np
 
-SEARCH_DIR = "/Users/marcinbodych/Workspace/saxocov/experiment-wcss/LLM-IDEAS/manager/runs/search_local"
-MODULATIONS = [
-    ("infection_modulation",       "Infection modulation"),
-    ("mild_detection_modulation",  "Detection modulation"),
-    ("tracing_modulation",         "Tracing modulation"),
-]
 
-def sort_key(path):
-    nums = re.findall(r'\d+', path)
-    return [int(n) for n in nums]
+def get_nested(d, path):
+    cur = d
+    for p in path.split("."):
+        cur = cur[p]
+    return cur
 
-def load_all_configs(search_dir):
-    files = sorted(
-        glob.glob(os.path.join(search_dir, "**/config.json"), recursive=True),
-        key=sort_key
-    )
+
+def flatten_scalars(obj, prefix=""):
+    out = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            out.update(flatten_scalars(v, key))
+    elif isinstance(obj, list):
+        if all(isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in obj):
+            for idx, x in enumerate(obj):
+                out[f"{prefix}[{idx}]"] = float(x)
+        elif prefix.endswith("imported_cases") and all(isinstance(x, dict) for x in obj):
+            for idx, x in enumerate(obj):
+                out.update(flatten_scalars(x, f"{prefix}[{idx}]"))
+    elif isinstance(obj, (int, float)) and not isinstance(obj, bool) and math.isfinite(obj):
+        out[prefix] = float(obj)
+    return out
+
+
+def load_records(search_dir: Path):
     records = []
+    files = sorted(glob.glob(str(search_dir / "**" / "config.json"), recursive=True))
     for f in files:
         try:
             cfg = json.load(open(f))
-            parts = f.replace(os.sep, "/").split("/")
-            # extract month/week/iter/candidate from path
-            month = next((int(re.search(r'\d+', p).group()) for p in parts if p.startswith("month_")), 0)
-            week  = next((int(re.search(r'\d+', p).group()) for p in parts if p.startswith("week_")),  0)
-            label = next((p for p in parts if p.startswith("iter_")), "")
-            records.append({"path": f, "config": cfg, "month": month, "week": week, "label": label})
+            m = re.search(r"stage_(\d+)", f)
+            i = re.search(r"iter_(\d+)", f)
+            c = re.search(r"cand_(\d+)", f)
+            if not (m and i and c):
+                continue
+            records.append(
+                {
+                    "stage": int(m.group(1)),
+                    "iter": int(i.group(1)),
+                    "cand": int(c.group(1)),
+                    "path": f,
+                    "config": cfg,
+                }
+            )
         except Exception:
             pass
-    return records
+    return sorted(records, key=lambda r: (r["stage"], r["iter"], r["cand"]))
 
-records = load_all_configs(SEARCH_DIR)
-n = len(records)
-print(f"Loaded {n} configs")
 
-# colour by month
-month_colors = {1: "#2196F3", 2: "#E91E63", 3: "#9C27B0", 4: "#009688"}
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--search-dir", required=True, type=Path)
+    ap.add_argument("--out-dir", type=Path, default=None)
+    args = ap.parse_args()
 
-for mod_key, mod_title in MODULATIONS:
-    # collect all bucket series: shape (n_configs, n_buckets)
-    try:
-        n_buckets = len(records[0]["config"][mod_key]["params"]["interval_values"])
-        interval_times = records[0]["config"][mod_key]["params"]["interval_times"]
-    except (KeyError, IndexError):
-        continue
+    records = load_records(args.search_dir)
+    print(f"Loaded {len(records)} configs")
+    if not records:
+        raise SystemExit("No config.json files found")
 
-    values = np.full((n, n_buckets), np.nan)
-    for i, rec in enumerate(records):
-        try:
-            vals = rec["config"][mod_key]["params"]["interval_values"]
-            values[i] = vals
-        except (KeyError, TypeError):
-            pass
+    out_dir = args.out_dir or (args.search_dir / "plots")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # one subplot per bucket
-    cols = 5
-    rows = (n_buckets + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.5, rows * 2.8), sharey=True)
-    fig.suptitle(f"{mod_title} — all {n_buckets} buckets over {n} configs", fontsize=12)
-    axes = axes.flatten()
+    params = set()
+    flattened = []
+    for r in records:
+        flat = flatten_scalars(r["config"])
+        flattened.append(flat)
+        params.update(flat.keys())
 
-    x = np.arange(n)
-    months = np.array([r["month"] for r in records])
-    # month boundary positions
-    boundaries = [0]
-    for m in [1, 2, 3, 4]:
-        idx = np.where(months == m)[0]
-        if len(idx):
-            boundaries.append(idx[-1] + 1)
+    for param in sorted(params):
+        ys, xs, labels = [], [], []
+        for idx, r in enumerate(records):
+            if param not in flattened[idx]:
+                continue
+            ys.append(flattened[idx][param])
+            xs.append(len(xs))
+            labels.append(f"s{r['stage']}i{r['iter']}c{r['cand']}")
 
-    for b in range(n_buckets):
-        ax = axes[b]
-        y = values[:, b]
+        if not ys:
+            continue
 
-        # shade months
-        shade_colors = ["#E3F2FD", "#FCE4EC", "#F3E5F5", "#E8F5E9"]
-        for mi, m in enumerate([1, 2, 3, 4]):
-            idx = np.where(months == m)[0]
-            if len(idx):
-                ax.axvspan(idx[0], idx[-1] + 1, alpha=0.18, color=shade_colors[mi], zorder=0)
+        plt.figure(figsize=(14, 4))
+        plt.plot(xs, ys, marker="o", linewidth=1)
+        plt.xticks(xs, labels, rotation=90, fontsize=6)
+        plt.title(param)
+        plt.tight_layout()
+        out = out_dir / f"{param.replace('.', '_')}.png"
+        plt.savefig(out, dpi=150)
+        plt.close()
+        print(f"Saved: {out}")
 
-        # plot each month segment separately for colour
-        for m, col in month_colors.items():
-            idx = np.where(months == m)[0]
-            if len(idx):
-                ax.plot(idx, y[idx], "o-", color=col, ms=2, lw=1.2, alpha=0.8)
 
-        # mark month boundaries
-        for bnd in boundaries[1:-1]:
-            ax.axvline(bnd, color="#999", lw=0.7, ls=":")
-
-        # bucket label: days covered
-        t_start = 0 if b == 0 else interval_times[b - 1]
-        t_end   = interval_times[b] if b < len(interval_times) else "∞"
-        ax.set_title(f"b{b}  [{t_start}–{t_end}d]", fontsize=8)
-        ax.set_xlim(0, n)
-        ax.set_ylim(0, 1.05)
-        ax.set_xlabel("config idx", fontsize=7)
-        ax.tick_params(labelsize=7)
-        ax.grid(alpha=0.3)
-
-    # hide unused subplots
-    for b in range(n_buckets, len(axes)):
-        axes[b].set_visible(False)
-
-    # legend
-    handles = [plt.Line2D([0], [0], color=c, lw=2, label=f"Month {m}")
-               for m, c in month_colors.items()]
-    fig.legend(handles=handles, loc="lower right", fontsize=9, ncol=4)
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
-    out = os.path.join(SEARCH_DIR, "plots", f"param_evolution_{mod_key}.png")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    plt.savefig(out, dpi=130, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {out}")
+if __name__ == "__main__":
+    main()
