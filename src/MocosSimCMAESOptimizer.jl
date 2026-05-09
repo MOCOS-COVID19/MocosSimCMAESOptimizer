@@ -343,14 +343,14 @@ function load_gt_series(gt_dir::String)
 end
 
 function read_daily_metric(path::String, metric::String)
-    vals = Float64[]
+    series = Vector{Vector{Float64}}()
     try
         h5open(path, "r") do h5
-            for key in keys(h5)
+            for key in sort(collect(keys(h5)))
                 grp = h5[key]
                 if haskey(grp, metric)
                     data = read(grp[metric])
-                    append!(vals, Float64.(data))
+                    push!(series, Float64.(vec(data)))
                 end
             end
         end
@@ -358,7 +358,8 @@ function read_daily_metric(path::String, metric::String)
         @warn "Failed to read HDF5 metric" path metric err
         return nothing
     end
-    return vals
+    isempty(series) && return nothing
+    return series
 end
 
 function rmse_series(a::Vector{Float64}, b::Vector{Float64})
@@ -395,45 +396,54 @@ function rolling_sum(series::Vector{Float64}, window::Int)
     return out
 end
 
+function per_trajectory_rmae(daily_path::String, metric::String, gt_series::Vector{Float64}, days::Int)
+    trajs = read_daily_metric(daily_path, metric)
+    trajs === nothing && return Inf
+    vals = Float64[]
+    g = Float64.(gt_series[1:min(end, days)])
+    g = rolling_sum(g, 7)
+    for traj in trajs
+        s = Float64.(traj[1:min(end, days)])
+        s = rolling_sum(s, 7)
+        push!(vals, rmae_series(s, g))
+    end
+    isempty(vals) && return Inf
+    return sum(vals) / length(vals)
+end
+
+function trajectory_metric_values(daily_path::String, metric::String, gt_series::Vector{Float64}, days::Int)
+    trajs = read_daily_metric(daily_path, metric)
+    trajs === nothing && return Float64[]
+    g = Float64.(gt_series[1:min(end, days)])
+    g = rolling_sum(g, 7)
+    vals = Float64[]
+    for traj in trajs
+        s = Float64.(traj[1:min(end, days)])
+        s = rolling_sum(s, 7)
+        push!(vals, rmae_series(s, g))
+    end
+    return vals
+end
+
 function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, days::Int; workdir::String)
     sim_ok, daily_path = run_external_sim(cfg, candidate, days; workdir=workdir)
     sim_ok || return Inf, Dict("sim_failed" => true)
     gt = load_gt_series(cfg.external_sim.gt_dir)
     metrics = Dict{String,Float64}()
     for (metric, gtvals) in gt
-        simvals = read_daily_metric(daily_path, metric)
-        if simvals === nothing
-            metrics[metric] = Inf
-            continue
-        end
-        g = Float64.(gtvals[1:min(end, days)])
-        s = Float64.(simvals[1:min(end, days)])
-        g = rolling_sum(g, 7)
-        s = rolling_sum(s, 7)
-        metrics[metric] = rmae_series(s, g)
+        metrics[metric] = per_trajectory_rmae(daily_path, metric, Float64.(gtvals), days)
     end
-    combined = 0.5 * metrics["daily_detections"] + 0.0 * metrics["daily_hospitalizations"] + 1.0 * metrics["daily_deaths"]
+    combined = 1.0 * metrics["daily_detections"] + 0.0 * metrics["daily_hospitalizations"] + 1.0 * metrics["daily_deaths"]
     return combined, metrics
 end
 
 function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
     gt = load_gt_series(cfg.external_sim.gt_dir)
     metrics = Dict{String,Float64}()
-    det = read_daily_metric(daily_path, "daily_detections")
-    hosp = read_daily_metric(daily_path, "daily_hospitalizations")
-    deaths = read_daily_metric(daily_path, "daily_deaths")
-    function rm(v, gkey)
-        v === nothing && return Inf
-        g = Float64.(gt[gkey][1:min(end, days)])
-        s = Float64.(v[1:min(end, days)])
-        g = rolling_sum(g, 7)
-        s = rolling_sum(s, 7)
-        rmae_series(s, g)
-    end
-    metrics["daily_detections"] = rm(det, "daily_detections")
-    metrics["daily_hospitalizations"] = rm(hosp, "daily_hospitalizations")
-    metrics["daily_deaths"] = rm(deaths, "daily_deaths")
-    combined = 0.5 * metrics["daily_detections"] + 0.0 * metrics["daily_hospitalizations"] + 1.0 * metrics["daily_deaths"]
+    metrics["daily_detections"] = per_trajectory_rmae(daily_path, "daily_detections", Float64.(gt["daily_detections"]), days)
+    metrics["daily_hospitalizations"] = per_trajectory_rmae(daily_path, "daily_hospitalizations", Float64.(gt["daily_hospitalizations"]), days)
+    metrics["daily_deaths"] = per_trajectory_rmae(daily_path, "daily_deaths", Float64.(gt["daily_deaths"]), days)
+    combined = 1.0 * metrics["daily_detections"] + 0.0 * metrics["daily_hospitalizations"] + 1.0 * metrics["daily_deaths"]
     return combined, metrics
 end
 
@@ -637,6 +647,9 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                         "daily_detections" => comp["daily_detections"],
                         "daily_hospitalizations" => comp["daily_hospitalizations"],
                         "daily_deaths" => comp["daily_deaths"],
+                        "daily_detections_per_trajectory" => trajectory_metric_values(daily_path, "daily_detections", Float64.(load_gt_series(cfg.external_sim.gt_dir)["daily_detections"]), days),
+                        "daily_hospitalizations_per_trajectory" => trajectory_metric_values(daily_path, "daily_hospitalizations", Float64.(load_gt_series(cfg.external_sim.gt_dir)["daily_hospitalizations"]), days),
+                        "daily_deaths_per_trajectory" => trajectory_metric_values(daily_path, "daily_deaths", Float64.(load_gt_series(cfg.external_sim.gt_dir)["daily_deaths"]), days),
                         "simulated" => "real",
                     )
                     save_json(joinpath(cand_dir, "metrics.json"), metrics_payload)
