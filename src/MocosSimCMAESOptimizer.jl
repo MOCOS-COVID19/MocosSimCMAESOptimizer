@@ -350,6 +350,19 @@ function rmse_series(a::Vector{Float64}, b::Vector{Float64})
     return sqrt(sum((a[i] - b[i])^2 for i in 1:n) / n)
 end
 
+function mae_series(a::Vector{Float64}, b::Vector{Float64})
+    n = min(length(a), length(b))
+    n == 0 && return Inf
+    return sum(abs.(a[1:n] .- b[1:n])) / n
+end
+
+function rmae_series(a::Vector{Float64}, b::Vector{Float64})
+    n = min(length(a), length(b))
+    n == 0 && return Inf
+    denom = max(mean(abs.(b[1:n])), 1e-9)
+    return mae_series(a, b) / denom
+end
+
 function rolling_sum(series::Vector{Float64}, window::Int)
     length(series) == 0 && return Float64[]
     w = max(window, 1)
@@ -378,10 +391,9 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
         end
         g = Float64.(gtvals[1:min(end, days)])
         s = Float64.(simvals[1:min(end, days)])
-        if metric == "daily_hospitalizations"
-            s = rolling_sum(s, 7)  # roll only simulated series
-        end
-        metrics[metric] = normalize_rmse(rmse_series(s, g), min(length(s), length(g)))
+        g = rolling_sum(g, 7)
+        s = rolling_sum(s, 7)
+        metrics[metric] = rmae_series(s, g)
     end
     combined = 0.5 * metrics["daily_detections"] + 0.0 * metrics["daily_hospitalizations"] + 1.0 * metrics["daily_deaths"]
     return combined, metrics
@@ -397,10 +409,9 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
         v === nothing && return Inf
         g = Float64.(gt[gkey][1:min(end, days)])
         s = Float64.(v[1:min(end, days)])
-        if gkey == "daily_hospitalizations"
-            s = rolling_sum(s, 7)  # roll only simulated series
-        end
-        normalize_rmse(rmse_series(s, g), min(length(s), length(g)))
+        g = rolling_sum(g, 7)
+        s = rolling_sum(s, 7)
+        rmae_series(s, g)
     end
     metrics["daily_detections"] = rm(det, "daily_detections")
     metrics["daily_hospitalizations"] = rm(hosp, "daily_hospitalizations")

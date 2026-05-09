@@ -113,6 +113,16 @@ def rolling_avg(arr: np.ndarray, window: int = 7) -> np.ndarray:
     return out
 
 
+def rolling_mean(arr: np.ndarray, window: int = 7) -> np.ndarray:
+    if len(arr) == 0:
+        return arr
+    out = np.zeros_like(arr, dtype=float)
+    for i in range(len(arr)):
+        lo = max(0, i - window + 1)
+        out[i] = arr[lo:i+1].mean()
+    return out
+
+
 def read_daily_metric(path: str, metric: str):
     try:
         with h5py.File(path, "r") as f:
@@ -148,7 +158,7 @@ def plot(gt: Dict[str, np.ndarray], sim: Dict[str, np.ndarray], out_path: Path):
         g = pad(gt[key], total_days)
         s = pad(sim[key], total_days)
         if key == "hospitalizations":
-            s = np.convolve(s, np.ones(7), "full")[:total_days]
+            s = rolling_mean(s, 7)
         ax.bar(days, g, color=color, alpha=0.25, width=1.0, label="GT raw")
         ax.plot(days, rolling_avg(g), color=color, lw=2, label="GT 7d avg")
         ax.bar(days, s, color="#607D8B", alpha=0.18, width=1.0, label="Sim raw")
