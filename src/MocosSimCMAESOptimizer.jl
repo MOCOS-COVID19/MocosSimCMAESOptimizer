@@ -89,7 +89,13 @@ function load_stage_state(stage_root::String)
 end
 
 function stage_resume_info(stage_root::String)
-    iter_files = sort(glob(joinpath(stage_root, "iter_*", "candidate_list.txt")))
+    iter_files = String[]
+    isdir(stage_root) || return nothing
+    for entry in readdir(stage_root)
+        startswith(entry, "iter_") || continue
+        cand = joinpath(stage_root, entry, "candidate_list.txt")
+        isfile(cand) && push!(iter_files, cand)
+    end
     isempty(iter_files) && return nothing
     last_iter = maximum(parse(Int, match(r"iter_(\d+)", f).captures[1]) for f in iter_files)
     return Dict("last_iter" => last_iter, "last_iter_file" => iter_files[end])
