@@ -66,6 +66,13 @@ def load_records(search_dir: Path):
     return sorted(records, key=lambda r: (r["stage"], r["iter"], r["cand"]))
 
 
+def load_optimized_paths(config_path: Path):
+    cfg = json.loads(config_path.read_text())
+    paths = set(cfg.get("scalar_bounds", {}).keys())
+    paths.update(cfg.get("temporal_bounds", {}).keys())
+    return paths
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--search-dir", required=True, type=Path)
@@ -77,6 +84,8 @@ def main():
     if not records:
         raise SystemExit("No config.json files found")
 
+    optimized = load_optimized_paths(Path(__file__).resolve().parents[1] / "optimizer_config.json")
+
     out_dir = args.out_dir or (args.search_dir / "plots")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -87,21 +96,24 @@ def main():
         flattened.append(flat)
         params.update(flat.keys())
 
-    for param in sorted(params):
+    for param in sorted(p for p in params if p in optimized or any(p.startswith(x + "[") for x in optimized)):
         ys, xs, labels = [], [], []
         for idx, r in enumerate(records):
             if param not in flattened[idx]:
                 continue
             ys.append(flattened[idx][param])
             xs.append(len(xs))
-            labels.append(f"s{r['stage']}i{r['iter']}c{r['cand']}")
+            labels.append(f"stage{r['stage']}-iter{r['iter']}")
 
         if not ys:
             continue
 
         plt.figure(figsize=(14, 4))
         plt.plot(xs, ys, marker="o", linewidth=1)
-        plt.xticks(xs, labels, rotation=90, fontsize=6)
+        tick_every = max(1, len(xs) // 8)
+        tick_pos = xs[::tick_every]
+        tick_lab = labels[::tick_every]
+        plt.xticks(tick_pos, tick_lab, rotation=45, ha="right", fontsize=8)
         plt.title(param)
         plt.tight_layout()
         out = out_dir / f"{param.replace('.', '_')}.png"

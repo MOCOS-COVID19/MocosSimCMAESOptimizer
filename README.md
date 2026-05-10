@@ -60,3 +60,5 @@ If invoking manually on a Slurm node:
 ```sh
 /home/mbodych/1.7.0-school_class/julia-1.7.0/bin/julia --project=. run_optimizer.jl --slurm
 ```
+
+If a run stops mid-stage, re-running the same command resumes from the latest `real_sims/<stage>/stage_state.json` and `iter_metrics.jsonl` artifacts.

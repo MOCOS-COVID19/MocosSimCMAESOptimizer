@@ -69,11 +69,30 @@ function stage_transition_state(prev::CMAState, stage::StageConfig, specs_stage:
     return CMAState(copy(prev.mean), max(stage.sigma, max(prev.sigma * sigma_scale, sigma_floor)), cov)
 end
 
+function parse_stage_iter_from_path(path::String)
+    m = match(r"stage_(\d+).*/iter_(\d+)", replace(path, '\\' => '/'))
+    m === nothing && return 0, 0
+    return parse(Int, m.captures[1]), parse(Int, m.captures[2])
+end
+
 function append_jsonl(path::String, value)
     mkpath(dirname(path))
     open(path, "a") do io
         println(io, JSON.json(value))
     end
+end
+
+function load_stage_state(stage_root::String)
+    path = joinpath(stage_root, "stage_state.json")
+    isfile(path) || return nothing
+    return load_json(path)
+end
+
+function stage_resume_info(stage_root::String)
+    iter_files = sort(glob(joinpath(stage_root, "iter_*", "candidate_list.txt")))
+    isempty(iter_files) && return nothing
+    last_iter = maximum(parse(Int, match(r"iter_(\d+)", f).captures[1]) for f in iter_files)
+    return Dict("last_iter" => last_iter, "last_iter_file" => iter_files[end])
 end
 
 function normalize_json(value)
@@ -499,8 +518,19 @@ function submit_slurm_array(cfg::OptimizerConfig, list_file::String)
     n = length(lines)
     n == 0 && return ""
     cmd = `sbatch --parsable -c 4 -t 01:00:00 --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir)`
-    out = strip(read(cmd, String))
-    return out
+    last_err = nothing
+    for attempt in 1:5
+        try
+            out = strip(read(cmd, String))
+            isempty(out) && error("empty sbatch output")
+            return out
+        catch err
+            last_err = err
+            @warn "sbatch submission failed, retrying" attempt err
+            sleep(5.0 * attempt)
+        end
+    end
+    error("Failed to submit Slurm array after retries: $(last_err)")
 end
 
 function build_reference(seed::Dict{String,Any}, days::Int)
@@ -589,7 +619,7 @@ function update_state(state::CMAState, ranked::Vector{Tuple{Float64,Vector{Float
     return CMAState(new_mean, clamp(new_sigma, 0.02, 0.5), new_cov)
 end
 
-function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{ParamSpec}, cfg::OptimizerConfig, stage::StageConfig, state::Union{Nothing,CMAState}; use_slurm::Bool=false)
+function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{ParamSpec}, cfg::OptimizerConfig, stage::StageConfig, state::Union{Nothing,CMAState}; use_slurm::Bool=false, resume_from::Int=0)
     active_months = stage.fit_months
     days = active_months * cfg.monthly_days
     reference = build_reference(seed, days)
@@ -602,14 +632,19 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
         state = stage_transition_state(state, stage, specs_stage)
     end
 
+    stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
+    resume_state = load_stage_state(stage_root)
     history = Any[]
     iter_log = Any[]
-    best_score = Inf
-    best_vector = copy(state.mean)
+    best_score = resume_state === nothing ? Inf : Float64(get(resume_state, "best_score", Inf))
+    best_vector = resume_state !== nothing && haskey(resume_state, "best_vector") ? Float64.(resume_state["best_vector"]) : copy(state.mean)
     best_candidate = deepcopy(seed)
-    stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
+    if resume_state !== nothing && haskey(resume_state, "best_vector")
+        state = CMAState(copy(best_vector), Float64(get(resume_state, "sigma", state.sigma)), state.covariance)
+    end
+    start_iter = max(1, resume_from + 1)
 
-    for iter in 1:stage.max_iterations
+    for iter in start_iter:stage.max_iterations
         candidates, zs = cma_candidates(rng, state, stage.population_size)
         ranked = Tuple{Float64,Vector{Float64},Vector{Float64}}[]
         # If external sim configured and slurm enabled, dispatch via Slurm array; otherwise score inline
@@ -758,7 +793,13 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
     current_seed = deepcopy(seed)
 
     for stage in cfg.stages
-        result, state = run_stage(rng, current_seed, specs, cfg, stage, state; use_slurm=use_slurm)
+        stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
+        resume_info = stage_resume_info(stage_root)
+        resume_from = resume_info === nothing ? 0 : Int(resume_info["last_iter"])
+        if resume_info !== nothing
+            @info "Resuming stage from artifacts" stage=stage.name resume_from=resume_from
+        end
+        result, state = run_stage(rng, current_seed, specs, cfg, stage, state; use_slurm=use_slurm, resume_from=resume_from)
         current_seed = result["best_candidate"]
         update_stage_freeze!(cfg, stage, result["history"], specs)
         push!(stage_outputs, Dict(
