@@ -147,6 +147,17 @@ function get_nested(config::Dict{String,Any}, path::String)
     node = config
     parts = split(path, ".")
     for (i, part) in enumerate(parts)
+        m = match(r"^([^\[]+)\[(\d+)\]$", part)
+        if m !== nothing
+            key = m.captures[1]
+            idx = parse(Int, m.captures[2])
+            node = node[key]
+            if i == length(parts)
+                return node[idx]
+            end
+            node = node[idx]
+            continue
+        end
         if i == length(parts)
             return node[part]
         end
@@ -159,9 +170,24 @@ function set_nested!(config::Dict{String,Any}, path::String, value)
     node = config
     parts = split(path, ".")
     for part in parts[1:end-1]
-        node = node[part]
+        m = match(r"^([^\[]+)\[(\d+)\]$", part)
+        if m !== nothing
+            key = m.captures[1]
+            idx = parse(Int, m.captures[2])
+            node = node[key][idx]
+        else
+            node = node[part]
+        end
     end
-    node[parts[end]] = value
+    last = parts[end]
+    m = match(r"^([^\[]+)\[(\d+)\]$", last)
+    if m !== nothing
+        key = m.captures[1]
+        idx = parse(Int, m.captures[2])
+        node[key][idx] = value
+    else
+        node[last] = value
+    end
     return config
 end
 
@@ -232,7 +258,8 @@ function vector_to_config(seed::Dict{String,Any}, specs::Vector{ParamSpec}, x::V
     idx = 1
     for spec in specs
         if spec.kind == :scalar
-            set_nested!(cfg, spec.name, x[idx])
+            val = endswith(spec.name, ".num_infections") ? round(Int, x[idx]) : x[idx]
+            set_nested!(cfg, spec.name, val)
             idx += 1
         else
             current = map(float, get_nested(cfg, spec.name))

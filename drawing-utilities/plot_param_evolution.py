@@ -97,23 +97,35 @@ def main():
         params.update(flat.keys())
 
     for param in sorted(p for p in params if p in optimized or any(p.startswith(x + "[") for x in optimized)):
-        ys, xs, labels = [], [], []
+        ys, xs = [], []
+        tick_pos, tick_lab = [], []
+        stage_marks = []
+        last_stage = None
+        stage_iter_seen = set()
         for idx, r in enumerate(records):
             if param not in flattened[idx]:
                 continue
+            if last_stage is None or r["stage"] != last_stage:
+                stage_marks.append(len(xs))
+                last_stage = r["stage"]
             ys.append(flattened[idx][param])
             xs.append(len(xs))
-            labels.append(f"stage{r['stage']}-iter{r['iter']}")
+            if (r["stage"], r["iter"]) not in stage_iter_seen:
+                stage_iter_seen.add((r["stage"], r["iter"]))
+                tick_pos.append(len(xs) - 1)
+                if r["iter"] == 1:
+                    tick_lab.append(f"stage{r['stage']}/{r['iter']}")
+                else:
+                    tick_lab.append(f"{r['stage']}/{r['iter']}")
 
         if not ys:
             continue
 
         plt.figure(figsize=(14, 4))
         plt.plot(xs, ys, marker="o", linewidth=1)
-        tick_every = max(1, len(xs) // 8)
-        tick_pos = xs[::tick_every]
-        tick_lab = labels[::tick_every]
-        plt.xticks(tick_pos, tick_lab, rotation=45, ha="right", fontsize=8)
+        for m in stage_marks[1:]:
+            plt.axvline(m - 0.5, color="gray", linestyle="--", linewidth=0.8, alpha=0.7)
+        plt.xticks(tick_pos, tick_lab, rotation=45, ha="right", fontsize=7)
         plt.title(param)
         plt.tight_layout()
         out = out_dir / f"{param.replace('.', '_')}.png"
