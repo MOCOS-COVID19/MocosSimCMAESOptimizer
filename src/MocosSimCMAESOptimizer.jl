@@ -9,6 +9,7 @@ using HDF5
 using Printf
 
 const MANAGER_ROOT = abspath(joinpath(@__DIR__, ".."))
+const CURRENT_OPTIMIZER_CONFIG = Ref{Any}(nothing)
 
 export main, run_optimizer
 
@@ -40,6 +41,7 @@ struct OptimizerConfig
     stages::Vector{StageConfig}
     scalar_bounds::Dict{String,Tuple{Float64,Float64}}
     temporal_bounds::Dict{String,Tuple{Float64,Float64}}
+    scalar_preprocessing::Dict{String,Dict{String,Any}}
     objective::ObjectiveConfig
     external_sim::Union{Nothing,ExternalSimConfig}
     stage_freeze::Dict{String,Vector{String}}
@@ -130,6 +132,12 @@ function load_config(path::String)
     stages = [StageConfig(s["name"], s["fit_months"], s["max_iterations"], s["population_size"], float(s["sigma"])) for s in raw["stages"]]
     scalar_bounds = Dict(k => (float(v[1]), float(v[2])) for (k, v) in raw["scalar_bounds"])
     temporal_bounds = Dict(k => (float(v[1]), float(v[2])) for (k, v) in raw["temporal_bounds"])
+    scalar_preprocessing = Dict{String,Dict{String,Any}}()
+    if haskey(raw, "scalar_preprocessing")
+        for (k, v) in raw["scalar_preprocessing"]
+            scalar_preprocessing[String(k)] = Dict(String(kk) => vv for (kk, vv) in v)
+        end
+    end
     objective = ObjectiveConfig(Dict(k => float(v) for (k, v) in raw["objective"]["weights"]), Int(raw["objective"]["recent_days"]), float(raw["objective"]["early_reject_multiplier"]))
     external_sim = haskey(raw, "gt_dir") && haskey(raw, "julia_bin") && haskey(raw, "project_dir") && haskey(raw, "advanced_cli") ?
         ExternalSimConfig(String(raw["gt_dir"]), String(raw["julia_bin"]), String(raw["project_dir"]), String(raw["advanced_cli"])) :
@@ -140,7 +148,41 @@ function load_config(path::String)
             stage_freeze[String(k)] = [String(x) for x in v]
         end
     end
-    return OptimizerConfig(raw["seed_config"], raw["output_dir"], Int(raw["monthly_days"]), stages, scalar_bounds, temporal_bounds, objective, external_sim, stage_freeze)
+    return OptimizerConfig(raw["seed_config"], raw["output_dir"], Int(raw["monthly_days"]), stages, scalar_bounds, temporal_bounds, scalar_preprocessing, objective, external_sim, stage_freeze)
+end
+
+function scalar_preprocessing_entry(cfg::OptimizerConfig, spec::ParamSpec)
+    return get(cfg.scalar_preprocessing, spec.name, nothing)
+end
+
+function encode_scalar_value(cfg::OptimizerConfig, seed::Dict{String,Any}, spec::ParamSpec, value)
+    preprocessing = scalar_preprocessing_entry(cfg, spec)
+    preprocessing === nothing && return float(value)
+    mode = get(preprocessing, "mode", nothing)
+    mode == "normalize_to_bounds" || return float(value)
+    lo = float(get(preprocessing, "min", spec.lower))
+    hi = float(get(preprocessing, "max", spec.upper))
+    hi > lo || error("normalize_to_bounds requires max > min for $(spec.name)")
+    return clamp((float(value) - lo) / (hi - lo), 0.0, 1.0)
+end
+
+function decode_scalar_value(cfg::OptimizerConfig, seed::Dict{String,Any}, spec::ParamSpec, value::Float64)
+    preprocessing = scalar_preprocessing_entry(cfg, spec)
+    raw = value
+    if preprocessing !== nothing
+        mode = get(preprocessing, "mode", nothing)
+        if mode == "normalize_to_bounds"
+            lo = float(get(preprocessing, "min", spec.lower))
+            hi = float(get(preprocessing, "max", spec.upper))
+            hi > lo || error("normalize_to_bounds requires max > min for $(spec.name)")
+            raw = lo + clamp(value, 0.0, 1.0) * (hi - lo)
+        end
+    end
+    map_mode = preprocessing === nothing ? nothing : get(preprocessing, "map", nothing)
+    if map_mode == "integer" || endswith(spec.name, ".num_infections") || occursin(".time_limit", spec.name)
+        return round(Int, raw)
+    end
+    return raw
 end
 
 function get_nested(config::Dict{String,Any}, path::String)
@@ -151,6 +193,7 @@ function get_nested(config::Dict{String,Any}, path::String)
         if m !== nothing
             key = m.captures[1]
             idx = parse(Int, m.captures[2])
+            idx > 0 || error("Config path uses zero-based index in '$path'. Use Julia-style 1-based indexing.")
             node = node[key]
             if i == length(parts)
                 return node[idx]
@@ -174,6 +217,7 @@ function set_nested!(config::Dict{String,Any}, path::String, value)
         if m !== nothing
             key = m.captures[1]
             idx = parse(Int, m.captures[2])
+            idx > 0 || error("Config path uses zero-based index in '$path'. Use Julia-style 1-based indexing.")
             node = node[key][idx]
         else
             node = node[part]
@@ -184,6 +228,7 @@ function set_nested!(config::Dict{String,Any}, path::String, value)
     if m !== nothing
         key = m.captures[1]
         idx = parse(Int, m.captures[2])
+        idx > 0 || error("Config path uses zero-based index in '$path'. Use Julia-style 1-based indexing.")
         node[key][idx] = value
     else
         node[last] = value
@@ -194,7 +239,12 @@ end
 function build_specs(seed::Dict{String,Any}, cfg::OptimizerConfig)
     specs = ParamSpec[]
     for (name, (lo, hi)) in sort(collect(cfg.scalar_bounds), by=first)
-        push!(specs, ParamSpec(name, :scalar, 1, lo, hi))
+        preprocessing = get(cfg.scalar_preprocessing, name, nothing)
+        if preprocessing !== nothing && get(preprocessing, "mode", nothing) == "normalize_to_bounds"
+            push!(specs, ParamSpec(name, :scalar, 1, 0.0, 1.0))
+        else
+            push!(specs, ParamSpec(name, :scalar, 1, lo, hi))
+        end
     end
     for (name, (lo, hi)) in sort(collect(cfg.temporal_bounds), by=first)
         arr = get_nested(seed, name)
@@ -231,10 +281,12 @@ end
 
 function initial_vector(seed::Dict{String,Any}, specs::Vector{ParamSpec})
     values = Float64[]
+    optcfg = CURRENT_OPTIMIZER_CONFIG[]
     for spec in specs
         current = get_nested(seed, spec.name)
         if spec.kind == :scalar
-            push!(values, float(current))
+            val = optcfg === nothing ? float(current) : encode_scalar_value(optcfg, seed, spec, current)
+            push!(values, val)
         else
             append!(values, map(float, current))
         end
@@ -253,17 +305,32 @@ function clip!(x::Vector{Float64}, specs::Vector{ParamSpec})
     return x
 end
 
+function temporal_active_length(seed::Dict{String,Any}, spec::ParamSpec, active_months::Int, cfg::OptimizerConfig)
+    active_days = active_months * cfg.monthly_days
+    interval_times = get_nested(seed, replace(spec.name, "interval_values" => "interval_times"))
+    isempty(interval_times) && return min(active_days, spec.length)
+    if length(interval_times) == 1
+        step_days = max(float(interval_times[1]), 1.0)
+    else
+        deltas = [float(interval_times[i+1]) - float(interval_times[i]) for i in 1:length(interval_times)-1]
+        positive_deltas = [d for d in deltas if d > 0]
+        step_days = isempty(positive_deltas) ? max(float(interval_times[1]), 1.0) : minimum(positive_deltas)
+    end
+    return min(cld(active_days, max(round(Int, step_days), 1)), spec.length)
+end
+
 function vector_to_config(seed::Dict{String,Any}, specs::Vector{ParamSpec}, x::Vector{Float64}, active_months::Int)
     cfg = deepcopy(seed)
+    optcfg = CURRENT_OPTIMIZER_CONFIG[]
     idx = 1
     for spec in specs
         if spec.kind == :scalar
-            val = endswith(spec.name, ".num_infections") ? round(Int, x[idx]) : x[idx]
+            val = optcfg === nothing ? x[idx] : decode_scalar_value(optcfg, seed, spec, x[idx])
             set_nested!(cfg, spec.name, val)
             idx += 1
         else
             current = map(float, get_nested(cfg, spec.name))
-            active = min(active_months, spec.length)
+            active = optcfg === nothing ? min(active_months, spec.length) : temporal_active_length(seed, spec, active_months, optcfg)
             for i in 1:active
                 current[i] = x[idx]
                 idx += 1
@@ -550,7 +617,7 @@ function submit_slurm_array(cfg::OptimizerConfig, list_file::String)
     lines = readlines(list_file)
     n = length(lines)
     n == 0 && return ""
-    cmd = `sbatch --parsable -c 4 -t 01:00:00 --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir)`
+    cmd = `sbatch --parsable -c 4 -t 01:00:00 --mem=16G --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir)`
     last_err = nothing
     for attempt in 1:5
         try
@@ -816,6 +883,7 @@ end
 
 function run_optimizer(config_path::String; use_slurm::Bool=false)
     cfg = load_config(config_path)
+    CURRENT_OPTIMIZER_CONFIG[] = cfg
     seed = load_json(cfg.seed_config)
     specs = build_specs(seed, cfg)
     rng = MersenneTwister(42)

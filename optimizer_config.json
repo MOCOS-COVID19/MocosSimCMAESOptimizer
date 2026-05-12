@@ -43,5 +43,37 @@
   "gt_dir": "./gt",
   "julia_bin": "/Users/marcinbodych/Workspace/saxocov/julia-1.7.0/bin/julia",
   "project_dir": "/Users/marcinbodych/Workspace/saxocov/MocosSimLauncher",
-  "advanced_cli": "/Users/marcinbodych/Workspace/saxocov/MocosSimLauncher/advanced_cli.jl"
+  "advanced_cli": "/Users/marcinbodych/Workspace/saxocov/MocosSimLauncher/advanced_cli.jl",
+  "scalar_preprocessing": {
+    "imported_cases[1].params.num_infections": {
+      "mode": "normalize_to_bounds",
+      "min": 10,
+      "max": 1000,
+      "map": "integer"
+    },
+    "imported_cases[3].params.time_limit": {
+      "mode": "normalize_to_bounds",
+      "min": 34,
+      "max": 44,
+      "map": "integer"
+    },
+    "imported_cases[4].params.time_limit": {
+      "mode": "normalize_to_bounds",
+      "min": 50,
+      "max": 70,
+      "map": "integer"
+    },
+    "imported_cases[5].params.time_limit": {
+      "mode": "normalize_to_bounds",
+      "min": 145,
+      "max": 165,
+      "map": "integer"
+    },
+    "imported_cases[6].params.time_limit": {
+      "mode": "normalize_to_bounds",
+      "min": 375,
+      "max": 395,
+      "map": "integer"
+    }
+  }
 }

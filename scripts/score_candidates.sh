@@ -51,8 +51,11 @@ rm -f "$DONE_OK" "$FAILED_OK"
 
 echo "[$(date)] candidate=$CAND_DIR"
 
-echo "[$(date)] Instantiating MocosSimLauncher for this task"
-"$JULIA_BIN" --project="$PROJECT_DIR" -e 'using Pkg; Pkg.instantiate()'
+export JULIA_PKG_PRECOMPILE_AUTO=0
+export JULIA_NUM_PRECOMPILE_TASKS=1
+
+echo "[$(date)] Instantiating MocosSimLauncher for this task (without auto-precompile)"
+"$JULIA_BIN" --project="$PROJECT_DIR" -e 'using Pkg; Pkg.instantiate(; allow_autoprecomp=false)'
 
 echo "[$(date)] Preparing uv environment for plotting"
 if command -v uv >/dev/null 2>&1; then
