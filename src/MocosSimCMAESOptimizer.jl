@@ -753,6 +753,12 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
     if haskey(gt, "daily_student_detections")
         metrics["daily_student_detections_cumulative"] = per_trajectory_cumulative_rmae(daily_path, "daily_student_detections", gt["daily_student_detections"], days)
     end
+    metrics["daily_detections_cumulative_rmae"] = metrics["daily_detections_cumulative"]
+    metrics["daily_hospitalizations_cumulative_rmae"] = metrics["daily_hospitalizations_cumulative"]
+    metrics["daily_deaths_cumulative_rmae"] = metrics["daily_deaths_cumulative"]
+    if haskey(metrics, "daily_student_detections_cumulative")
+        metrics["daily_student_detections_cumulative_rmae"] = metrics["daily_student_detections_cumulative"]
+    end
     sax_scholars_metric = sax_scholars_rmae_from_daily(daily_path, cfg, days)
     if sax_scholars_metric !== nothing
         metrics["sax_scholars_rmae"] = sax_scholars_metric
@@ -765,7 +771,7 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
                get(weights, "daily_detections_cumulative", 1.0) * get(metrics, "daily_detections_cumulative", 0.0) +
                get(weights, "daily_hospitalizations_cumulative", 1.0) * get(metrics, "daily_hospitalizations_cumulative", 0.0) +
                get(weights, "daily_deaths_cumulative", 1.0) * get(metrics, "daily_deaths_cumulative", 0.0) +
-               get(weights, "daily_student_detections_cumulative", 1.0) * get(metrics, "daily_student_detections_cumulative", 0.0) +
+               get(weights, "daily_student_detections_cumulative", 0.0) * get(metrics, "daily_student_detections_cumulative", 0.0) +
                get(weights, "sax_scholars_rmae", 1.0) * get(metrics, "sax_scholars_rmae", 0.0)
     return combined, metrics
 end
