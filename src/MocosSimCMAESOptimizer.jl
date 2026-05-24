@@ -686,7 +686,7 @@ function drop_missing(series)
     return Float64[float(x) for x in series if x !== missing]
 end
 
-function per_trajectory_rmae(daily_path::String, metric::String, gt_series::Vector{Float64}, days::Int)
+function per_trajectory_rmae(daily_path::String, metric::String, gt_series::Vector{Union{Missing,Float64}}, days::Int)
     trajs = read_daily_metric(daily_path, metric)
     trajs === nothing && return Inf
     vals = Float64[]
@@ -701,7 +701,7 @@ function per_trajectory_rmae(daily_path::String, metric::String, gt_series::Vect
     return sum(vals) / length(vals)
 end
 
-function per_trajectory_cumulative_rmae(daily_path::String, metric::String, gt_series::Vector{Float64}, days::Int)
+function per_trajectory_cumulative_rmae(daily_path::String, metric::String, gt_series::Vector{Union{Missing,Float64}}, days::Int)
     trajs = read_daily_metric(daily_path, metric)
     trajs === nothing && return Inf
     vals = Float64[]
@@ -716,7 +716,7 @@ function per_trajectory_cumulative_rmae(daily_path::String, metric::String, gt_s
     return sum(vals) / length(vals)
 end
 
-function trajectory_metric_values(daily_path::String, metric::String, gt_series::Vector{Float64}, days::Int)
+function trajectory_metric_values(daily_path::String, metric::String, gt_series::Vector{Union{Missing,Float64}}, days::Int)
     trajs = read_daily_metric(daily_path, metric)
     trajs === nothing && return Float64[]
     g = drop_missing(gt_series[1:min(end, days)])
@@ -730,7 +730,7 @@ function trajectory_metric_values(daily_path::String, metric::String, gt_series:
     return vals
 end
 
-function cumulative_metric_values(daily_path::String, metric::String, gt_series::Vector{Float64}, days::Int)
+function cumulative_metric_values(daily_path::String, metric::String, gt_series::Vector{Union{Missing,Float64}}, days::Int)
     trajs = read_daily_metric(daily_path, metric)
     trajs === nothing && return Float64[]
     g = drop_missing(gt_series[1:min(end, days)])
@@ -750,8 +750,8 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     gt = load_gt_series(cfg.external_sim.gt_dir)
     metrics = Dict{String,Float64}()
     for (metric, gtvals) in gt
-        metrics[metric] = per_trajectory_rmae(daily_path, metric, Float64.(gtvals), days)
-        metrics["$(metric)_cumulative"] = per_trajectory_cumulative_rmae(daily_path, metric, Float64.(gtvals), days)
+        metrics[metric] = per_trajectory_rmae(daily_path, metric, drop_missing(gtvals), days)
+        metrics["$(metric)_cumulative"] = per_trajectory_cumulative_rmae(daily_path, metric, drop_missing(gtvals), days)
     end
     sax_scholars_metric = sax_scholars_rmae_from_daily(daily_path, cfg, days)
     if sax_scholars_metric !== nothing
@@ -773,17 +773,17 @@ end
 function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
     gt = load_gt_series(cfg.external_sim.gt_dir)
     metrics = Dict{String,Float64}()
-    metrics["daily_detections"] = per_trajectory_rmae(daily_path, "daily_detections", Float64.(gt["daily_detections"]), days)
-    metrics["daily_hospitalizations"] = per_trajectory_rmae(daily_path, "daily_hospitalizations", Float64.(gt["daily_hospitalizations"]), days)
-    metrics["daily_deaths"] = per_trajectory_rmae(daily_path, "daily_deaths", Float64.(gt["daily_deaths"]), days)
+    metrics["daily_detections"] = per_trajectory_rmae(daily_path, "daily_detections", gt["daily_detections"], days)
+    metrics["daily_hospitalizations"] = per_trajectory_rmae(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], days)
+    metrics["daily_deaths"] = per_trajectory_rmae(daily_path, "daily_deaths", gt["daily_deaths"], days)
     if haskey(gt, "daily_student_detections")
-        metrics["daily_student_detections"] = per_trajectory_rmae(daily_path, "daily_student_detections", Float64.(gt["daily_student_detections"]), days)
+        metrics["daily_student_detections"] = per_trajectory_rmae(daily_path, "daily_student_detections", gt["daily_student_detections"], days)
     end
-    metrics["daily_detections_cumulative"] = per_trajectory_cumulative_rmae(daily_path, "daily_detections", Float64.(gt["daily_detections"]), days)
-    metrics["daily_hospitalizations_cumulative"] = per_trajectory_cumulative_rmae(daily_path, "daily_hospitalizations", Float64.(gt["daily_hospitalizations"]), days)
-    metrics["daily_deaths_cumulative"] = per_trajectory_cumulative_rmae(daily_path, "daily_deaths", Float64.(gt["daily_deaths"]), days)
+    metrics["daily_detections_cumulative"] = per_trajectory_cumulative_rmae(daily_path, "daily_detections", gt["daily_detections"], days)
+    metrics["daily_hospitalizations_cumulative"] = per_trajectory_cumulative_rmae(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], days)
+    metrics["daily_deaths_cumulative"] = per_trajectory_cumulative_rmae(daily_path, "daily_deaths", gt["daily_deaths"], days)
     if haskey(gt, "daily_student_detections")
-        metrics["daily_student_detections_cumulative"] = per_trajectory_cumulative_rmae(daily_path, "daily_student_detections", Float64.(gt["daily_student_detections"]), days)
+        metrics["daily_student_detections_cumulative"] = per_trajectory_cumulative_rmae(daily_path, "daily_student_detections", gt["daily_student_detections"], days)
     end
     sax_scholars_metric = sax_scholars_rmae_from_daily(daily_path, cfg, days)
     if sax_scholars_metric !== nothing
