@@ -1020,9 +1020,9 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                         "daily_detections" => comp["daily_detections"],
                         "daily_hospitalizations" => comp["daily_hospitalizations"],
                         "daily_deaths" => comp["daily_deaths"],
-                        "daily_detections_per_trajectory" => trajectory_metric_values(daily_path, "daily_detections", Float64.(load_gt_series(cfg.external_sim.gt_dir)["daily_detections"]), days),
-                        "daily_hospitalizations_per_trajectory" => trajectory_metric_values(daily_path, "daily_hospitalizations", Float64.(load_gt_series(cfg.external_sim.gt_dir)["daily_hospitalizations"]), days),
-                        "daily_deaths_per_trajectory" => trajectory_metric_values(daily_path, "daily_deaths", Float64.(load_gt_series(cfg.external_sim.gt_dir)["daily_deaths"]), days),
+                        "daily_detections_per_trajectory" => trajectory_metric_values(daily_path, "daily_detections", load_gt_series(cfg.external_sim.gt_dir)["daily_detections"], days),
+                        "daily_hospitalizations_per_trajectory" => trajectory_metric_values(daily_path, "daily_hospitalizations", load_gt_series(cfg.external_sim.gt_dir)["daily_hospitalizations"], days),
+                        "daily_deaths_per_trajectory" => trajectory_metric_values(daily_path, "daily_deaths", load_gt_series(cfg.external_sim.gt_dir)["daily_deaths"], days),
                         "simulated" => "real",
                     )
                     if haskey(comp, "sax_scholars_rmae")
