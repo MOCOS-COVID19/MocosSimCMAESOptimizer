@@ -853,7 +853,7 @@ function submit_slurm_array(cfg::OptimizerConfig, list_file::String)
     lines = readlines(list_file)
     n = length(lines)
     n == 0 && return ""
-    cmd = `sbatch --parsable -c 4 -t 01:00:00 --mem=16G --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir)`
+    cmd = `sbatch --parsable -c 4 -t 01:00:00 --mem=20G --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir)`
     last_err = nothing
     for attempt in 1:5
         try

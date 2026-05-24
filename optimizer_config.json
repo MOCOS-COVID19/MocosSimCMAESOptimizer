@@ -1,31 +1,15 @@
 {
-  "seed_config": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/seed/config8.json",
-  "output_dir": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/runs/config8",
+  "seed_config": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/seed/config9.json",
+  "output_dir": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/runs/config9",
   "monthly_days": 30,
   "stages": [
-    {"name": "stage_10m", "fit_months": 10, "max_iterations": 25, "population_size": 30, "sigma": 0.3},
-    {"name": "stage_18m", "fit_months": 18, "max_iterations": 30, "population_size": 40, "sigma": 0.3}
+    {"name": "stage_10m", "fit_months": 10, "max_iterations": 5, "population_size": 30, "sigma": 0.3}
 ],
   "scalar_bounds": {
-    "mild_detection_delay": [0.0, 7.0],
-    "contact_tracing.testing_time": [0.5, 7.0],
-    "contact_tracing.detection_delay": [0.0, 7.0],
-    "transmission_probabilities.age_coupling_param": [0.0, 1.0],
-    "transmission_probabilities.school": [0.0, 0.5],
-    "transmission_probabilities.class": [0.0, 0.5],
-    "initial_conditions.hospitalization_multiplier": [0.2, 5.0],
-    "screening.precision": [0.0, 1.0],
-    "household_params.trace_prob": [0.0, 1.0],
-    "household_params.quarantine_prob": [0.0, 1.0],
-    "mild_detection_prob": [0.0, 1.0],
-    "contact_tracing.probability": [0.0, 1.0],
-    "imported_cases[1].params.num_infections": [10, 2500],
-    "imported_cases[2].params.time_limit": [31, 120],
-    "imported_cases[2].params.frequency": [0.001, 1],
-    "imported_cases[3].params.time_limit": [150, 250],
-    "imported_cases[3].params.frequency": [0.001, 1],
-    "imported_cases[4].params.time_limit": [325, 450],
-    "imported_cases[4].params.frequency": [0.001, 1]
+    "transmission_probabilities.age_coupling_param": [0.48, 0.64],
+    "transmission_probabilities.school": [0, 0.4],
+    "transmission_probabilities.class": [0.1, 0.5],
+    "initial_conditions.hospitalization_multiplier": [1.0, 3.0]
   },
   "temporal_bounds": {
     "infection_modulation.params.interval_values": [0.0, 1.0],
@@ -45,32 +29,6 @@
     "early_reject_multiplier": 2.2
   },
   "gt_dir": "./gt",
-  "scalar_preprocessing": {
-    "imported_cases[1].params.num_infections": {
-      "mode": "normalize_to_bounds",
-      "min": 10,
-      "max": 2500,
-      "map": "integer"
-    },
-    "imported_cases[2].params.time_limit": {
-      "mode": "normalize_to_bounds",
-      "min": 31,
-      "max": 120,
-      "map": "integer"
-    },
-    "imported_cases[3].params.time_limit": {
-      "mode": "normalize_to_bounds",
-      "min": 150,
-      "max": 250,
-      "map": "integer"
-    },
-    "imported_cases[4].params.time_limit": {
-      "mode": "normalize_to_bounds",
-      "min": 325,
-      "max": 450,
-      "map": "integer"
-    }
-  },
   "julia_bin": "/home/mbodych/1.7.0-school_class/julia-1.7.0/bin/julia",
   "project_dir": "/home/mbodych/1.7.0-school_class/MocosSimLauncher",
   "advanced_cli": "/home/mbodych/1.7.0-school_class/MocosSimLauncher/advanced_cli.jl"
