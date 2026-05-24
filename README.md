@@ -7,6 +7,17 @@ uv run -- python drawing-utilities/plot_param_evolution.py \
   --search-dir runs/wcss3m/real_sims \
   --out-dir runs/wcss3m/real_sims/plots
 ```
+
+To rebuild the interactive HTML viewer for a plots directory:
+
+```bash
+python3 drawing-utilities/build_plot_viewer.py \
+  --plots-dir config8/real_sims/plots \
+  --title "Config8 plot explorer"
+```
+
+This regenerates `index.html`, includes `gt_vs_sim.png` entries from sibling stage/iteration/candidate directories, loads nearby `metrics.json`, and orders `gt_vs_sim` items by lowest `score` first.
+
 # MocosSimCMAESOptimizer
 
 This package runs a synthetic CMA-ES optimizer against a configurable epidemic simulation seed and records the best parameter combinations per stage.

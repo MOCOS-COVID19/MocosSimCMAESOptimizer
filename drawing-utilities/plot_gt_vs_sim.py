@@ -34,6 +34,7 @@ def load_gt(gt_dir: Path) -> Dict[str, np.ndarray]:
         "detections": gt_dir / "daily_detections.csv",
         "deaths": gt_dir / "daily_deaths.csv",
         "hospitalizations": gt_dir / "daily_hospitalizations.csv",
+        "student_detections": gt_dir / "daily_student_detections.csv",
     }
     for key, path in files.items():
         if not path.exists():
@@ -73,6 +74,7 @@ def synthetic_simulation(config: Dict, days: int) -> Dict[str, np.ndarray]:
     quarantine_prob = float(config["household_params"]["quarantine_prob"])
 
     detections = []
+    student_detections = []
     # For this synthetic visual, derive hospitalizations/deaths as scaled detections
     hospitalizations = []
     deaths = []
@@ -85,11 +87,13 @@ def synthetic_simulation(config: Dict, days: int) -> Dict[str, np.ndarray]:
         trend = 0.12 * day * infection[bucket - 1]
         signal = max(0.0, base + contact + trend - control + 6.0 * hosp)
         detections.append(signal)
+        student_detections.append(signal * 0.35)
         hospitalizations.append(signal * 0.07)  # simple scaling for visualization
         deaths.append(signal * 0.01)            # simple scaling for visualization
 
     return {
         "detections": np.array(detections, dtype=float),
+        "student_detections": np.array(student_detections, dtype=float),
         "hospitalizations": np.array(hospitalizations, dtype=float),
         "deaths": np.array(deaths, dtype=float),
     }
@@ -123,6 +127,10 @@ def rolling_mean(arr: np.ndarray, window: int = 7) -> np.ndarray:
     return out
 
 
+def cumulative(arr: np.ndarray) -> np.ndarray:
+    return np.cumsum(arr, dtype=float)
+
+
 def read_daily_metric(path: str, metric: str):
     try:
         with h5py.File(path, "r") as f:
@@ -145,6 +153,7 @@ def read_daily_metric(path: str, metric: str):
 
 def plot(gt: Dict[str, np.ndarray], sim: Dict[str, np.ndarray], out_path: Path):
     metrics = [("detections", "Daily Detections", "#2196F3"),
+               ("student_detections", "Daily Student Detections", "#4CAF50"),
                ("hospitalizations", "7-day Hospitalizations (roll sum)", "#FF9800"),
                ("deaths", "Daily Deaths", "#F44336")]
 
@@ -167,12 +176,29 @@ def plot(gt: Dict[str, np.ndarray], sim: Dict[str, np.ndarray], out_path: Path):
         ax.grid(axis="y", alpha=0.3)
         ax.legend(fontsize=8, loc="upper left")
 
+    fig2, axes2 = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+    fig2.suptitle("Ground Truth vs Synthetic Simulation (Cumulative)", fontsize=12)
+    for ax, (key, title, color) in zip(axes2, metrics):
+        g = cumulative(pad(gt[key], total_days))
+        s = cumulative(pad(sim[key], total_days))
+        ax.plot(days, g, color=color, lw=2, label="GT cumulative")
+        ax.plot(days, s, color="#37474F", lw=2, ls="--", label="Sim cumulative")
+        ax.set_ylabel(title, fontsize=10)
+        ax.grid(axis="y", alpha=0.3)
+        ax.legend(fontsize=8, loc="upper left")
+    axes2[-1].set_xlabel("Day", fontsize=10)
+
     axes[-1].set_xlabel("Day", fontsize=10)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
     plt.savefig(out_path, dpi=140, bbox_inches="tight")
     plt.close(fig)
+    cum_path = out_path.with_name(out_path.stem + "_cumulative" + out_path.suffix)
+    plt.tight_layout()
+    plt.savefig(cum_path, dpi=140, bbox_inches="tight")
+    plt.close(fig2)
     print(f"Saved: {out_path}")
+    print(f"Saved: {cum_path}")
 
 
 def main():

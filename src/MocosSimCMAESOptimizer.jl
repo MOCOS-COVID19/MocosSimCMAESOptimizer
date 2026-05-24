@@ -439,26 +439,183 @@ end
 function load_gt_series(gt_dir::String)
     function load_csv(name)
         path = joinpath(gt_dir, name)
+        rows = Vector{Tuple{Int,Union{Missing,Float64}}}()
         open(path, "r") do io
             first = true
-            vals = Float64[]
             for line in eachline(io)
                 first && (first = false; continue)
                 parts = split(line, ",")
                 length(parts) >= 2 || continue
-                try
-                    push!(vals, parse(Float64, parts[2]))
+                day = try
+                    parse(Int, strip(parts[1]))
                 catch
+                    continue
                 end
+                value = try
+                    parse(Float64, strip(parts[2]))
+                catch
+                    missing
+                end
+                push!(rows, (day, value))
             end
-            return vals
         end
+        isempty(rows) && return Float64[]
+        sort!(rows, by = first)
+        min_day = rows[1][1]
+        max_day = rows[end][1]
+        values = Union{Missing,Float64}[missing for _ in min_day:max_day]
+        for (day, value) in rows
+            values[day - min_day + 1] = value
+        end
+        return values
     end
     return Dict(
         "daily_detections" => load_csv("daily_detections.csv"),
         "daily_hospitalizations" => load_csv("daily_hospitalizations.csv"),
         "daily_deaths" => load_csv("daily_deaths.csv"),
+        "daily_student_detections" => load_csv("sax-scholars-infections-normalized.csv"),
     )
+end
+
+const SAX_SCHOLARS_CACHE = Dict{String,Union{Nothing,Tuple{Vector{Int},Vector{Float64}}}}()
+
+function load_sax_scholars_series(gt_dir::String)
+    if isempty(gt_dir)
+        return nothing
+    end
+    cached = get(SAX_SCHOLARS_CACHE, gt_dir, nothing)
+    cached !== nothing && return cached
+    path = joinpath(gt_dir, "sax-scholars-infections-normalized.csv")
+    if !isfile(path)
+        SAX_SCHOLARS_CACHE[gt_dir] = nothing
+        return nothing
+    end
+    days = Int[]
+    values = Float64[]
+    open(path, "r") do io
+        first_line = true
+        for line in eachline(io)
+            first_line && (first_line = false; continue)
+            line = strip(line)
+            isempty(line) && continue
+            parts = split(line, ",")
+            length(parts) < 2 && continue
+            try
+                day = parse(Int, strip(parts[1]))
+                val = parse(Float64, strip(parts[2])) / 7.0
+                push!(days, day)
+                push!(values, val)
+            catch
+                continue
+            end
+        end
+    end
+    if isempty(days)
+        SAX_SCHOLARS_CACHE[gt_dir] = nothing
+        return nothing
+    end
+    order = sortperm(days)
+    SAX_SCHOLARS_CACHE[gt_dir] = (days[order], values[order])
+    return SAX_SCHOLARS_CACHE[gt_dir]
+end
+
+function sax_scholars_targets_for_days(gt_dir::String, days::Int)
+    data = load_sax_scholars_series(gt_dir)
+    data === nothing && return nothing
+    src_days, src_values = data
+    selected_days = Int[]
+    selected_values = Float64[]
+    for (day, val) in zip(src_days, src_values)
+        day < 1 && continue
+        day > days && break
+        push!(selected_days, day)
+        push!(selected_values, val)
+    end
+    isempty(selected_days) && return nothing
+    return selected_days, selected_values
+end
+
+function sax_scholars_targets(cfg::OptimizerConfig, days::Int)
+    gt_dir = cfg.external_sim === nothing ? joinpath(MANAGER_ROOT, "gt") : cfg.external_sim.gt_dir
+    sax_scholars_targets_for_days(gt_dir, days)
+end
+
+function moving_average(series::Vector{Float64}, window::Int=7)
+    n = length(series)
+    n == 0 && return Float64[]
+    w = max(window, 1)
+    out = similar(series)
+    acc = 0.0
+    for i in 1:n
+        acc += series[i]
+        if i > w
+            acc -= series[i - w]
+        end
+        out[i] = acc / min(i, w)
+    end
+    return out
+end
+
+function sax_scholars_rmae_from_series(series::Vector{Float64}, sax_days::Vector{Int}, sax_values::Vector{Float64})
+    moving = moving_average(series, 7)
+    sims = Float64[]
+    targets = Float64[]
+    for (day, val) in zip(sax_days, sax_values)
+        if 1 <= day <= length(moving)
+            push!(sims, moving[day])
+            push!(targets, val)
+        end
+    end
+    isempty(sims) && return Inf
+    return rmae_series(sims, targets)
+end
+
+function sax_scholars_rmae_from_vector(series::Vector{Float64}, cfg::OptimizerConfig, days::Int)
+    data = sax_scholars_targets(cfg, days)
+    data === nothing && return nothing
+    sax_days, sax_values = data
+    return sax_scholars_rmae_from_series(series, sax_days, sax_values)
+end
+
+function sax_scholars_rmae_from_daily(daily_path::String, cfg::OptimizerConfig, days::Int)
+    data = sax_scholars_targets(cfg, days)
+    data === nothing && return nothing
+    sax_days, sax_values = data
+    trajs = read_daily_metric(daily_path, "daily_student_detections")
+    trajs === nothing && return nothing
+    vals = Float64[]
+    for traj in trajs
+        s = Float64.(traj[1:min(end, days)])
+        push!(vals, sax_scholars_rmae_from_series(s, sax_days, sax_values))
+    end
+    isempty(vals) && return nothing
+    return sum(vals) / length(vals)
+end
+
+function per_trajectory_sax_scholars_rmae(daily_path::String, sax_days::Vector{Int}, sax_values::Vector{Float64}, days::Int)
+    trajs = read_daily_metric(daily_path, "daily_student_detections")
+    trajs === nothing && return Inf
+    vals = Float64[]
+    for traj in trajs
+        s = Float64.(traj[1:min(end, days)])
+        push!(vals, sax_scholars_rmae_from_series(s, sax_days, sax_values))
+    end
+    isempty(vals) && return Inf
+    return sum(vals) / length(vals)
+end
+
+function sax_scholars_metric_values(daily_path::String, cfg::OptimizerConfig, days::Int)
+    data = sax_scholars_targets(cfg, days)
+    data === nothing && return Float64[]
+    sax_days, sax_values = data
+    trajs = read_daily_metric(daily_path, "daily_student_detections")
+    trajs === nothing && return Float64[]
+    vals = Float64[]
+    for traj in trajs
+        s = Float64.(traj[1:min(end, days)])
+        push!(vals, sax_scholars_rmae_from_series(s, sax_days, sax_values))
+    end
+    return vals
 end
 
 function read_daily_metric(path::String, metric::String)
@@ -515,11 +672,25 @@ function rolling_sum(series::Vector{Float64}, window::Int)
     return out
 end
 
+function cumulative_series(series::Vector{Float64})
+    out = similar(series)
+    acc = 0.0
+    for i in 1:length(series)
+        acc += series[i]
+        out[i] = acc
+    end
+    return out
+end
+
+function drop_missing(series)
+    return Float64[float(x) for x in series if x !== missing]
+end
+
 function per_trajectory_rmae(daily_path::String, metric::String, gt_series::Vector{Float64}, days::Int)
     trajs = read_daily_metric(daily_path, metric)
     trajs === nothing && return Inf
     vals = Float64[]
-    g = Float64.(gt_series[1:min(end, days)])
+    g = drop_missing(gt_series[1:min(end, days)])
     g = rolling_sum(g, 7)
     for traj in trajs
         s = Float64.(traj[1:min(end, days)])
@@ -530,15 +701,44 @@ function per_trajectory_rmae(daily_path::String, metric::String, gt_series::Vect
     return sum(vals) / length(vals)
 end
 
+function per_trajectory_cumulative_rmae(daily_path::String, metric::String, gt_series::Vector{Float64}, days::Int)
+    trajs = read_daily_metric(daily_path, metric)
+    trajs === nothing && return Inf
+    vals = Float64[]
+    g = drop_missing(gt_series[1:min(end, days)])
+    g = cumulative_series(g)
+    for traj in trajs
+        s = Float64.(traj[1:min(end, days)])
+        s = cumulative_series(s)
+        push!(vals, rmae_series(s, g))
+    end
+    isempty(vals) && return Inf
+    return sum(vals) / length(vals)
+end
+
 function trajectory_metric_values(daily_path::String, metric::String, gt_series::Vector{Float64}, days::Int)
     trajs = read_daily_metric(daily_path, metric)
     trajs === nothing && return Float64[]
-    g = Float64.(gt_series[1:min(end, days)])
+    g = drop_missing(gt_series[1:min(end, days)])
     g = rolling_sum(g, 7)
     vals = Float64[]
     for traj in trajs
         s = Float64.(traj[1:min(end, days)])
         s = rolling_sum(s, 7)
+        push!(vals, rmae_series(s, g))
+    end
+    return vals
+end
+
+function cumulative_metric_values(daily_path::String, metric::String, gt_series::Vector{Float64}, days::Int)
+    trajs = read_daily_metric(daily_path, metric)
+    trajs === nothing && return Float64[]
+    g = drop_missing(gt_series[1:min(end, days)])
+    g = cumulative_series(g)
+    vals = Float64[]
+    for traj in trajs
+        s = Float64.(traj[1:min(end, days)])
+        s = cumulative_series(s)
         push!(vals, rmae_series(s, g))
     end
     return vals
@@ -551,8 +751,22 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     metrics = Dict{String,Float64}()
     for (metric, gtvals) in gt
         metrics[metric] = per_trajectory_rmae(daily_path, metric, Float64.(gtvals), days)
+        metrics["$(metric)_cumulative"] = per_trajectory_cumulative_rmae(daily_path, metric, Float64.(gtvals), days)
     end
-    combined = 1.0 * metrics["daily_detections"] + 0.0 * metrics["daily_hospitalizations"] + 1.0 * metrics["daily_deaths"]
+    sax_scholars_metric = sax_scholars_rmae_from_daily(daily_path, cfg, days)
+    if sax_scholars_metric !== nothing
+        metrics["sax_scholars_rmae"] = sax_scholars_metric
+    end
+    weights = cfg.objective.weights
+    combined = get(weights, "daily_detections", 1.0) * metrics["daily_detections"] +
+               get(weights, "daily_hospitalizations", 0.0) * metrics["daily_hospitalizations"] +
+               get(weights, "daily_deaths", 1.0) * metrics["daily_deaths"] +
+               get(weights, "daily_student_detections", 0.0) * get(metrics, "daily_student_detections", 0.0) +
+               get(weights, "daily_detections_cumulative", 0.0) * get(metrics, "daily_detections_cumulative", 0.0) +
+               get(weights, "daily_hospitalizations_cumulative", 0.0) * get(metrics, "daily_hospitalizations_cumulative", 0.0) +
+               get(weights, "daily_deaths_cumulative", 0.0) * get(metrics, "daily_deaths_cumulative", 0.0) +
+               get(weights, "daily_student_detections_cumulative", 0.0) * get(metrics, "daily_student_detections_cumulative", 0.0) +
+               get(weights, "sax_scholars_rmae", 0.0) * get(metrics, "sax_scholars_rmae", 0.0)
     return combined, metrics
 end
 
@@ -562,7 +776,29 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
     metrics["daily_detections"] = per_trajectory_rmae(daily_path, "daily_detections", Float64.(gt["daily_detections"]), days)
     metrics["daily_hospitalizations"] = per_trajectory_rmae(daily_path, "daily_hospitalizations", Float64.(gt["daily_hospitalizations"]), days)
     metrics["daily_deaths"] = per_trajectory_rmae(daily_path, "daily_deaths", Float64.(gt["daily_deaths"]), days)
-    combined = 1.0 * metrics["daily_detections"] + 0.0 * metrics["daily_hospitalizations"] + 1.0 * metrics["daily_deaths"]
+    if haskey(gt, "daily_student_detections")
+        metrics["daily_student_detections"] = per_trajectory_rmae(daily_path, "daily_student_detections", Float64.(gt["daily_student_detections"]), days)
+    end
+    metrics["daily_detections_cumulative"] = per_trajectory_cumulative_rmae(daily_path, "daily_detections", Float64.(gt["daily_detections"]), days)
+    metrics["daily_hospitalizations_cumulative"] = per_trajectory_cumulative_rmae(daily_path, "daily_hospitalizations", Float64.(gt["daily_hospitalizations"]), days)
+    metrics["daily_deaths_cumulative"] = per_trajectory_cumulative_rmae(daily_path, "daily_deaths", Float64.(gt["daily_deaths"]), days)
+    if haskey(gt, "daily_student_detections")
+        metrics["daily_student_detections_cumulative"] = per_trajectory_cumulative_rmae(daily_path, "daily_student_detections", Float64.(gt["daily_student_detections"]), days)
+    end
+    sax_scholars_metric = sax_scholars_rmae_from_daily(daily_path, cfg, days)
+    if sax_scholars_metric !== nothing
+        metrics["sax_scholars_rmae"] = sax_scholars_metric
+    end
+    weights = cfg.objective.weights
+    combined = get(weights, "daily_detections", 1.0) * metrics["daily_detections"] +
+               get(weights, "daily_hospitalizations", 0.0) * metrics["daily_hospitalizations"] +
+               get(weights, "daily_deaths", 1.0) * metrics["daily_deaths"] +
+               get(weights, "daily_student_detections", 0.0) * get(metrics, "daily_student_detections", 0.0) +
+               get(weights, "daily_detections_cumulative", 0.0) * get(metrics, "daily_detections_cumulative", 0.0) +
+               get(weights, "daily_hospitalizations_cumulative", 0.0) * get(metrics, "daily_hospitalizations_cumulative", 0.0) +
+               get(weights, "daily_deaths_cumulative", 0.0) * get(metrics, "daily_deaths_cumulative", 0.0) +
+               get(weights, "daily_student_detections_cumulative", 0.0) * get(metrics, "daily_student_detections_cumulative", 0.0) +
+               get(weights, "sax_scholars_rmae", 0.0) * get(metrics, "sax_scholars_rmae", 0.0)
     return combined, metrics
 end
 
@@ -736,11 +972,13 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
     resume_state = load_stage_state(stage_root)
     history = Any[]
     iter_log = Any[]
-    best_score = resume_state === nothing ? Inf : Float64(get(resume_state, "best_score", Inf))
+    best_score_raw = resume_state === nothing ? Inf : get(resume_state, "best_score", Inf)
+    best_score = best_score_raw === nothing ? Inf : Float64(best_score_raw)
     best_vector = resume_state !== nothing && haskey(resume_state, "best_vector") ? Float64.(resume_state["best_vector"]) : copy(state.mean)
     best_candidate = deepcopy(seed)
     if resume_state !== nothing && haskey(resume_state, "best_vector")
-        state = CMAState(copy(best_vector), Float64(get(resume_state, "sigma", state.sigma)), state.covariance)
+        sigma_raw = get(resume_state, "sigma", state.sigma)
+        state = CMAState(copy(best_vector), sigma_raw === nothing ? state.sigma : Float64(sigma_raw), state.covariance)
     end
     start_iter = max(1, resume_from + 1)
 
@@ -787,6 +1025,10 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                         "daily_deaths_per_trajectory" => trajectory_metric_values(daily_path, "daily_deaths", Float64.(load_gt_series(cfg.external_sim.gt_dir)["daily_deaths"]), days),
                         "simulated" => "real",
                     )
+                    if haskey(comp, "sax_scholars_rmae")
+                        metrics_payload["sax_scholars_rmae"] = comp["sax_scholars_rmae"]
+                        metrics_payload["sax_scholars_per_trajectory"] = sax_scholars_metric_values(daily_path, cfg, days)
+                    end
                     save_json(joinpath(cand_dir, "metrics.json"), metrics_payload)
                     Dict("score" => combined, "metrics" => comp, "simulated" => "real")
                 else

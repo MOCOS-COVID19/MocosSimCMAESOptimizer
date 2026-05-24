@@ -15,6 +15,26 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+DISPLAY_PARAM_ALIASES = {
+    "imported_cases[0].params.num_infections": "imported_cases[0]_params_num_infections",
+    "imported_cases[1].params.time_limit": "imported_cases[1]_params_time_limit",
+    "imported_cases[1].params.frequency": "imported_cases[1]_params_frequency",
+    "imported_cases[2].params.time_limit": "imported_cases[2]_params_time_limit",
+    "imported_cases[2].params.frequency": "imported_cases[2]_params_frequency",
+    "imported_cases[3].params.time_limit": "imported_cases[3]_params_time_limit",
+    "imported_cases[3].params.frequency": "imported_cases[3]_params_frequency",
+}
+
+PARAM_ALTERNATIVES = {
+    "imported_cases[0].params.num_infections": ["imported_cases[1].params.num_infections"],
+    "imported_cases[1].params.time_limit": ["imported_cases[2].params.time_limit"],
+    "imported_cases[1].params.frequency": ["imported_cases[2].params.frequency"],
+    "imported_cases[2].params.time_limit": ["imported_cases[3].params.time_limit"],
+    "imported_cases[2].params.frequency": ["imported_cases[3].params.frequency"],
+    "imported_cases[3].params.time_limit": ["imported_cases[4].params.time_limit"],
+    "imported_cases[3].params.frequency": ["imported_cases[4].params.frequency"],
+}
+
 
 def get_nested(d, path):
     cur = d
@@ -73,6 +93,19 @@ def load_optimized_paths(config_path: Path):
     return paths
 
 
+def display_name(param: str) -> str:
+    return DISPLAY_PARAM_ALIASES.get(param, param)
+
+
+def resolve_param(flat, param: str):
+    if param in flat:
+        return param
+    for alt in PARAM_ALTERNATIVES.get(param, []):
+        if alt in flat:
+            return alt
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--search-dir", required=True, type=Path)
@@ -89,26 +122,34 @@ def main():
     out_dir = args.out_dir or (args.search_dir / "plots")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    params = set()
+    params = set(DISPLAY_PARAM_ALIASES.keys())
     flattened = []
     for r in records:
         flat = flatten_scalars(r["config"])
         flattened.append(flat)
         params.update(flat.keys())
 
-    for param in sorted(p for p in params if p in optimized or any(p.startswith(x + "[") for x in optimized)):
+    plotted = []
+    for param in sorted(params):
+        source_keys = [param, *PARAM_ALTERNATIVES.get(param, [])]
+        if not any(
+            key in optimized or any(key.startswith(x + "[") for x in optimized)
+            for key in source_keys
+        ):
+            continue
         ys, xs = [], []
         tick_pos, tick_lab = [], []
         stage_marks = []
         last_stage = None
         stage_iter_seen = set()
         for idx, r in enumerate(records):
-            if param not in flattened[idx]:
+            resolved = resolve_param(flattened[idx], param)
+            if resolved is None:
                 continue
             if last_stage is None or r["stage"] != last_stage:
                 stage_marks.append(len(xs))
                 last_stage = r["stage"]
-            ys.append(flattened[idx][param])
+            ys.append(flattened[idx][resolved])
             xs.append(len(xs))
             if (r["stage"], r["iter"]) not in stage_iter_seen:
                 stage_iter_seen.add((r["stage"], r["iter"]))
@@ -126,11 +167,12 @@ def main():
         for m in stage_marks[1:]:
             plt.axvline(m - 0.5, color="gray", linestyle="--", linewidth=0.8, alpha=0.7)
         plt.xticks(tick_pos, tick_lab, rotation=45, ha="right", fontsize=7)
-        plt.title(param)
+        plt.title(display_name(param))
         plt.tight_layout()
-        out = out_dir / f"{param.replace('.', '_')}.png"
+        out = out_dir / f"{display_name(param).replace('.', '_')}.png"
         plt.savefig(out, dpi=150)
         plt.close()
+        plotted.append(display_name(param))
         print(f"Saved: {out}")
 
 
