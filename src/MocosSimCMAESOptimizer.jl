@@ -379,38 +379,6 @@ function recent_weighted_rmse(a::Vector{Float64}, b::Vector{Float64}, recent_day
     return sqrt(err / max(denom, 1e-9))
 end
 
-function finite_diff_slope(series::Vector{Float64})
-    length(series) < 2 && return zeros(Float64, 0)
-    return [series[i+1] - series[i] for i in 1:length(series)-1]
-end
-
-function synthetic_simulation(config::Dict{String,Any}, days::Int)
-    infection = map(float, config["infection_modulation"]["params"]["interval_values"])
-    detection = map(float, config["mild_detection_modulation"]["params"]["interval_values"])
-    tracing = map(float, config["tracing_modulation"]["params"]["interval_values"])
-    household = float(config["transmission_probabilities"]["household"])
-    school = float(config["transmission_probabilities"]["school"])
-    classv = float(config["transmission_probabilities"]["class"])
-    agec = float(config["transmission_probabilities"]["age_coupling_param"])
-    mild = float(config["mild_detection_prob"])
-    hosp = float(config["initial_conditions"]["hospitalization_multiplier"])
-    precision = float(config["screening"]["precision"])
-    trace_prob = float(config["household_params"]["trace_prob"])
-    quarantine_prob = float(config["household_params"]["quarantine_prob"])
-
-    out = Float64[]
-    for day in 1:days
-        bucket = min(cld(day, 30), length(infection))
-        base = 15.0 * infection[bucket] * (0.6 + mild * detection[bucket])
-        contact = 50.0 * (0.8 * household + 0.4 * school + 0.7 * classv + 0.5 * agec)
-        control = 10.0 * tracing[bucket] * (trace_prob + quarantine_prob + precision)
-        trend = 0.12 * day * infection[bucket]
-        signal = max(0.0, base + contact + trend - control + 6.0 * hosp)
-        push!(out, signal)
-    end
-    return out
-end
-
 # ─────────────────────────────────────────────────────────────────────────────
 # External simulation hook (single-run) invoking manager/MocosSimLauncher
 # ─────────────────────────────────────────────────────────────────────────────
@@ -761,12 +729,12 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     combined = get(weights, "daily_detections", 1.0) * metrics["daily_detections"] +
                get(weights, "daily_hospitalizations", 0.0) * metrics["daily_hospitalizations"] +
                get(weights, "daily_deaths", 1.0) * metrics["daily_deaths"] +
-               get(weights, "daily_student_detections", 0.0) * get(metrics, "daily_student_detections", 0.0) +
-               get(weights, "daily_detections_cumulative", 0.0) * get(metrics, "daily_detections_cumulative", 0.0) +
+               get(weights, "daily_student_detections", 1.0) * get(metrics, "daily_student_detections", 0.0) +
+               get(weights, "daily_detections_cumulative", 1.0) * get(metrics, "daily_detections_cumulative", 0.0) +
                get(weights, "daily_hospitalizations_cumulative", 0.0) * get(metrics, "daily_hospitalizations_cumulative", 0.0) +
-               get(weights, "daily_deaths_cumulative", 0.0) * get(metrics, "daily_deaths_cumulative", 0.0) +
-               get(weights, "daily_student_detections_cumulative", 0.0) * get(metrics, "daily_student_detections_cumulative", 0.0) +
-               get(weights, "sax_scholars_rmae", 0.0) * get(metrics, "sax_scholars_rmae", 0.0)
+               get(weights, "daily_deaths_cumulative", 1.0) * get(metrics, "daily_deaths_cumulative", 0.0) +
+               get(weights, "daily_student_detections_cumulative", 1.0) * get(metrics, "daily_student_detections_cumulative", 0.0) +
+               get(weights, "sax_scholars_rmae", 1.0) * get(metrics, "sax_scholars_rmae", 0.0)
     return combined, metrics
 end
 
@@ -793,12 +761,12 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
     combined = get(weights, "daily_detections", 1.0) * metrics["daily_detections"] +
                get(weights, "daily_hospitalizations", 0.0) * metrics["daily_hospitalizations"] +
                get(weights, "daily_deaths", 1.0) * metrics["daily_deaths"] +
-               get(weights, "daily_student_detections", 0.0) * get(metrics, "daily_student_detections", 0.0) +
-               get(weights, "daily_detections_cumulative", 0.0) * get(metrics, "daily_detections_cumulative", 0.0) +
-               get(weights, "daily_hospitalizations_cumulative", 0.0) * get(metrics, "daily_hospitalizations_cumulative", 0.0) +
-               get(weights, "daily_deaths_cumulative", 0.0) * get(metrics, "daily_deaths_cumulative", 0.0) +
-               get(weights, "daily_student_detections_cumulative", 0.0) * get(metrics, "daily_student_detections_cumulative", 0.0) +
-               get(weights, "sax_scholars_rmae", 0.0) * get(metrics, "sax_scholars_rmae", 0.0)
+               get(weights, "daily_student_detections", 1.0) * get(metrics, "daily_student_detections", 0.0) +
+               get(weights, "daily_detections_cumulative", 1.0) * get(metrics, "daily_detections_cumulative", 0.0) +
+               get(weights, "daily_hospitalizations_cumulative", 1.0) * get(metrics, "daily_hospitalizations_cumulative", 0.0) +
+               get(weights, "daily_deaths_cumulative", 1.0) * get(metrics, "daily_deaths_cumulative", 0.0) +
+               get(weights, "daily_student_detections_cumulative", 1.0) * get(metrics, "daily_student_detections_cumulative", 0.0) +
+               get(weights, "sax_scholars_rmae", 1.0) * get(metrics, "sax_scholars_rmae", 0.0)
     return combined, metrics
 end
 
@@ -869,56 +837,16 @@ function submit_slurm_array(cfg::OptimizerConfig, list_file::String)
     error("Failed to submit Slurm array after retries: $(last_err)")
 end
 
-function build_reference(seed::Dict{String,Any}, days::Int)
-    return synthetic_simulation(seed, days)
-end
-
-function score_candidate(candidate::Dict{String,Any}, reference::Vector{Float64}, cfg::OptimizerConfig, days::Int; workdir::String="")
-    if cfg.external_sim === nothing
-        simulated = synthetic_simulation(candidate, days)
-        full_daily = rmse(simulated, reference)
-        recent_daily = recent_weighted_rmse(simulated, reference, cfg.objective.recent_days)
-        full_daily > cfg.objective.early_reject_multiplier * max(rmse(reference, zeros(length(reference))), 1.0) && return Dict(
-            "score" => 1.0e9,
-            "full_daily" => full_daily,
-            "recent_daily" => recent_daily,
-            "early_reject" => true,
-        )
-
-        cumulative = abs(sum(simulated) - sum(reference)) / max(sum(reference), 1e-9)
-        peak_height = abs(maximum(simulated) - maximum(reference)) / max(maximum(reference), 1e-9)
-        peak_timing = abs(argmax(simulated) - argmax(reference)) / max(length(reference), 1)
-        slope = rmse(finite_diff_slope(simulated), finite_diff_slope(reference))
-
-        score = cfg.objective.weights["full_daily"] * full_daily +
-                cfg.objective.weights["recent_daily"] * recent_daily +
-                cfg.objective.weights["cumulative"] * cumulative +
-                cfg.objective.weights["peak_height"] * peak_height +
-                cfg.objective.weights["peak_timing"] * peak_timing +
-                cfg.objective.weights["slope"] * slope
-
-        return Dict(
-            "score" => score,
-            "full_daily" => full_daily,
-            "recent_daily" => recent_daily,
-            "cumulative" => cumulative,
-            "peak_height" => peak_height,
-            "peak_timing" => peak_timing,
-            "slope" => slope,
-            "early_reject" => false,
-            "simulated" => "synthetic",
-        )
-    else
-        workdir == "" && (workdir = mktempdir(prefix="simrun_"; parent=joinpath(cfg.output_dir, "real_sims")))
-        combined, metrics = score_with_real_sim(cfg, candidate, days; workdir=workdir)
-        return Dict(
-            "score" => combined,
-            "metrics" => metrics,
-            "early_reject" => false,
-            "simulated" => "real",
-            "workdir" => workdir,
-        )
-    end
+function score_candidate(candidate::Dict{String,Any}, cfg::OptimizerConfig, days::Int; workdir::String="")
+    workdir == "" && (workdir = mktempdir(prefix="simrun_"; parent=joinpath(cfg.output_dir, "real_sims")))
+    combined, metrics = score_with_real_sim(cfg, candidate, days; workdir=workdir)
+    return Dict(
+        "score" => combined,
+        "metrics" => metrics,
+        "early_reject" => false,
+        "simulated" => "real",
+        "workdir" => workdir,
+    )
 end
 
 function cma_candidates(rng::AbstractRNG, state::CMAState, λ::Int)
@@ -958,7 +886,6 @@ end
 function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{ParamSpec}, cfg::OptimizerConfig, stage::StageConfig, state::Union{Nothing,CMAState}; use_slurm::Bool=false, resume_from::Int=0)
     active_months = stage.fit_months
     days = active_months * cfg.monthly_days
-    reference = build_reference(seed, days)
     specs_stage = stage_specs(specs, cfg, stage)
     dim = sum(spec.length for spec in specs_stage)
     if state === nothing
@@ -1067,7 +994,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                 x = clip!(copy(cand), specs_stage)
                 candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
                 inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
-                metrics = score_candidate(candidate_cfg, reference, cfg, days; workdir=joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"))
+                metrics = score_candidate(candidate_cfg, cfg, days; workdir=joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"))
                 save_json(joinpath(joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"), "metrics.json"), metrics)
                 score = metrics["score"]
                 push!(history, Dict(
