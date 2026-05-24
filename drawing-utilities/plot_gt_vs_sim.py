@@ -242,12 +242,14 @@ def main():
         sim_detections = read_daily_metric(str(args.daily), "daily_detections")
         sim_hosp = read_daily_metric(str(args.daily), "daily_hospitalizations")
         sim_deaths = read_daily_metric(str(args.daily), "daily_deaths")
+        sim_student_detections = read_daily_metric(str(args.daily), "daily_student_detections")
         if sim_detections is None:
             raise SystemExit(f"Cannot read daily_detections from {args.daily}")
         sim = {
             "detections": np.array(sim_detections[:max_days], dtype=float),
             "hospitalizations": np.array(sim_hosp[:max_days], dtype=float) if sim_hosp is not None else np.zeros(max_days, dtype=float),
             "deaths": np.array(sim_deaths[:max_days], dtype=float) if sim_deaths is not None else np.zeros(max_days, dtype=float),
+            "student_detections": np.array(sim_student_detections[:max_days], dtype=float) if sim_deaths is not None else np.zeros(max_days, dtype=float),
         }
     else:
         sim = synthetic_simulation(cfg, max_days)
