@@ -24,8 +24,38 @@ from typing import Dict, List, Tuple
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import numpy as np
 import h5py
+
+
+def load_sparse_series(gt_dir: Path, filename: str) -> Tuple[np.ndarray, np.ndarray]:
+    path = gt_dir / filename
+    if not path.exists():
+        raise FileNotFoundError(f"Missing GT file: {path}")
+    days: List[int] = []
+    values: List[float] = []
+    with path.open() as f:
+        next(f, None)
+        for line in f:
+            parts = line.strip().split(",")
+            if len(parts) < 2:
+                continue
+            try:
+                days.append(int(float(parts[0])))
+                values.append(float(parts[1]))
+            except ValueError:
+                continue
+    return np.array(days, dtype=int), np.array(values, dtype=float)
+
+
+def load_weekly_series(gt_dir: Path, filename: str, total_days: int) -> np.ndarray:
+    days, values = load_sparse_series(gt_dir, filename)
+    out = np.zeros(total_days, dtype=float)
+    for day, value in zip(days, values):
+        if 1 <= day <= total_days:
+            out[day - 1] = value
+    return out
 
 
 def load_gt(gt_dir: Path) -> Dict[str, np.ndarray]:
@@ -127,6 +157,36 @@ def rolling_mean(arr: np.ndarray, window: int = 7) -> np.ndarray:
     return out
 
 
+def rolling_max(arr: np.ndarray, window: int = 7) -> np.ndarray:
+    if len(arr) == 0:
+        return arr
+    out = np.zeros_like(arr, dtype=float)
+    for i in range(len(arr)):
+        lo = max(0, i - window + 1)
+        out[i] = np.max(arr[lo:i+1])
+    return out
+
+
+def sparse_cumulative(days: np.ndarray, values: np.ndarray, total_days: int) -> np.ndarray:
+    out = np.zeros(total_days, dtype=float)
+    acc = 0.0
+    idx = 0
+    for day in range(1, total_days + 1):
+        while idx < len(days) and days[idx] == day:
+            acc += values[idx]
+            idx += 1
+        out[day - 1] = acc
+    return out
+
+
+def day_to_date(start: np.datetime64, day: int) -> np.datetime64:
+    return start + np.timedelta64(day - 1, "D")
+
+
+def date_range(start: np.datetime64, total_days: int) -> np.ndarray:
+    return np.array([day_to_date(start, d) for d in range(1, total_days + 1)], dtype="datetime64[D]")
+
+
 def cumulative(arr: np.ndarray) -> np.ndarray:
     return np.cumsum(arr, dtype=float)
 
@@ -151,44 +211,65 @@ def read_daily_metric(path: str, metric: str):
         return None
 
 
-def plot(gt: Dict[str, np.ndarray], sim: Dict[str, np.ndarray], out_path: Path):
+def plot(gt: Dict[str, np.ndarray], sim: Dict[str, np.ndarray], out_path: Path, gt_dir: Path, stop_day: int):
     metrics = [("detections", "Daily Detections", "#2196F3"),
                ("student_detections", "Daily Student Detections", "#4CAF50"),
                ("hospitalizations", "7-day Hospitalizations (roll sum)", "#FF9800"),
                ("deaths", "Daily Deaths", "#F44336")]
+    gt_avg_labels = {
+        "student_detections": "GT 7d max",
+    }
 
-    total_days = max(len(gt[m]) for m, *_ in metrics)
-    days = np.arange(1, total_days + 1)
+    total_days = min(max(len(gt[m]) for m, *_ in metrics), stop_day)
+    start_date = np.datetime64("2020-09-01")
+    dates = date_range(start_date, total_days)
+    date_numbers = mdates.date2num([np.datetime64(d, "D").astype(object) for d in dates])
 
-    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
+    fig.subplots_adjust(hspace=0.25)
     fig.suptitle("Ground Truth vs Synthetic Simulation", fontsize=12)
 
     for ax, (key, title, color) in zip(axes, metrics):
-        g = pad(gt[key], total_days)
+        g = load_weekly_series(gt_dir, "daily_student_detections.csv", total_days) if key == "student_detections" else pad(gt[key], total_days)
         s = pad(sim[key], total_days)
         if key == "hospitalizations":
             s = rolling_mean(s, 7)
-        ax.bar(days, g, color=color, alpha=0.25, width=1.0, label="GT raw")
-        ax.plot(days, rolling_avg(g), color=color, lw=2, label="GT 7d avg")
-        ax.bar(days, s, color="#607D8B", alpha=0.18, width=1.0, label="Sim raw")
-        ax.plot(days, rolling_avg(s), color="#37474F", lw=2, ls="--", label="Sim 7d avg")
+        ax.bar(date_numbers, g, color=color, alpha=0.25, width=0.9, label="GT raw")
+        if key == "student_detections":
+            ax.plot(date_numbers, rolling_max(g), color=color, lw=2, label="GT 7d max")
+        else:
+            gt_label = gt_avg_labels.get(key, "GT 7d avg")
+            ax.plot(date_numbers, rolling_avg(g), color=color, lw=2, label=gt_label)
+        ax.bar(date_numbers, s, color="#607D8B", alpha=0.18, width=0.9, label="Sim raw")
+        ax.plot(date_numbers, rolling_avg(s), color="#37474F", lw=2, ls="--", label="Sim 7d avg")
         ax.set_ylabel(title, fontsize=10)
         ax.grid(axis="y", alpha=0.3)
         ax.legend(fontsize=8, loc="upper left")
 
-    fig2, axes2 = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+    fig2, axes2 = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
+    fig2.subplots_adjust(hspace=0.25)
     fig2.suptitle("Ground Truth vs Synthetic Simulation (Cumulative)", fontsize=12)
     for ax, (key, title, color) in zip(axes2, metrics):
-        g = cumulative(pad(gt[key], total_days))
+        if key == "student_detections":
+            sparse_days, sparse_vals = load_sparse_series(gt_dir, "daily_student_detections.csv")
+            g = sparse_cumulative(sparse_days, sparse_vals, total_days)
+        else:
+            g = cumulative(pad(gt[key], total_days))
         s = cumulative(pad(sim[key], total_days))
-        ax.plot(days, g, color=color, lw=2, label="GT cumulative")
-        ax.plot(days, s, color="#37474F", lw=2, ls="--", label="Sim cumulative")
+        ax.plot(date_numbers, g, color=color, lw=2, label="GT cumulative")
+        ax.plot(date_numbers, s, color="#37474F", lw=2, ls="--", label="Sim cumulative")
         ax.set_ylabel(title, fontsize=10)
         ax.grid(axis="y", alpha=0.3)
         ax.legend(fontsize=8, loc="upper left")
-    axes2[-1].set_xlabel("Day", fontsize=10)
+    for ax in list(axes) + list(axes2):
+        ax.set_xlim(date_numbers[0], date_numbers[-1])
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+        ax.tick_params(axis="x", rotation=30)
+        ax.grid(axis="x", alpha=0.15)
+    axes[-1].set_xlabel("Date", fontsize=10)
+    axes2[-1].set_xlabel("Date", fontsize=10)
 
-    axes[-1].set_xlabel("Day", fontsize=10)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(out_path, dpi=140, bbox_inches="tight")
@@ -260,7 +341,8 @@ def main():
             out_path = args.daily.with_suffix(".gt_vs_sim.png")
         else:
             out_path = (base / "plots" / "gt_vs_sim.png")
-    plot(gt, sim, Path(out_path))
+    stop_day = int(cfg.get("stop_simulation_time", max_days)) if cfg is not None else max_days
+    plot(gt, sim, Path(out_path), args.gt_dir.resolve(), stop_day)
 
 
 if __name__ == "__main__":
