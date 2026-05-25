@@ -293,6 +293,14 @@ def plot_param_evolution(records: List[Dict], accepted: List[Dict], ax):
         ax.set_title("Accepted param evolution")
         return
 
+    score_points = []
+    for m in sorted(best_per_month.keys()):
+        month_records = [r for r in records if r.get("month") == m and r.get("combined_rmse") is not None]
+        if not month_records:
+            continue
+        best = min(month_records, key=lambda r: _finite(r.get("combined_rmse", float("inf"))))
+        score_points.append((m, _finite(best.get("combined_rmse"))))
+
     prefix_map: Dict[str, List[str]] = {}
     for col in param_cols:
         m = re.match(r"param_([a-z_]+)_b(\d+)$", col)
@@ -319,6 +327,15 @@ def plot_param_evolution(records: List[Dict], accepted: List[Dict], ax):
     ax.set_xticks(months_seen)
     ax.legend(fontsize=6, ncol=2)
     ax.grid(True, alpha=0.3)
+
+    if score_points:
+        ax2 = ax.twinx()
+        xs = [m for m, _ in score_points]
+        ys = [v for _, v in score_points]
+        ax2.plot(xs, ys, color="black", marker="o", markersize=5, linewidth=2, label="Score evolution")
+        ax2.set_ylabel("Score")
+        ax2.legend(loc="upper right", fontsize=7)
+        ax2.grid(False)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -359,9 +376,15 @@ def plot_window_coverage(records: List[Dict], ax):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def make_figure(output_dir: Path, show: bool = False):
-    records    = load_progress(output_dir)
-    id_reports = load_identifiability(output_dir)
-    accepted   = load_accepted_months(output_dir)
+    if (output_dir / "optimizer_history.json").exists():
+        source_dir = output_dir
+    elif (output_dir.parent / "optimizer_history.json").exists():
+        source_dir = output_dir.parent
+    else:
+        raise FileNotFoundError(f"optimizer_history.json not found in {output_dir} or {output_dir.parent}")
+    records    = load_progress(source_dir)
+    id_reports = load_identifiability(source_dir)
+    accepted   = load_accepted_months(source_dir)
 
     fig = plt.figure(figsize=(18, 14))
     fig.suptitle(f"Checkpoint delta search — {output_dir.name}", fontsize=12, y=0.98)
@@ -379,7 +402,7 @@ def make_figure(output_dir: Path, show: bool = False):
     plot_param_evolution(records, accepted, ax_param_evo)
     plot_window_coverage(records, ax_windows)
 
-    plots_dir = output_dir / "plots"
+    plots_dir = source_dir / "plots"
     plots_dir.mkdir(exist_ok=True)
 
     combined_path = plots_dir / "search_overview.png"
