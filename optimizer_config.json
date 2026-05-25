@@ -1,15 +1,13 @@
 {
-  "seed_config": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/seed/config9.json",
-  "output_dir": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/runs/config9",
+  "seed_config": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/seed/config11.json",
+  "output_dir": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/runs/config11",
   "monthly_days": 30,
   "stages": [
-    {"name": "stage_10m", "fit_months": 10, "max_iterations": 5, "population_size": 30, "sigma": 0.3}
+    {"name": "stage_10m", "fit_months": 10, "max_iterations": 25, "population_size": 50, "sigma": 0.3}
 ],
   "scalar_bounds": {
-    "transmission_probabilities.age_coupling_param": [0.48, 0.64],
-    "transmission_probabilities.school": [0, 0.4],
-    "transmission_probabilities.class": [0.1, 0.5],
-    "initial_conditions.hospitalization_multiplier": [1.0, 3.0]
+    "transmission_probabilities.school": [0, 0.3],
+    "transmission_probabilities.class": [0.15, 0.5]
   },
   "temporal_bounds": {
     "infection_modulation.params.interval_values": [0.0, 1.0],
