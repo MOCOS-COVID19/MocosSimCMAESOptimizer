@@ -827,6 +827,17 @@ function top_k_entries(entries::Vector{Dict{String,Any}}, k::Int)
     return sorted[1:kk]
 end
 
+function with_iteration_ranks(entries::Vector{Dict{String,Any}})
+    ranked = sort(entries, by = x -> Float64(get(x, "score", Inf)))
+    out = Any[]
+    for (idx, entry) in enumerate(ranked)
+        enriched = deepcopy(entry)
+        enriched["rank_within_iteration"] = idx
+        push!(out, enriched)
+    end
+    return out
+end
+
 function slurm_array_is_running(jobid::String)
     try
         out = read(`squeue -h -j $jobid -o "%.18i %.2t %.10M %.R"`, String)
@@ -993,6 +1004,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
     for iter in start_iter:stage.max_iterations
         candidates, zs = cma_candidates(rng, state, stage.population_size)
         ranked = Tuple{Float64,Vector{Float64},Vector{Float64}}[]
+        iteration_top_candidates = Any[]
         # If external sim configured and slurm enabled, dispatch via Slurm array; otherwise score inline
         if cfg.external_sim !== nothing && use_slurm
             iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
@@ -1085,6 +1097,19 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     "status" => get(metrics, "status", "unknown"),
                     "metrics" => metrics,
                 ))
+                key = "$(iter)-$(ci)"
+                candidate_entry = Dict(
+                    "stage" => stage.name,
+                    "iteration" => iter,
+                    "candidate" => ci,
+                    "fit_months" => active_months,
+                    "score" => score,
+                    "status" => get(metrics, "status", "unknown"),
+                    "config" => deepcopy(cand_cfg),
+                    "metrics" => metrics,
+                )
+                top_candidates[key] = candidate_entry
+                push!(iteration_top_candidates, candidate_entry)
                 if get(metrics, "status", "failed") == "completed"
                     push!(ranked, (score, x, zs[ci]))
                 end
@@ -1096,6 +1121,8 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
             end
         else
             for (ci, cand) in enumerate(candidates)
+                iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
+                mkpath(iter_root)
                 x = clip!(copy(cand), specs_stage)
                 candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
                 inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
@@ -1111,7 +1138,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     "metrics" => metrics,
                 ))
                 key = "$(iter)-$(ci)"
-                top_candidates[key] = Dict(
+                candidate_entry = Dict(
                     "stage" => stage.name,
                     "iteration" => iter,
                     "candidate" => ci,
@@ -1120,6 +1147,8 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     "config" => deepcopy(candidate_cfg),
                     "metrics" => metrics,
                 )
+                top_candidates[key] = candidate_entry
+                push!(iteration_top_candidates, candidate_entry)
                 push!(ranked, (score, x, zs[ci]))
                 if score < best_score
                     best_score = score
@@ -1151,6 +1180,9 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
             "covariance_trace" => tr(state.covariance),
             "best_vector" => best_vector,
         ))
+        iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
+        mkpath(iter_root)
+        save_json(joinpath(iter_root, "top_candidates.json"), top_k_entries(with_iteration_ranks(iteration_top_candidates), cfg.objective.top_k))
     save_json(joinpath(stage_root, "full_reusable_state.json"), full_reusable_state_from_cma(stage, specs_stage, state))
     end
 
