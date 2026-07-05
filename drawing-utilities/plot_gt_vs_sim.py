@@ -217,7 +217,7 @@ def plot(gt: Dict[str, np.ndarray], sim: Dict[str, np.ndarray], out_path: Path, 
                ("hospitalizations", "7-day Hospitalizations (roll sum)", "#FF9800"),
                ("deaths", "Daily Deaths", "#F44336")]
     gt_avg_labels = {
-        "student_detections": "GT 7d max",
+        "student_detections": "GT 7d avg",
     }
 
     total_days = min(max(len(gt[m]) for m, *_ in metrics), stop_day)
@@ -235,10 +235,10 @@ def plot(gt: Dict[str, np.ndarray], sim: Dict[str, np.ndarray], out_path: Path, 
         if key == "hospitalizations":
             s = rolling_mean(s, 7)
         ax.bar(date_numbers, g, color=color, alpha=0.25, width=0.9, label="GT raw")
+        gt_label = gt_avg_labels.get(key, "GT 7d avg")
         if key == "student_detections":
-            ax.plot(date_numbers, rolling_max(g), color=color, lw=2, label="GT 7d max")
+            ax.plot(date_numbers, rolling_avg(g), color=color, lw=2, label=gt_label)
         else:
-            gt_label = gt_avg_labels.get(key, "GT 7d avg")
             ax.plot(date_numbers, rolling_avg(g), color=color, lw=2, label=gt_label)
         ax.bar(date_numbers, s, color="#607D8B", alpha=0.18, width=0.9, label="Sim raw")
         ax.plot(date_numbers, rolling_avg(s), color="#37474F", lw=2, ls="--", label="Sim 7d avg")

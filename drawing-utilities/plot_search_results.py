@@ -39,9 +39,17 @@ import numpy as np
 def load_progress(output_dir: Path) -> List[Dict[str, Any]]:
     """Map optimizer_history.json into a search-like record list."""
     p = output_dir / "optimizer_history.json"
-    if not p.exists():
+    if p.exists():
+        history = json.loads(p.read_text())
+        return history_to_records(history)
+
+    metrics_files = sorted(output_dir.glob("stage_*/iter_*/cand_*/metrics.json"))
+    if not metrics_files:
         raise FileNotFoundError(f"optimizer_history.json not found in {output_dir}")
-    history = json.loads(p.read_text())
+    return metrics_to_records(metrics_files)
+
+
+def history_to_records(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     step = 0
     for entry in history:
@@ -49,7 +57,7 @@ def load_progress(output_dir: Path) -> List[Dict[str, Any]]:
         rec = {
             "search_step": step,
             "month": entry.get("fit_months"),
-            "combined_rmse": entry.get("metrics", {}).get("score"),
+            "combined_rmse": entry.get("metrics", {}).get("score", entry.get("score")),
             "start_day": 1,
             "end_day": entry.get("fit_months", 0) * 30,
         }
@@ -59,6 +67,32 @@ def load_progress(output_dir: Path) -> List[Dict[str, Any]]:
                 rec[f"rmse_{k}" if k.startswith("full") or k.startswith("recent") else k] = entry["metrics"][k]
         # copy param snapshots if present (best_vector not stored; none available)
         records.append(rec)
+    return records
+
+
+def metrics_to_records(metrics_files: List[Path]) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for step, path in enumerate(metrics_files, start=1):
+        try:
+            metrics = json.loads(path.read_text())
+        except Exception:
+            continue
+        parts = path.parts
+        stage = next((p for p in parts if p.startswith("stage_")), "stage_0")
+        iter_dir = next((p for p in parts if p.startswith("iter_")), "iter_0")
+        cand_dir = next((p for p in parts if p.startswith("cand_")), "cand_0")
+        month = int(re.search(r"stage_(\d+)", stage).group(1)) if re.search(r"stage_(\d+)", stage) else 0
+        records.append({
+            "search_step": step,
+            "month": month,
+            "combined_rmse": metrics.get("score"),
+            "start_day": 1,
+            "end_day": month * 30,
+            "metrics": metrics,
+            "stage": stage,
+            "iteration": iter_dir,
+            "candidate": cand_dir,
+        })
     return records
 
 
@@ -376,12 +410,12 @@ def plot_window_coverage(records: List[Dict], ax):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def make_figure(output_dir: Path, show: bool = False):
-    if (output_dir / "optimizer_history.json").exists():
+    if (output_dir / "optimizer_history.json").exists() or (output_dir / "stage_").exists():
         source_dir = output_dir
     elif (output_dir.parent / "optimizer_history.json").exists():
         source_dir = output_dir.parent
     else:
-        raise FileNotFoundError(f"optimizer_history.json not found in {output_dir} or {output_dir.parent}")
+        source_dir = output_dir
     records    = load_progress(source_dir)
     id_reports = load_identifiability(source_dir)
     accepted   = load_accepted_months(source_dir)

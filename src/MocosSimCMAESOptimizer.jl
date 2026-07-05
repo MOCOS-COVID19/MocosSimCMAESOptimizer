@@ -45,6 +45,7 @@ struct OptimizerConfig
     objective::ObjectiveConfig
     external_sim::Union{Nothing,ExternalSimConfig}
     stage_freeze::Dict{String,Vector{String}}
+    initial_state::Union{Nothing,Dict{String,Any}}
 end
 
 struct ParamSpec
@@ -61,6 +62,18 @@ struct CMAState
     covariance::Matrix{Float64}
 end
 
+function full_reusable_state_from_cma(stage::StageConfig, specs_stage::Vector{ParamSpec}, state::CMAState)
+    return Dict(
+        "stage" => stage.name,
+        "fit_months" => stage.fit_months,
+        "param_names" => [spec.name for spec in specs_stage],
+        "param_ranges" => [spec.kind == :temporal ? [spec.lower, spec.upper] : [spec.lower, spec.upper] for spec in specs_stage],
+        "mean" => state.mean,
+        "sigma" => state.sigma,
+        "covariance" => state.covariance,
+    )
+end
+
 function stage_transition_state(prev::CMAState, stage::StageConfig, specs_stage::Vector{ParamSpec}; sigma_floor::Float64=0.08, sigma_scale::Float64=2.0)
     dim = length(prev.mean)
     cov = copy(prev.covariance)
@@ -69,6 +82,55 @@ function stage_transition_state(prev::CMAState, stage::StageConfig, specs_stage:
     end
     cov = 0.5 .* cov .+ 0.5 .* Matrix{Float64}(I, dim, dim)
     return CMAState(copy(prev.mean), max(stage.sigma, max(prev.sigma * sigma_scale, sigma_floor)), cov)
+end
+
+function initial_state_from_config(cfg::OptimizerConfig, dim::Int, default_mean::Vector{Float64})
+    cfg.initial_state === nothing && return nothing
+    raw = cfg.initial_state
+    mean = haskey(raw, "mean") ? Float64.(raw["mean"]) : copy(default_mean)
+    sigma = haskey(raw, "sigma") ? Float64(raw["sigma"]) : 0.3
+    cov = if haskey(raw, "covariance")
+        Matrix{Float64}(raw["covariance"])
+    else
+        Matrix{Float64}(I, dim, dim)
+    end
+    size(cov, 1) == dim && size(cov, 2) == dim || return nothing
+    length(mean) == dim || return nothing
+    return CMAState(mean, sigma, cov)
+end
+
+function load_full_reusable_state(path::String)
+    isfile(path) || return nothing
+    raw = load_json(path)
+    haskey(raw, "param_names") && haskey(raw, "mean") && haskey(raw, "covariance") || return nothing
+    return raw
+end
+
+function build_state_from_reusable(seed::Dict{String,Any}, specs_stage::Vector{ParamSpec}, reusable::Dict{String,Any}; sigma_floor::Float64=0.08)
+    old_names = [String(x) for x in reusable["param_names"]]
+    old_mean = Float64.(reusable["mean"])
+    old_cov = Matrix{Float64}(reusable["covariance"])
+    old_sigma = haskey(reusable, "sigma") ? Float64(reusable["sigma"]) : 0.3
+
+    new_names = [spec.name for spec in specs_stage]
+    new_mean = initial_vector(seed, specs_stage)
+    dim = length(new_names)
+    new_cov = Matrix{Float64}(I, dim, dim)
+    idx_map = Dict(name => i for (i, name) in enumerate(old_names))
+    kept = Int[]
+    for (j, name) in enumerate(new_names)
+        haskey(idx_map, name) || continue
+        i = idx_map[name]
+        new_mean[j] = old_mean[i]
+        push!(kept, i)
+    end
+    for (a, name_a) in enumerate(new_names), (b, name_b) in enumerate(new_names)
+        haskey(idx_map, name_a) && haskey(idx_map, name_b) || continue
+        ia = idx_map[name_a]
+        ib = idx_map[name_b]
+        new_cov[a, b] = old_cov[ia, ib]
+    end
+    return CMAState(new_mean, max(old_sigma, sigma_floor), new_cov)
 end
 
 function parse_stage_iter_from_path(path::String)
@@ -148,7 +210,8 @@ function load_config(path::String)
             stage_freeze[String(k)] = [String(x) for x in v]
         end
     end
-    return OptimizerConfig(raw["seed_config"], raw["output_dir"], Int(raw["monthly_days"]), stages, scalar_bounds, temporal_bounds, scalar_preprocessing, objective, external_sim, stage_freeze)
+    initial_state = haskey(raw, "initial_state") ? Dict{String,Any}(String(k) => v for (k, v) in raw["initial_state"]) : nothing
+    return OptimizerConfig(raw["seed_config"], raw["output_dir"], Int(raw["monthly_days"]), stages, scalar_bounds, temporal_bounds, scalar_preprocessing, objective, external_sim, stage_freeze, initial_state)
 end
 
 function scalar_preprocessing_entry(cfg::OptimizerConfig, spec::ParamSpec)
@@ -317,6 +380,19 @@ function temporal_active_length(seed::Dict{String,Any}, spec::ParamSpec, active_
         step_days = isempty(positive_deltas) ? max(float(interval_times[1]), 1.0) : minimum(positive_deltas)
     end
     return min(cld(active_days, max(round(Int, step_days), 1)), spec.length)
+end
+
+function temporal_bucket_day_ranges(seed::Dict{String,Any}, spec::ParamSpec, active_months::Int, cfg::OptimizerConfig)
+    active_days = active_months * cfg.monthly_days
+    interval_times = get_nested(seed, replace(spec.name, "interval_values" => "interval_times"))
+    isempty(interval_times) && return [(1, active_days) for _ in 1:spec.length]
+    ranges = Tuple{Int,Int}[]
+    for i in 1:spec.length
+        start_day = i == 1 ? 1 : max(1, round(Int, float(interval_times[min(i, length(interval_times))])))
+        end_day = i == spec.length ? active_days : max(start_day, round(Int, float(interval_times[min(i, length(interval_times))])))
+        push!(ranges, (start_day, min(end_day, active_days)))
+    end
+    return ranges
 end
 
 function vector_to_config(seed::Dict{String,Any}, specs::Vector{ParamSpec}, x::Vector{Float64}, active_months::Int)
@@ -654,16 +730,91 @@ function drop_missing(series)
     return Float64[float(x) for x in series if x !== missing]
 end
 
+"""
+Compute 7-day-window GT alignment value for student detections with missing-aware rules:
+- If 7 values are missing (all 7 are missing) => ignore this window (returns `nothing`).
+- If 6 values are missing => use 1/7 of the single non-missing value.
+- Otherwise (<=5 missings) => use the mean over available values (equally-weighted).
+"""
+function student_window_gt_value(window::AbstractVector{T}; expected_window::Int = 7) where {T<:Union{Missing,Float64}}
+    miss = 0
+    sumv = 0.0
+    cnt = 0
+    for x in window
+        if x === missing
+            miss += 1
+        else
+            v = Float64(x)
+            sumv += v
+            cnt += 1
+        end
+    end
+    if miss == expected_window
+        return nothing
+    elseif cnt == 0
+        return nothing
+    else
+        # Missing-aware weekly value: sum of available GT values scaled by 1/7
+        # (matches rule: sum(vi)/7 for all non-missing vi)
+        return (sumv / expected_window)
+    end
+end
+
+"""
+Compute student detection weekly targets/sim values on 7-day windows with missing-aware GT weighting.
+Returns vectors of equal length containing only windows that are not ignored.
+"""
+function student_weekly_aligned_vectors(gt_daily::AbstractVector{T}, sim_daily::AbstractVector{Float64}, days::Int) where {T<:Union{Missing,Float64}}
+    n = min(days, length(sim_daily), length(gt_daily))
+    if n <= 0
+        return Float64[], Float64[]
+    end
+    out_g = Float64[]
+    out_s = Float64[]
+    # windows are [i-6..i] with i being 1-based index end of window
+    w = 7
+    for end_idx in 1:n
+        start_idx = end_idx - w + 1
+        start_idx = max(start_idx, 1)
+        window_gt = gt_daily[start_idx:end_idx]
+        # for sim we still take 7-day mean over the available prefix; this matches existing "rolling mean" behavior
+        window_sim = sim_daily[start_idx:end_idx]
+        # Only apply missing-aware rule when we have the full 7-day window; for partial start, follow same logic with shorter window
+        expected = w
+        val_g = student_window_gt_value(window_gt; expected_window=expected)
+        if val_g === nothing
+            continue
+        end
+        # sim weekly value: mean over available sim values in window
+        val_s = mean(window_sim)
+        push!(out_g, Float64(val_g))
+        push!(out_s, val_s)
+    end
+    return out_g, out_s
+end
+
 function per_trajectory_rmae(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int)
     trajs = read_daily_metric(daily_path, metric)
     trajs === nothing && return Inf
     vals = Float64[]
     g = drop_missing(gt_series[1:min(end, days)])
-    g = rolling_sum(g, 7)
+    g = metric == "daily_student_detections" ? rolling_mean(g, 7) : rolling_sum(g, 7)
     for traj in trajs
         s = Float64.(traj[1:min(end, days)])
-        s = rolling_sum(s, 7)
-        push!(vals, rmae_series(s, g))
+        if metric == "daily_student_detections"
+            # Missing-aware weekly alignment:
+            # build weekly vectors from the *original* gt_series (with missing), but sim already has numbers.
+            gt_daily = gt_series[1:min(end, days)]
+            sim_daily = traj[1:min(end, days)]
+            gg, ss = student_weekly_aligned_vectors(gt_daily, Float64.(sim_daily), days)
+            if isempty(gg)
+                continue
+            end
+            push!(vals, rmae_series(ss, gg))
+        else
+            s = rolling_sum(s, 7)
+            push!(vals, rmae_series(s, g))
+        end
     end
     isempty(vals) && return Inf
     return sum(vals) / length(vals)
@@ -682,6 +833,21 @@ function per_trajectory_cumulative_error(daily_path::String, metric::String, gt_
     end
     isempty(vals) && return Inf
     return sum(vals) / length(vals)
+end
+
+function rolling_mean(series::Vector{Float64}, window::Int)
+    length(series) == 0 && return Float64[]
+    w = max(window, 1)
+    out = similar(series)
+    acc = 0.0
+    for i in 1:length(series)
+        acc += series[i]
+        if i > w
+            acc -= series[i - w]
+        end
+        out[i] = acc / min(i, w)
+    end
+    return out
 end
 
 function trajectory_metric_values(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int)
@@ -725,6 +891,30 @@ function cumulative_error_distribution(daily_path::String, metric::String, gt_se
         push!(vals, abs(last(s) - last(g)) / denom)
     end
     return vals
+end
+
+function temporal_directional_guidance(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int, spec::ParamSpec, active_months::Int, cfg::OptimizerConfig)
+    trajs = read_daily_metric(daily_path, metric)
+    trajs === nothing && return Float64[]
+    g = drop_missing(gt_series[1:min(end, days)])
+    g = rolling_sum(g, 7)
+    bucket_ranges = temporal_bucket_day_ranges(load_json(cfg.seed_config), spec, active_months, cfg)
+    guidance = zeros(Float64, spec.length)
+    for (bi, (start_day, end_day)) in enumerate(bucket_ranges)
+        start_day > end_day && continue
+        idxs = start_day:min(end_day, length(g))
+        isempty(idxs) && continue
+        g_seg = g[idxs]
+        err = 0.0
+        for traj in trajs
+            s = Float64.(traj[1:min(end, days)])
+            s = rolling_sum(s, 7)
+            s_seg = s[idxs]
+            err += mean(abs.(s_seg .- g_seg))
+        end
+        guidance[bi] = err / length(trajs)
+    end
+    return guidance
 end
 
 function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, days::Int; workdir::String)
@@ -905,7 +1095,14 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
     dim = sum(spec.length for spec in specs_stage)
     if state === nothing
         x0 = initial_vector(seed, specs_stage)
-        state = CMAState(copy(x0), stage.sigma, Matrix{Float64}(I, dim, dim))
+        reusable_path = joinpath(cfg.output_dir, "full_reusable_state.json")
+        reusable = load_full_reusable_state(reusable_path)
+        if reusable !== nothing
+            state = build_state_from_reusable(seed, specs_stage, reusable)
+        else
+            seeded = initial_state_from_config(cfg, dim, x0)
+            state = seeded === nothing ? CMAState(copy(x0), stage.sigma, Matrix{Float64}(I, dim, dim)) : seeded
+        end
     else
         state = stage_transition_state(state, stage, specs_stage)
     end
@@ -1063,6 +1260,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
             "covariance_trace" => tr(state.covariance),
             "best_vector" => best_vector,
         ))
+    save_json(joinpath(stage_root, "full_reusable_state.json"), full_reusable_state_from_cma(stage, specs_stage, state))
     end
 
     return Dict(
