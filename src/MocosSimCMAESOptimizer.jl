@@ -868,7 +868,14 @@ function wait_for_iteration_outputs(list_file::String; poll::Float64=10.0, min_c
         end
 
         if done_count + failed_count == length(cand_dirs)
-            return Dict("done" => done_count, "failed" => failed_count, "pending" => pending, "threshold_reached" => done_count >= target_done, "timed_out" => false)
+            return Dict(
+                "done" => done_count,
+                "failed" => failed_count,
+                "pending" => pending,
+                "pending_count" => length(pending),
+                "threshold_reached" => done_count >= target_done,
+                "iteration_truncated" => false,
+            )
         end
 
         if done_count >= target_done
@@ -876,14 +883,28 @@ function wait_for_iteration_outputs(list_file::String; poll::Float64=10.0, min_c
                 threshold_reached_at = time()
             end
             if done_count + failed_count == length(cand_dirs)
-                return Dict("done" => done_count, "failed" => failed_count, "pending" => pending, "threshold_reached" => true, "timed_out" => false)
+                return Dict(
+                    "done" => done_count,
+                    "failed" => failed_count,
+                    "pending" => pending,
+                    "pending_count" => length(pending),
+                    "threshold_reached" => true,
+                    "iteration_truncated" => false,
+                )
             end
             if (time() - threshold_reached_at) >= finish_iter_delay
                 for d in pending
                     skipped_ok = joinpath(d, "skipped.ok")
                     isfile(skipped_ok) || touch(skipped_ok)
                 end
-                return Dict("done" => done_count, "failed" => failed_count, "pending" => pending, "threshold_reached" => true, "timed_out" => !isempty(pending))
+                return Dict(
+                    "done" => done_count,
+                    "failed" => failed_count,
+                    "pending" => pending,
+                    "pending_count" => length(pending),
+                    "threshold_reached" => true,
+                    "iteration_truncated" => !isempty(pending),
+                )
             end
         end
 
@@ -892,7 +913,14 @@ function wait_for_iteration_outputs(list_file::String; poll::Float64=10.0, min_c
                 skipped_ok = joinpath(d, "skipped.ok")
                 isfile(skipped_ok) || touch(skipped_ok)
             end
-            return Dict("done" => done_count, "failed" => failed_count, "pending" => pending, "threshold_reached" => true, "timed_out" => false)
+            return Dict(
+                "done" => done_count,
+                "failed" => failed_count,
+                "pending" => pending,
+                "pending_count" => length(pending),
+                "threshold_reached" => true,
+                "iteration_truncated" => !isempty(pending),
+            )
         end
 
         sleep(poll)
@@ -1094,7 +1122,10 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     "sigma" => state.sigma,
                     "best_score_so_far" => best_score,
                     "threshold_reached" => wait_result["threshold_reached"],
-                    "timed_out" => wait_result["timed_out"],
+                    "iteration_truncated" => wait_result["iteration_truncated"],
+                    "completed_count" => wait_result["done"],
+                    "failed_count" => wait_result["failed"],
+                    "pending_count" => wait_result["pending_count"],
                 ))
                 push!(history, Dict(
                     "stage" => stage.name,
