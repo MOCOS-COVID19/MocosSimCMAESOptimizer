@@ -1,9 +1,9 @@
 {
-  "seed_config": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/seed/config11.json",
-  "output_dir": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/runs/config11",
+  "seed_config": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/seed/config12.json",
+  "output_dir": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/runs/config12",
   "monthly_days": 30,
   "stages": [
-    {"name": "stage_7m", "fit_months": 7, "max_iterations": 30, "population_size": 50, "sigma": 0.2}
+    {"name": "stage_11m", "fit_months": 11, "max_iterations": 30, "population_size": 50, "sigma": 0.2}
 ],
   "scalar_bounds": {
     "transmission_probabilities.school": [0.05, 0.3],
