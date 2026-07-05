@@ -30,8 +30,9 @@ end
 
 struct ObjectiveConfig
     weights::Dict{String,Float64}
-    recent_days::Int
-    early_reject_multiplier::Float64
+    top_k::Int
+    min_completion_fraction::Float64
+    finish_iter_delay::Int
 end
 
 struct OptimizerConfig
@@ -200,7 +201,12 @@ function load_config(path::String)
             scalar_preprocessing[String(k)] = Dict(String(kk) => vv for (kk, vv) in v)
         end
     end
-    objective = ObjectiveConfig(Dict(k => float(v) for (k, v) in raw["objective"]["weights"]), Int(raw["objective"]["recent_days"]), float(raw["objective"]["early_reject_multiplier"]))
+    objective = ObjectiveConfig(
+        Dict(k => float(v) for (k, v) in raw["objective"]["weights"]),
+        Int(get(raw["objective"], "top_k", 1)),
+        float(get(raw["objective"], "min_completion_fraction", 1.0)),
+        Int(get(raw["objective"], "finish_iter_delay", 30)),
+    )
     external_sim = haskey(raw, "gt_dir") && haskey(raw, "julia_bin") && haskey(raw, "project_dir") && haskey(raw, "advanced_cli") ?
         ExternalSimConfig(String(raw["gt_dir"]), String(raw["julia_bin"]), String(raw["project_dir"]), String(raw["advanced_cli"])) :
         nothing
@@ -429,32 +435,6 @@ function inject_frozen!(cfg_out::Dict{String,Any}, seed::Dict{String,Any}, specs
     end
 end
 
-function rmse(a::Vector{Float64}, b::Vector{Float64})
-    n = min(length(a), length(b))
-    n == 0 && return Inf
-    return sqrt(sum((a[i] - b[i])^2 for i in 1:n) / n)
-end
-
-function normalize_rmse(v::Float64, days::Int)
-    isfinite(v) || return v
-    return v / sqrt(max(days, 1))
-end
-
-function recent_weighted_rmse(a::Vector{Float64}, b::Vector{Float64}, recent_days::Int)
-    n = min(length(a), length(b))
-    n == 0 && return Inf
-    start_idx = max(1, n - recent_days + 1)
-    weights = collect(1.0:(n - start_idx + 1))
-    err = 0.0
-    denom = 0.0
-    for (j, i) in enumerate(start_idx:n)
-        w = weights[j]
-        err += w * (a[i] - b[i])^2
-        denom += w
-    end
-    return sqrt(err / max(denom, 1e-9))
-end
-
 # ─────────────────────────────────────────────────────────────────────────────
 # External simulation hook (single-run) invoking manager/MocosSimLauncher
 # ─────────────────────────────────────────────────────────────────────────────
@@ -521,69 +501,6 @@ function load_gt_series(gt_dir::String)
     )
 end
 
-const SAX_SCHOLARS_CACHE = Dict{String,Union{Nothing,Tuple{Vector{Int},Vector{Float64}}}}()
-
-function load_sax_scholars_series(gt_dir::String)
-    if isempty(gt_dir)
-        return nothing
-    end
-    cached = get(SAX_SCHOLARS_CACHE, gt_dir, nothing)
-    cached !== nothing && return cached
-    path = joinpath(gt_dir, "sax-scholars-infections-normalized.csv")
-    if !isfile(path)
-        SAX_SCHOLARS_CACHE[gt_dir] = nothing
-        return nothing
-    end
-    days = Int[]
-    values = Float64[]
-    open(path, "r") do io
-        first_line = true
-        for line in eachline(io)
-            first_line && (first_line = false; continue)
-            line = strip(line)
-            isempty(line) && continue
-            parts = split(line, ",")
-            length(parts) < 2 && continue
-            try
-                day = parse(Int, strip(parts[1]))
-                val = parse(Float64, strip(parts[2])) / 7.0
-                push!(days, day)
-                push!(values, val)
-            catch
-                continue
-            end
-        end
-    end
-    if isempty(days)
-        SAX_SCHOLARS_CACHE[gt_dir] = nothing
-        return nothing
-    end
-    order = sortperm(days)
-    SAX_SCHOLARS_CACHE[gt_dir] = (days[order], values[order])
-    return SAX_SCHOLARS_CACHE[gt_dir]
-end
-
-function sax_scholars_targets_for_days(gt_dir::String, days::Int)
-    data = load_sax_scholars_series(gt_dir)
-    data === nothing && return nothing
-    src_days, src_values = data
-    selected_days = Int[]
-    selected_values = Float64[]
-    for (day, val) in zip(src_days, src_values)
-        day < 1 && continue
-        day > days && break
-        push!(selected_days, day)
-        push!(selected_values, val)
-    end
-    isempty(selected_days) && return nothing
-    return selected_days, selected_values
-end
-
-function sax_scholars_targets(cfg::OptimizerConfig, days::Int)
-    gt_dir = cfg.external_sim === nothing ? joinpath(MANAGER_ROOT, "gt") : cfg.external_sim.gt_dir
-    sax_scholars_targets_for_days(gt_dir, days)
-end
-
 function moving_average(series::Vector{Float64}, window::Int=7)
     n = length(series)
     n == 0 && return Float64[]
@@ -598,68 +515,6 @@ function moving_average(series::Vector{Float64}, window::Int=7)
         out[i] = acc / min(i, w)
     end
     return out
-end
-
-function sax_scholars_rmae_from_series(series::Vector{Float64}, sax_days::Vector{Int}, sax_values::Vector{Float64})
-    moving = moving_average(series, 7)
-    sims = Float64[]
-    targets = Float64[]
-    for (day, val) in zip(sax_days, sax_values)
-        if 1 <= day <= length(moving)
-            push!(sims, moving[day])
-            push!(targets, val)
-        end
-    end
-    isempty(sims) && return Inf
-    return rmae_series(sims, targets)
-end
-
-function sax_scholars_rmae_from_vector(series::Vector{Float64}, cfg::OptimizerConfig, days::Int)
-    data = sax_scholars_targets(cfg, days)
-    data === nothing && return nothing
-    sax_days, sax_values = data
-    return sax_scholars_rmae_from_series(series, sax_days, sax_values)
-end
-
-function sax_scholars_rmae_from_daily(daily_path::String, cfg::OptimizerConfig, days::Int)
-    data = sax_scholars_targets(cfg, days)
-    data === nothing && return nothing
-    sax_days, sax_values = data
-    trajs = read_daily_metric(daily_path, "daily_student_detections")
-    trajs === nothing && return nothing
-    vals = Float64[]
-    for traj in trajs
-        s = Float64.(traj[1:min(end, days)])
-        push!(vals, sax_scholars_rmae_from_series(s, sax_days, sax_values))
-    end
-    isempty(vals) && return nothing
-    return sum(vals) / length(vals)
-end
-
-function per_trajectory_sax_scholars_rmae(daily_path::String, sax_days::Vector{Int}, sax_values::Vector{Float64}, days::Int)
-    trajs = read_daily_metric(daily_path, "daily_student_detections")
-    trajs === nothing && return Inf
-    vals = Float64[]
-    for traj in trajs
-        s = Float64.(traj[1:min(end, days)])
-        push!(vals, sax_scholars_rmae_from_series(s, sax_days, sax_values))
-    end
-    isempty(vals) && return Inf
-    return sum(vals) / length(vals)
-end
-
-function sax_scholars_metric_values(daily_path::String, cfg::OptimizerConfig, days::Int)
-    data = sax_scholars_targets(cfg, days)
-    data === nothing && return Float64[]
-    sax_days, sax_values = data
-    trajs = read_daily_metric(daily_path, "daily_student_detections")
-    trajs === nothing && return Float64[]
-    vals = Float64[]
-    for traj in trajs
-        s = Float64.(traj[1:min(end, days)])
-        push!(vals, sax_scholars_rmae_from_series(s, sax_days, sax_values))
-    end
-    return vals
 end
 
 function read_daily_metric(path::String, metric::String)
@@ -926,10 +781,6 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
         metrics[metric] = per_trajectory_rmae(daily_path, metric, drop_missing(gtvals), days)
         metrics["$(metric)_cumulative"] = per_trajectory_cumulative_error(daily_path, metric, drop_missing(gtvals), days)
     end
-    sax_scholars_metric = sax_scholars_rmae_from_daily(daily_path, cfg, days)
-    if sax_scholars_metric !== nothing
-        metrics["sax_scholars_rmae"] = sax_scholars_metric
-    end
     weights = cfg.objective.weights
     combined = get(weights, "daily_detections", 1.0) * metrics["daily_detections"] +
                get(weights, "daily_hospitalizations", 0.0) * metrics["daily_hospitalizations"] +
@@ -938,8 +789,7 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
                get(weights, "daily_detections_cumulative", 1.0) * get(metrics, "daily_detections_cumulative", 0.0) +
                get(weights, "daily_hospitalizations_cumulative", 0.0) * get(metrics, "daily_hospitalizations_cumulative", 0.0) +
                get(weights, "daily_deaths_cumulative", 1.0) * get(metrics, "daily_deaths_cumulative", 0.0) +
-               get(weights, "daily_student_detections_cumulative", 1.0) * get(metrics, "daily_student_detections_cumulative", 0.0) +
-               get(weights, "sax_scholars_rmae", 1.0) * get(metrics, "sax_scholars_rmae", 0.0)
+               get(weights, "daily_student_detections_cumulative", 1.0) * get(metrics, "daily_student_detections_cumulative", 0.0)
     return combined, metrics
 end
 
@@ -958,10 +808,6 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
     if haskey(gt, "daily_student_detections")
         metrics["daily_student_detections_cumulative"] = per_trajectory_cumulative_error(daily_path, "daily_student_detections", gt["daily_student_detections"], days)
     end
-    sax_scholars_metric = sax_scholars_rmae_from_daily(daily_path, cfg, days)
-    if sax_scholars_metric !== nothing
-        metrics["sax_scholars_rmae"] = sax_scholars_metric
-    end
     weights = cfg.objective.weights
     combined = get(weights, "daily_detections", 1.0) * metrics["daily_detections"] +
                get(weights, "daily_hospitalizations", 0.0) * metrics["daily_hospitalizations"] +
@@ -970,9 +816,15 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
                get(weights, "daily_detections_cumulative", 1.0) * get(metrics, "daily_detections_cumulative", 0.0) +
                get(weights, "daily_hospitalizations_cumulative", 0.0) * get(metrics, "daily_hospitalizations_cumulative", 0.0) +
                get(weights, "daily_deaths_cumulative", 1.0) * get(metrics, "daily_deaths_cumulative", 0.0) +
-               get(weights, "daily_student_detections_cumulative", 0.0) * get(metrics, "daily_student_detections_cumulative", 0.0) +
-               get(weights, "sax_scholars_rmae", 1.0) * get(metrics, "sax_scholars_rmae", 0.0)
+               get(weights, "daily_student_detections_cumulative", 0.0) * get(metrics, "daily_student_detections_cumulative", 0.0)
     return combined, metrics
+end
+
+function top_k_entries(entries::Vector{Dict{String,Any}}, k::Int)
+    isempty(entries) && return Any[]
+    kk = max(1, min(k, length(entries)))
+    sorted = sort(entries, by = x -> Float64(get(x, "score", Inf)))
+    return sorted[1:kk]
 end
 
 function slurm_array_is_running(jobid::String)
@@ -984,9 +836,10 @@ function slurm_array_is_running(jobid::String)
     end
 end
 
-function wait_for_iteration_outputs(list_file::String; poll::Float64=10.0)
+function wait_for_iteration_outputs(list_file::String; poll::Float64=10.0, min_completion_fraction::Float64=1.0, finish_iter_delay::Int=30)
     cand_dirs = [strip(x) for x in readlines(list_file) if !isempty(strip(x))]
-    last_done = -1
+    target_done = max(1, ceil(Int, length(cand_dirs) * clamp(min_completion_fraction, 0.0, 1.0)))
+    threshold_reached_at = nothing
     while true
         done_count = 0
         failed_count = 0
@@ -1004,20 +857,35 @@ function wait_for_iteration_outputs(list_file::String; poll::Float64=10.0)
         end
 
         if done_count + failed_count == length(cand_dirs)
-            return
+            return Dict("done" => done_count, "failed" => failed_count, "pending" => pending, "threshold_reached" => done_count >= target_done, "timed_out" => false)
         end
 
-        if done_count > 0 && done_count == last_done
-            # no new completions for 1 minute -> mark remaining as failed and continue
-            for d in pending
-                failed_ok = joinpath(d, "failed.ok")
-                isfile(failed_ok) || touch(failed_ok)
+        if done_count >= target_done
+            if threshold_reached_at === nothing
+                threshold_reached_at = time()
             end
-            return
+            if done_count + failed_count == length(cand_dirs) || (time() - threshold_reached_at) >= finish_iter_delay
+                for d in pending
+                    skipped_ok = joinpath(d, "skipped.ok")
+                    isfile(skipped_ok) || touch(skipped_ok)
+                end
+                return Dict("done" => done_count, "failed" => failed_count, "pending" => pending, "threshold_reached" => true, "timed_out" => !isempty(pending))
+            end
         end
 
-        last_done = done_count
-        sleep(60.0)
+        if done_count + failed_count == length(cand_dirs)
+            return Dict("done" => done_count, "failed" => failed_count, "pending" => pending, "threshold_reached" => done_count >= target_done, "timed_out" => false)
+        end
+
+        if threshold_reached_at !== nothing && finish_iter_delay <= 0
+            for d in pending
+                skipped_ok = joinpath(d, "skipped.ok")
+                isfile(skipped_ok) || touch(skipped_ok)
+            end
+            return Dict("done" => done_count, "failed" => failed_count, "pending" => pending, "threshold_reached" => true, "timed_out" => false)
+        end
+
+        sleep(poll)
     end
 end
 
@@ -1084,7 +952,7 @@ function update_state(state::CMAState, ranked::Vector{Tuple{Float64,Vector{Float
     end
     new_cov = 0.7 .* state.covariance .+ 0.3 .* cov
     best_score = selected[1][1]
-    new_sigma = best_score < ranked[min(end, μ)][1] ? state.sigma * 0.97 : state.sigma * 1.01
+    new_sigma = best_score < ranked[min(end, μ)][1] ? state.sigma * 0.98 : state.sigma * 1.01
     return CMAState(new_mean, clamp(new_sigma, 0.02, 0.5), new_cov)
 end
 
@@ -1111,6 +979,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
     resume_state = load_stage_state(stage_root)
     history = Any[]
     iter_log = Any[]
+    top_candidates = Dict{String,Dict{String,Any}}()
     best_score_raw = resume_state === nothing ? Inf : get(resume_state, "best_score", Inf)
     best_score = best_score_raw === nothing ? Inf : Float64(best_score_raw)
     best_vector = resume_state !== nothing && haskey(resume_state, "best_vector") ? Float64.(resume_state["best_vector"]) : copy(state.mean)
@@ -1142,7 +1011,12 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
             end
             jobid = submit_slurm_array(cfg, list_file)
             @info "Submitted Slurm array" stage=stage.name iteration=iter jobid=jobid
-            wait_for_iteration_outputs(list_file; poll=10.0)
+            wait_result = wait_for_iteration_outputs(
+                list_file;
+                poll=10.0,
+                min_completion_fraction=cfg.objective.min_completion_fraction,
+                finish_iter_delay=cfg.objective.finish_iter_delay,
+            )
             @info "Slurm array finished" stage=stage.name iteration=iter jobid=jobid
 
             # collect scores from generated output_daily.jld2
@@ -1171,10 +1045,6 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                         "daily_deaths_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_deaths", gt["daily_deaths"], days),
                         "simulated" => "real",
                     )
-                    if haskey(comp, "sax_scholars_rmae")
-                        metrics_payload["sax_scholars_rmae"] = comp["sax_scholars_rmae"]
-                        metrics_payload["sax_scholars_per_trajectory"] = sax_scholars_metric_values(daily_path, cfg, days)
-                    end
                     if haskey(comp, "daily_student_detections")
                         metrics_payload["daily_student_detections"] = comp["daily_student_detections"]
                         metrics_payload["daily_student_detections_cumulative"] = get(comp, "daily_student_detections_cumulative", NaN)
@@ -1182,11 +1052,15 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                         metrics_payload["daily_student_detections_cumulative_per_trajectory"] = cumulative_error_distribution(daily_path, "daily_student_detections", gt["daily_student_detections"], days)
                     end
                     save_json(joinpath(cand_dir, "metrics.json"), metrics_payload)
-                    Dict("score" => combined, "metrics" => comp, "simulated" => "real")
-                else
-                    metrics_payload = Dict("score" => Inf, "simulated" => "real_missing")
+                    Dict("score" => combined, "metrics" => comp, "simulated" => "real", "status" => "completed")
+                elseif isfile(joinpath(cand_dir, "skipped.ok"))
+                    metrics_payload = Dict("score" => Inf, "simulated" => "real_skipped", "status" => "skipped")
                     save_json(joinpath(cand_dir, "metrics.json"), metrics_payload)
-                    Dict("score" => Inf, "metrics" => Dict(), "simulated" => "real_missing")
+                    Dict("score" => Inf, "metrics" => Dict(), "simulated" => "real_skipped", "status" => "skipped")
+                else
+                    metrics_payload = Dict("score" => Inf, "simulated" => "real_missing", "status" => "failed")
+                    save_json(joinpath(cand_dir, "metrics.json"), metrics_payload)
+                    Dict("score" => Inf, "metrics" => Dict(), "simulated" => "real_missing", "status" => "failed")
                 end
                 score = metrics["score"]
                 append_jsonl(joinpath(stage_root, "iter_metrics.jsonl"), Dict(
@@ -1195,9 +1069,12 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     "candidate" => ci,
                     "score" => score,
                     "simulated" => metrics["simulated"],
+                    "status" => get(metrics, "status", "unknown"),
                     "has_output_daily" => isfile(daily_path),
                     "sigma" => state.sigma,
                     "best_score_so_far" => best_score,
+                    "threshold_reached" => wait_result["threshold_reached"],
+                    "timed_out" => wait_result["timed_out"],
                 ))
                 push!(history, Dict(
                     "stage" => stage.name,
@@ -1205,10 +1082,13 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     "candidate" => ci,
                     "fit_months" => active_months,
                     "score" => score,
+                    "status" => get(metrics, "status", "unknown"),
                     "metrics" => metrics,
                 ))
-                push!(ranked, (score, x, zs[ci]))
-                if score < best_score
+                if get(metrics, "status", "failed") == "completed"
+                    push!(ranked, (score, x, zs[ci]))
+                end
+                if get(metrics, "status", "failed") == "completed" && score < best_score
                     best_score = score
                     best_vector = copy(x)
                     best_candidate = deepcopy(cand_cfg)
@@ -1230,6 +1110,16 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     "score" => score,
                     "metrics" => metrics,
                 ))
+                key = "$(iter)-$(ci)"
+                top_candidates[key] = Dict(
+                    "stage" => stage.name,
+                    "iteration" => iter,
+                    "candidate" => ci,
+                    "fit_months" => active_months,
+                    "score" => score,
+                    "config" => deepcopy(candidate_cfg),
+                    "metrics" => metrics,
+                )
                 push!(ranked, (score, x, zs[ci]))
                 if score < best_score
                     best_score = score
@@ -1238,6 +1128,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                 end
             end
         end
+        isempty(ranked) && error("No completed candidates available for stage $(stage.name) iteration $(iter). Increase max wait or completion fraction.")
         sort!(ranked, by=first)
         state = update_state(state, ranked)
         if state.sigma > stage.sigma
@@ -1268,6 +1159,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
         "fit_months" => active_months,
         "best_score" => best_score,
         "best_candidate" => best_candidate,
+        "top_candidates" => top_k_entries(collect(values(top_candidates)), cfg.objective.top_k),
         "best_vector" => best_vector,
         "sigma" => state.sigma,
         "covariance" => state.covariance,
@@ -1302,15 +1194,19 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             "stage" => result["stage"],
             "fit_months" => result["fit_months"],
             "best_score" => result["best_score"],
+            "top_k" => length(result["top_candidates"]),
             "sigma" => result["sigma"],
         ))
         append!(all_history, result["history"])
         save_json(joinpath(cfg.output_dir, "$(stage.name)_best_candidate.json"), result["best_candidate"])
+        save_json(joinpath(cfg.output_dir, "$(stage.name)_top_candidates.json"), result["top_candidates"])
         save_json(joinpath(cfg.output_dir, "$(stage.name)_summary.json"), Dict(
             "stage" => result["stage"],
             "fit_months" => result["fit_months"],
             "best_score" => result["best_score"],
+            "top_k" => length(result["top_candidates"]),
             "sigma" => result["sigma"],
+            "top_candidates" => result["top_candidates"],
             "iter_log" => result["iter_log"],
         ))
     end
@@ -1318,7 +1214,7 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
     save_json(joinpath(cfg.output_dir, "optimizer_history.json"), all_history)
     save_json(joinpath(cfg.output_dir, "stage_summary.json"), stage_outputs)
     save_json(joinpath(cfg.output_dir, "final_best_candidate.json"), current_seed)
-    return Dict("stage_summary" => stage_outputs, "output_dir" => cfg.output_dir)
+    return Dict("stage_summary" => stage_outputs, "output_dir" => cfg.output_dir, "top_k" => cfg.objective.top_k)
 end
 
 function main()

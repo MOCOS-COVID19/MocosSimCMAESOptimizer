@@ -3,11 +3,11 @@
   "output_dir": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/runs/config11",
   "monthly_days": 30,
   "stages": [
-    {"name": "stage_10m", "fit_months": 10, "max_iterations": 25, "population_size": 50, "sigma": 0.3}
+    {"name": "stage_7m", "fit_months": 7, "max_iterations": 30, "population_size": 50, "sigma": 0.2}
 ],
   "scalar_bounds": {
-    "transmission_probabilities.school": [0, 0.3],
-    "transmission_probabilities.class": [0.15, 0.5]
+    "transmission_probabilities.school": [0.05, 0.3],
+    "transmission_probabilities.class": [0.1, 0.4]
   },
   "temporal_bounds": {
     "infection_modulation.params.interval_values": [0.0, 1.0],
@@ -21,10 +21,19 @@
       "cumulative": 0.35,
       "peak_height": 0.5,
       "peak_timing": 0.5,
-      "slope": 0.25
+      "slope": 0.25,
+      "daily_detections": 1.0,
+      "daily_hospitalizations": 0.0,
+      "daily_deaths": 1.0,
+      "daily_student_detections": 0.2,
+      "daily_detections_cumulative": 1.0,
+      "daily_hospitalizations_cumulative": 0.0,
+      "daily_deaths_cumulative": 1.0,
+      "daily_student_detections_cumulative": 0.0
     },
-    "recent_days": 21,
-    "early_reject_multiplier": 2.2
+    "top_k": 5,
+    "min_completion_fraction": 0.75,
+    "finish_iter_delay": 30
   },
   "gt_dir": "./gt",
   "julia_bin": "/home/mbodych/1.7.0-school_class/julia-1.7.0/bin/julia",
