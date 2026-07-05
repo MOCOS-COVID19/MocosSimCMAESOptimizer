@@ -875,17 +875,16 @@ function wait_for_iteration_outputs(list_file::String; poll::Float64=10.0, min_c
             if threshold_reached_at === nothing
                 threshold_reached_at = time()
             end
-            if done_count + failed_count == length(cand_dirs) || (time() - threshold_reached_at) >= finish_iter_delay
+            if done_count + failed_count == length(cand_dirs)
+                return Dict("done" => done_count, "failed" => failed_count, "pending" => pending, "threshold_reached" => true, "timed_out" => false)
+            end
+            if (time() - threshold_reached_at) >= finish_iter_delay
                 for d in pending
                     skipped_ok = joinpath(d, "skipped.ok")
                     isfile(skipped_ok) || touch(skipped_ok)
                 end
                 return Dict("done" => done_count, "failed" => failed_count, "pending" => pending, "threshold_reached" => true, "timed_out" => !isempty(pending))
             end
-        end
-
-        if done_count + failed_count == length(cand_dirs)
-            return Dict("done" => done_count, "failed" => failed_count, "pending" => pending, "threshold_reached" => done_count >= target_done, "timed_out" => false)
         end
 
         if threshold_reached_at !== nothing && finish_iter_delay <= 0
@@ -965,6 +964,15 @@ function update_state(state::CMAState, ranked::Vector{Tuple{Float64,Vector{Float
     best_score = selected[1][1]
     new_sigma = best_score < ranked[min(end, μ)][1] ? state.sigma * 0.98 : state.sigma * 1.01
     return CMAState(new_mean, clamp(new_sigma, 0.02, 0.5), new_cov)
+end
+
+function safe_save_json(path::String, value; label::String=path)
+    try
+        save_json(path, value)
+    catch err
+        @error "Failed to save JSON artifact" label path err
+        rethrow(err)
+    end
 end
 
 function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{ParamSpec}, cfg::OptimizerConfig, stage::StageConfig, state::Union{Nothing,CMAState}; use_slurm::Bool=false, resume_from::Int=0)
@@ -1063,15 +1071,15 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                         metrics_payload["daily_student_detections_per_trajectory"] = trajectory_metric_values(daily_path, "daily_student_detections", gt["daily_student_detections"], days)
                         metrics_payload["daily_student_detections_cumulative_per_trajectory"] = cumulative_error_distribution(daily_path, "daily_student_detections", gt["daily_student_detections"], days)
                     end
-                    save_json(joinpath(cand_dir, "metrics.json"), metrics_payload)
+                    safe_save_json(joinpath(cand_dir, "metrics.json"), metrics_payload; label="candidate_metrics")
                     Dict("score" => combined, "metrics" => comp, "simulated" => "real", "status" => "completed")
                 elseif isfile(joinpath(cand_dir, "skipped.ok"))
                     metrics_payload = Dict("score" => Inf, "simulated" => "real_skipped", "status" => "skipped")
-                    save_json(joinpath(cand_dir, "metrics.json"), metrics_payload)
+                    safe_save_json(joinpath(cand_dir, "metrics.json"), metrics_payload; label="candidate_metrics")
                     Dict("score" => Inf, "metrics" => Dict(), "simulated" => "real_skipped", "status" => "skipped")
                 else
                     metrics_payload = Dict("score" => Inf, "simulated" => "real_missing", "status" => "failed")
-                    save_json(joinpath(cand_dir, "metrics.json"), metrics_payload)
+                    safe_save_json(joinpath(cand_dir, "metrics.json"), metrics_payload; label="candidate_metrics")
                     Dict("score" => Inf, "metrics" => Dict(), "simulated" => "real_missing", "status" => "failed")
                 end
                 score = metrics["score"]
@@ -1127,7 +1135,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                 candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
                 inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
                 metrics = score_candidate(candidate_cfg, cfg, days; workdir=joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"))
-                save_json(joinpath(joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"), "metrics.json"), metrics)
+                safe_save_json(joinpath(joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"), "metrics.json"), metrics; label="candidate_metrics")
                 score = metrics["score"]
                 push!(history, Dict(
                     "stage" => stage.name,
@@ -1172,18 +1180,18 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
             "sigma" => state.sigma,
             "covariance_trace" => tr(state.covariance),
         ))
-        save_json(joinpath(stage_root, "stage_state.json"), Dict(
+        safe_save_json(joinpath(stage_root, "stage_state.json"), Dict(
             "stage" => stage.name,
             "fit_months" => active_months,
             "best_score" => best_score,
             "sigma" => state.sigma,
             "covariance_trace" => tr(state.covariance),
             "best_vector" => best_vector,
-        ))
+        ); label="stage_state")
         iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
         mkpath(iter_root)
-        save_json(joinpath(iter_root, "top_candidates.json"), top_k_entries(with_iteration_ranks(iteration_top_candidates), cfg.objective.top_k))
-    save_json(joinpath(stage_root, "full_reusable_state.json"), full_reusable_state_from_cma(stage, specs_stage, state))
+        safe_save_json(joinpath(iter_root, "top_candidates.json"), top_k_entries(with_iteration_ranks(iteration_top_candidates), cfg.objective.top_k); label="iteration_top_candidates")
+    safe_save_json(joinpath(stage_root, "full_reusable_state.json"), full_reusable_state_from_cma(stage, specs_stage, state); label="full_reusable_state")
     end
 
     return Dict(
@@ -1230,9 +1238,9 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             "sigma" => result["sigma"],
         ))
         append!(all_history, result["history"])
-        save_json(joinpath(cfg.output_dir, "$(stage.name)_best_candidate.json"), result["best_candidate"])
-        save_json(joinpath(cfg.output_dir, "$(stage.name)_top_candidates.json"), result["top_candidates"])
-        save_json(joinpath(cfg.output_dir, "$(stage.name)_summary.json"), Dict(
+        safe_save_json(joinpath(cfg.output_dir, "$(stage.name)_best_candidate.json"), result["best_candidate"]; label="stage_best_candidate")
+        safe_save_json(joinpath(cfg.output_dir, "$(stage.name)_top_candidates.json"), result["top_candidates"]; label="stage_top_candidates")
+        safe_save_json(joinpath(cfg.output_dir, "$(stage.name)_summary.json"), Dict(
             "stage" => result["stage"],
             "fit_months" => result["fit_months"],
             "best_score" => result["best_score"],
@@ -1240,12 +1248,12 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             "sigma" => result["sigma"],
             "top_candidates" => result["top_candidates"],
             "iter_log" => result["iter_log"],
-        ))
+        ); label="stage_summary")
     end
 
-    save_json(joinpath(cfg.output_dir, "optimizer_history.json"), all_history)
-    save_json(joinpath(cfg.output_dir, "stage_summary.json"), stage_outputs)
-    save_json(joinpath(cfg.output_dir, "final_best_candidate.json"), current_seed)
+    safe_save_json(joinpath(cfg.output_dir, "optimizer_history.json"), all_history; label="optimizer_history")
+    safe_save_json(joinpath(cfg.output_dir, "stage_summary.json"), stage_outputs; label="stage_summary")
+    safe_save_json(joinpath(cfg.output_dir, "final_best_candidate.json"), current_seed; label="final_best_candidate")
     return Dict("stage_summary" => stage_outputs, "output_dir" => cfg.output_dir, "top_k" => cfg.objective.top_k)
 end
 
