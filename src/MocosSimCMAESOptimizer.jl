@@ -131,7 +131,120 @@ function build_state_from_reusable(seed::Dict{String,Any}, specs_stage::Vector{P
         ib = idx_map[name_b]
         new_cov[a, b] = old_cov[ia, ib]
     end
+    # Phase 1 temporal unlock on resume:
+    # keep scalar warm-starts stable, but loosen temporal params so the search can
+    # escape minima inherited from shorter horizons / older resumed states.
+    temporal_mean_jitter = 0.12
+    temporal_covariance_inflation = 2.5
+    idx = 1
+    for spec in specs_stage
+        if spec.kind == :temporal
+            for local_idx in 1:spec.length
+                pos = idx + local_idx - 1
+                # Later temporal buckets get stronger unlock.
+                frac = spec.length <= 1 ? 1.0 : (local_idx - 1) / (spec.length - 1)
+                jitter_scale = temporal_mean_jitter * (0.5 + frac)
+                new_mean[pos] = clamp(
+                    new_mean[pos] + jitter_scale * (2rand() - 1),
+                    spec.lower,
+                    spec.upper,
+                )
+                new_cov[pos, pos] = max(new_cov[pos, pos] * temporal_covariance_inflation * (1.0 + frac), 1e-6)
+            end
+        end
+        idx += spec.length
+    end
     return CMAState(new_mean, max(old_sigma, sigma_floor), new_cov)
+end
+
+function temporal_unlock_from_top_candidates!(state::CMAState, specs_stage::Vector{ParamSpec}, top_candidates)
+    top_candidates === nothing && return state
+    top_candidates isa AbstractVector || return state
+    isempty(top_candidates) && return state
+
+    # Phase 2:
+    # Use spread among top candidates as a mismatch / uncertainty proxy.
+    # Buckets that vary a lot across strong candidates get unlocked more aggressively.
+    idx = 1
+    for spec in specs_stage
+        if spec.kind == :temporal
+            bucket_values = [Float64[] for _ in 1:spec.length]
+            for cand in top_candidates
+                cfg = get(cand, "config", nothing)
+                cfg isa AbstractDict || continue
+                vals = try
+                    get_nested(cfg, spec.name)
+                catch
+                    nothing
+                end
+                vals isa AbstractVector || continue
+                for bi in 1:min(spec.length, length(vals))
+                    v = vals[bi]
+                    v isa Number || continue
+                    push!(bucket_values[bi], Float64(v))
+                end
+            end
+            for bi in 1:spec.length
+                pos = idx + bi - 1
+                vals = bucket_values[bi]
+                isempty(vals) && continue
+                spread = length(vals) == 1 ? 0.0 : std(vals)
+                frac = spec.length <= 1 ? 1.0 : (bi - 1) / (spec.length - 1)
+                unlock = clamp(spread / max(spec.upper - spec.lower, 1e-6), 0.0, 1.0)
+                jitter_scale = 0.05 + 0.20 * unlock + 0.08 * frac
+                state.mean[pos] = clamp(
+                    state.mean[pos] + jitter_scale * (2rand() - 1),
+                    spec.lower,
+                    spec.upper,
+                )
+                inflate = 1.0 + 2.0 * unlock + 0.5 * frac
+                state.covariance[pos, pos] = max(state.covariance[pos, pos] * inflate, 1e-6)
+            end
+        end
+        idx += spec.length
+    end
+    return state
+end
+
+function temporal_unlock_from_bucket_errors!(state::CMAState, specs_stage::Vector{ParamSpec}, top_candidates)
+    top_candidates === nothing && return state
+    top_candidates isa AbstractVector || return state
+    isempty(top_candidates) && return state
+
+    best = top_candidates[1]
+    metrics = get(best, "metrics", nothing)
+    metrics isa AbstractDict || return state
+    bucket_errors = get(metrics, "bucket_errors", nothing)
+    bucket_errors isa AbstractDict || return state
+
+    idx = 1
+    for spec in specs_stage
+        if spec.kind == :temporal && haskey(bucket_errors, spec.name)
+            errors = try
+                Float64.(bucket_errors[spec.name])
+            catch
+                Float64[]
+            end
+            if !isempty(errors)
+                max_err = max(maximum(errors), 1e-9)
+                for bi in 1:min(spec.length, length(errors))
+                    pos = idx + bi - 1
+                    frac = spec.length <= 1 ? 1.0 : (bi - 1) / (spec.length - 1)
+                    unlock = clamp(errors[bi] / max_err, 0.0, 1.0)
+                    jitter_scale = 0.04 + 0.22 * unlock + 0.06 * frac
+                    state.mean[pos] = clamp(
+                        state.mean[pos] + jitter_scale * (2rand() - 1),
+                        spec.lower,
+                        spec.upper,
+                    )
+                    inflate = 1.0 + 2.5 * unlock + 0.5 * frac
+                    state.covariance[pos, pos] = max(state.covariance[pos, pos] * inflate, 1e-6)
+                end
+            end
+        end
+        idx += spec.length
+    end
+    return state
 end
 
 function parse_stage_iter_from_path(path::String)
@@ -151,6 +264,32 @@ function load_stage_state(stage_root::String)
     path = joinpath(stage_root, "stage_state.json")
     isfile(path) || return nothing
     return load_json(path)
+end
+
+function latest_iteration_top_candidates(stage_root::String)
+    isdir(stage_root) || return nothing
+    iter_dirs = String[]
+    for entry in readdir(stage_root)
+        startswith(entry, "iter_") || continue
+        path = joinpath(stage_root, entry, "top_candidates.json")
+        isfile(path) && push!(iter_dirs, path)
+    end
+    isempty(iter_dirs) && return nothing
+    function iter_num(path::String)
+        m = match(r"iter_(\d+)", path)
+        m === nothing && return 0
+        return parse(Int, m.captures[1])
+    end
+    best_path = iter_dirs[1]
+    best_iter = iter_num(best_path)
+    for path in iter_dirs[2:end]
+        cur = iter_num(path)
+        if cur > best_iter
+            best_iter = cur
+            best_path = path
+        end
+    end
+    return load_json(best_path)
 end
 
 function stage_resume_info(stage_root::String)
@@ -796,6 +935,42 @@ function temporal_directional_guidance(daily_path::String, metric::String, gt_se
     return guidance
 end
 
+function temporal_bucket_error_distribution(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int, spec::ParamSpec, active_months::Int, cfg::OptimizerConfig)
+    trajs = read_daily_metric(daily_path, metric)
+    trajs === nothing && return Float64[]
+    g = drop_missing(gt_series[1:min(end, days)])
+    if metric == "daily_student_detections"
+        g = rolling_mean(g, 7)
+    else
+        g = rolling_sum(g, 7)
+    end
+    bucket_ranges = temporal_bucket_day_ranges(load_json(cfg.seed_config), spec, active_months, cfg)
+    errors = zeros(Float64, spec.length)
+    for (bi, (start_day, end_day)) in enumerate(bucket_ranges)
+        start_day > end_day && continue
+        idxs = start_day:min(end_day, length(g))
+        isempty(idxs) && continue
+        g_seg = g[idxs]
+        err = 0.0
+        counted = 0
+        for traj in trajs
+            s = Float64.(traj[1:min(end, days)])
+            if metric == "daily_student_detections"
+                s = rolling_mean(s, 7)
+            else
+                s = rolling_sum(s, 7)
+            end
+            s_seg = s[idxs]
+            n = min(length(s_seg), length(g_seg))
+            n == 0 && continue
+            err += mean(abs.(s_seg[1:n] .- g_seg[1:n]))
+            counted += 1
+        end
+        errors[bi] = counted == 0 ? 0.0 : err / counted
+    end
+    return errors
+end
+
 function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, days::Int; workdir::String)
     sim_ok, daily_path = run_external_sim(cfg, candidate, days; workdir=workdir)
     sim_ok || return Inf, Dict("sim_failed" => true)
@@ -1069,6 +1244,9 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
         reusable = load_full_reusable_state(reusable_path)
         if reusable !== nothing
             state = build_state_from_reusable(seed, specs_stage, reusable)
+            stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
+            top_candidates = latest_iteration_top_candidates(stage_root)
+            state = temporal_unlock_from_bucket_errors!(state, specs_stage, top_candidates)
         else
             seeded = initial_state_from_config(cfg, dim, x0)
             state = seeded === nothing ? CMAState(copy(x0), stage.sigma, Matrix{Float64}(I, dim, dim)) : seeded
@@ -1143,6 +1321,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                 elseif isfile(daily_path)
                     combined, comp = score_from_daily(cfg, daily_path, days)
                     gt = load_gt_series(cfg.external_sim.gt_dir)
+                    bucket_errors = Dict{String,Any}()
                     metrics_payload = Dict(
                         "score" => combined,
                         "daily_detections" => comp["daily_detections"],
@@ -1159,6 +1338,31 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                         "daily_deaths_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_deaths", gt["daily_deaths"], days),
                         "simulated" => "real",
                     )
+                    for spec in specs_stage
+                        spec.kind == :temporal || continue
+                        metric_name = if startswith(spec.name, "infection_modulation")
+                            "daily_detections"
+                        elseif startswith(spec.name, "mild_detection_modulation")
+                            "daily_student_detections"
+                        elseif startswith(spec.name, "tracing_modulation")
+                            "daily_detections"
+                        else
+                            nothing
+                        end
+                        metric_name === nothing && continue
+                        gt_key = metric_name
+                        haskey(gt, gt_key) || continue
+                        bucket_errors[spec.name] = temporal_bucket_error_distribution(
+                            daily_path,
+                            metric_name,
+                            gt[gt_key],
+                            days,
+                            spec,
+                            active_months,
+                            cfg,
+                        )
+                    end
+                    metrics_payload["bucket_errors"] = bucket_errors
                     if haskey(comp, "daily_student_detections")
                         metrics_payload["daily_student_detections"] = comp["daily_student_detections"]
                         metrics_payload["daily_student_detections_cumulative"] = get(comp, "daily_student_detections_cumulative", NaN)
