@@ -841,8 +841,8 @@ function top_k_entries(entries::Vector{Dict{String,Any}}, k::Int)
     return sorted[1:kk]
 end
 
-function with_iteration_ranks(entries::Vector{Dict{String,Any}})
-    ranked = sort(entries, by = x -> Float64(get(x, "score", Inf)))
+function with_iteration_ranks(entries)
+    ranked = sort(collect(entries), by = x -> Float64(get(x, "score", Inf)))
     out = Any[]
     for (idx, entry) in enumerate(ranked)
         enriched = deepcopy(entry)
@@ -850,6 +850,23 @@ function with_iteration_ranks(entries::Vector{Dict{String,Any}})
         push!(out, enriched)
     end
     return out
+end
+
+function safe_iteration_top_k(entries, k::Int)
+    try
+        return top_k_entries(with_iteration_ranks(entries), k)
+    catch err
+        @error "Failed to build iteration top candidates" err entries_count=length(entries)
+        fallback = Any[]
+        ranked = sort(collect(entries), by = x -> Float64(get(x, "score", Inf)))
+        kk = max(1, min(k, length(ranked)))
+        for (idx, entry) in enumerate(ranked[1:kk])
+            enriched = deepcopy(entry)
+            enriched["rank_within_iteration"] = idx
+            push!(fallback, enriched)
+        end
+        return fallback
+    end
 end
 
 function slurm_array_is_running(jobid::String)
@@ -1254,7 +1271,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
         ); label="stage_state")
         iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
         mkpath(iter_root)
-        safe_save_json(joinpath(iter_root, "top_candidates.json"), top_k_entries(with_iteration_ranks(iteration_top_candidates), cfg.objective.top_k); label="iteration_top_candidates")
+        safe_save_json(joinpath(iter_root, "top_candidates.json"), safe_iteration_top_k(iteration_top_candidates, cfg.objective.top_k); label="iteration_top_candidates")
         safe_save_json(joinpath(stage_root, "full_reusable_state.json"), full_reusable_state_from_cma(stage, specs_stage, state); label="full_reusable_state")
         @info "Finished iteration" stage=stage.name iteration=iter best_score=best_score sigma=state.sigma top_candidates_written=length(iteration_top_candidates)
     end
