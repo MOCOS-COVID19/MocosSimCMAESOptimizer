@@ -843,10 +843,11 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
     return combined, metrics
 end
 
-function top_k_entries(entries::Vector{Dict{String,Any}}, k::Int)
-    isempty(entries) && return Any[]
-    kk = max(1, min(k, length(entries)))
-    sorted = sort(entries, by = x -> Float64(get(x, "score", Inf)))
+function top_k_entries(entries, k::Int)
+    items = collect(entries)
+    isempty(items) && return Any[]
+    kk = max(1, min(k, length(items)))
+    sorted = sort(items, by = x -> Float64(get(x, "score", Inf)))
     return sorted[1:kk]
 end
 
