@@ -170,7 +170,16 @@ function stage_resume_info(stage_root::String)
     end
     isempty(iter_infos) && return nothing
     completed_iters = [info for info in iter_infos if info[3]]
-    chosen = isempty(completed_iters) ? maximum(iter_infos, by=first) : maximum(completed_iters, by=first)
+    function max_iter_info(items)
+        best = items[1]
+        for item in items[2:end]
+            if item[1] > best[1]
+                best = item
+            end
+        end
+        return best
+    end
+    chosen = isempty(completed_iters) ? max_iter_info(iter_infos) : max_iter_info(completed_iters)
     return Dict(
         "last_iter" => chosen[1],
         "last_iter_file" => chosen[2],
