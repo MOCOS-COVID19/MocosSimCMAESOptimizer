@@ -991,12 +991,13 @@ function submit_slurm_array(cfg::OptimizerConfig, list_file::String)
     error("Failed to submit Slurm array after retries: $(last_err)")
 end
 
-function cancel_slurm_array(jobid::String)
-    isempty(strip(jobid)) && return
+function cancel_slurm_array(jobid)
+    jobid_str = String(jobid)
+    isempty(strip(jobid_str)) && return
     try
-        run(`scancel $jobid`)
+        run(`scancel $jobid_str`)
     catch err
-        @warn "Failed to cancel Slurm array job" jobid err
+        @warn "Failed to cancel Slurm array job" jobid=jobid_str err
     end
 end
 
