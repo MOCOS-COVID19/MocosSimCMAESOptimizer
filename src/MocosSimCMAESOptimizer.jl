@@ -858,9 +858,12 @@ function wait_for_iteration_outputs(list_file::String; poll::Float64=10.0, min_c
         for d in cand_dirs
             done_ok = isfile(joinpath(d, "done.ok"))
             failed_ok = isfile(joinpath(d, "failed.ok"))
+            skipped_ok = isfile(joinpath(d, "skipped.ok"))
             if done_ok
                 done_count += 1
             elseif failed_ok
+                failed_count += 1
+            elseif skipped_ok
                 failed_count += 1
             else
                 push!(pending, d)
