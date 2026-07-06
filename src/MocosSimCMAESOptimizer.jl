@@ -542,6 +542,7 @@ end
 
 function read_daily_metric(path::String, metric::String)
     series = Vector{Vector{Float64}}()
+    isfile(path) || return nothing
     try
         h5open(path, "r") do h5
             for key in sort(collect(keys(h5)))
@@ -1134,7 +1135,12 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                 daily_path = joinpath(cand_dir, "output_daily.jld2")
                 cand_cfg = vector_to_config(seed, specs_stage, x, active_months)
                 inject_frozen!(cand_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
-                metrics = if isfile(daily_path)
+                skipped = isfile(joinpath(cand_dir, "skipped.ok"))
+                metrics = if skipped
+                    metrics_payload = Dict("score" => Inf, "simulated" => "real_skipped", "status" => "skipped")
+                    safe_save_json(joinpath(cand_dir, "metrics.json"), metrics_payload; label="candidate_metrics")
+                    Dict("score" => Inf, "metrics" => Dict(), "simulated" => "real_skipped", "status" => "skipped")
+                elseif isfile(daily_path)
                     combined, comp = score_from_daily(cfg, daily_path, days)
                     gt = load_gt_series(cfg.external_sim.gt_dir)
                     metrics_payload = Dict(
@@ -1161,10 +1167,6 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     end
                     safe_save_json(joinpath(cand_dir, "metrics.json"), metrics_payload; label="candidate_metrics")
                     Dict("score" => combined, "metrics" => comp, "simulated" => "real", "status" => "completed")
-                elseif isfile(joinpath(cand_dir, "skipped.ok"))
-                    metrics_payload = Dict("score" => Inf, "simulated" => "real_skipped", "status" => "skipped")
-                    safe_save_json(joinpath(cand_dir, "metrics.json"), metrics_payload; label="candidate_metrics")
-                    Dict("score" => Inf, "metrics" => Dict(), "simulated" => "real_skipped", "status" => "skipped")
                 else
                     metrics_payload = Dict("score" => Inf, "simulated" => "real_missing", "status" => "failed")
                     safe_save_json(joinpath(cand_dir, "metrics.json"), metrics_payload; label="candidate_metrics")

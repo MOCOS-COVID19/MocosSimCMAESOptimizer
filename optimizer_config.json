@@ -32,8 +32,8 @@
       "daily_student_detections_cumulative": 0.0
     },
     "top_k": 5,
-    "min_completion_fraction": 0.75,
-    "finish_iter_delay": 30
+    "min_completion_fraction": 0.5,
+    "finish_iter_delay": 15
   },
   "gt_dir": "./gt",
   "julia_bin": "/home/mbodych/1.7.0-school_class/julia-1.7.0/bin/julia",
