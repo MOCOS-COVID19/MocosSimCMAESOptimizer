@@ -154,16 +154,30 @@ function load_stage_state(stage_root::String)
 end
 
 function stage_resume_info(stage_root::String)
-    iter_files = String[]
+    iter_infos = Vector{Tuple{Int,String,Bool}}()
     isdir(stage_root) || return nothing
     for entry in readdir(stage_root)
         startswith(entry, "iter_") || continue
-        cand = joinpath(stage_root, entry, "candidate_list.txt")
-        isfile(cand) && push!(iter_files, cand)
+        iter_dir = joinpath(stage_root, entry)
+        cand = joinpath(iter_dir, "candidate_list.txt")
+        m = match(r"iter_(\d+)", entry)
+        m === nothing && continue
+        iter_idx = parse(Int, m.captures[1])
+        top_candidates_file = joinpath(iter_dir, "top_candidates.json")
+        has_any_candidate_dirs = any(startswith(name, "cand_") for name in readdir(iter_dir))
+        completed = isfile(top_candidates_file) || has_any_candidate_dirs
+        isfile(cand) && push!(iter_infos, (iter_idx, cand, completed))
     end
-    isempty(iter_files) && return nothing
-    last_iter = maximum(parse(Int, match(r"iter_(\d+)", f).captures[1]) for f in iter_files)
-    return Dict("last_iter" => last_iter, "last_iter_file" => iter_files[end])
+    isempty(iter_infos) && return nothing
+    completed_iters = [info for info in iter_infos if info[3]]
+    chosen = isempty(completed_iters) ? maximum(iter_infos, by=first) : maximum(completed_iters, by=first)
+    return Dict(
+        "last_iter" => chosen[1],
+        "last_iter_file" => chosen[2],
+        "iteration_completed" => chosen[3],
+        "found_iterations" => sort([info[1] for info in iter_infos]),
+        "completed_iterations" => sort([info[1] for info in completed_iters]),
+    )
 end
 
 function normalize_json(value)
@@ -951,6 +965,15 @@ function submit_slurm_array(cfg::OptimizerConfig, list_file::String)
     error("Failed to submit Slurm array after retries: $(last_err)")
 end
 
+function cancel_slurm_array(jobid::String)
+    isempty(strip(jobid)) && return
+    try
+        run(`scancel $jobid`)
+    catch err
+        @warn "Failed to cancel Slurm array job" jobid err
+    end
+end
+
 function score_candidate(candidate::Dict{String,Any}, cfg::OptimizerConfig, days::Int; workdir::String="")
     workdir == "" && (workdir = mktempdir(prefix="simrun_"; parent=joinpath(cfg.output_dir, "real_sims")))
     combined, metrics = score_with_real_sim(cfg, candidate, days; workdir=workdir)
@@ -1039,8 +1062,10 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
         state = CMAState(copy(best_vector), sigma_raw === nothing ? state.sigma : Float64(sigma_raw), state.covariance)
     end
     start_iter = max(1, resume_from + 1)
+    @info "Starting stage run" stage=stage.name fit_months=active_months start_iter=start_iter max_iterations=stage.max_iterations population_size=stage.population_size use_slurm=use_slurm
 
     for iter in start_iter:stage.max_iterations
+        @info "Starting iteration" stage=stage.name iteration=iter sigma=state.sigma best_score=best_score
         candidates, zs = cma_candidates(rng, state, stage.population_size)
         ranked = Tuple{Float64,Vector{Float64},Vector{Float64}}[]
         iteration_top_candidates = Any[]
@@ -1068,6 +1093,10 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                 min_completion_fraction=cfg.objective.min_completion_fraction,
                 finish_iter_delay=cfg.objective.finish_iter_delay,
             )
+            @info "Iteration wait result" stage=stage.name iteration=iter jobid=jobid completed_count=wait_result["done"] failed_count=wait_result["failed"] pending_count=wait_result["pending_count"] threshold_reached=wait_result["threshold_reached"] iteration_truncated=wait_result["iteration_truncated"]
+            if get(wait_result, "iteration_truncated", false)
+                cancel_slurm_array(jobid)
+            end
             @info "Slurm array finished" stage=stage.name iteration=iter jobid=jobid
 
             # collect scores from generated output_daily.jld2
@@ -1201,6 +1230,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
         end
         isempty(ranked) && error("No completed candidates available for stage $(stage.name) iteration $(iter). Increase max wait or completion fraction.")
         sort!(ranked, by=first)
+        @info "Updating CMA state" stage=stage.name iteration=iter completed_candidates=length(ranked) best_iteration_score=ranked[1][1]
         state = update_state(state, ranked)
         if state.sigma > stage.sigma
             state = CMAState(copy(best_vector), state.sigma, state.covariance)
@@ -1225,8 +1255,11 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
         iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
         mkpath(iter_root)
         safe_save_json(joinpath(iter_root, "top_candidates.json"), top_k_entries(with_iteration_ranks(iteration_top_candidates), cfg.objective.top_k); label="iteration_top_candidates")
-    safe_save_json(joinpath(stage_root, "full_reusable_state.json"), full_reusable_state_from_cma(stage, specs_stage, state); label="full_reusable_state")
+        safe_save_json(joinpath(stage_root, "full_reusable_state.json"), full_reusable_state_from_cma(stage, specs_stage, state); label="full_reusable_state")
+        @info "Finished iteration" stage=stage.name iteration=iter best_score=best_score sigma=state.sigma top_candidates_written=length(iteration_top_candidates)
     end
+
+    @info "Finished stage run" stage=stage.name best_score=best_score iterations_run=(start_iter > stage.max_iterations ? 0 : stage.max_iterations - start_iter + 1)
 
     return Dict(
         "stage" => stage.name,
