@@ -1,0 +1,7 @@
+wcss*
+stage*
+runs/*
+config*
+*.tar.gz
+**/.DS_Store
+.idea
