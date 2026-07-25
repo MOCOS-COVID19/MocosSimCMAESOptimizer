@@ -46,9 +46,14 @@
     "warmup": 250,
     "max_depth": 8,
     "step_size": 0.05,
-    "temperature": 1.0
+    "temperature": 1.0,
+    "transfer_covariance_inflation": 1.75,
+    "transfer_sigma_multiplier": 1.25,
+    "new_dimension_variance": 2.0,
+    "immigrant_fraction": 0.2
   },
   "gt_dir": "./gt",
+  "disable_compiled_modules": true,
   "julia_bin": "/home/mbodych/1.7.0-school_class/julia-1.7.0/bin/julia",
   "project_dir": "/home/mbodych/1.7.0-school_class/MocosSimLauncher",
   "advanced_cli": "/home/mbodych/1.7.0-school_class/MocosSimLauncher/advanced_cli.jl"

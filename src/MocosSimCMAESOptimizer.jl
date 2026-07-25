@@ -19,6 +19,7 @@ struct ExternalSimConfig
     julia_bin::String
     project_dir::String
     advanced_cli::String
+    disable_compiled_modules::Bool
 end
 
 struct StageConfig
@@ -45,6 +46,10 @@ struct PosteriorConfig
     max_depth::Int
     step_size::Float64
     temperature::Float64
+    transfer_covariance_inflation::Float64
+    transfer_sigma_multiplier::Float64
+    new_dimension_variance::Float64
+    immigrant_fraction::Float64
 end
 
 struct OptimizerConfig
@@ -171,7 +176,16 @@ function load_full_reusable_state(path::String)
     return raw
 end
 
-function build_state_from_reusable(seed::Dict{String,Any}, specs_stage::Vector{ParamSpec}, reusable::Dict{String,Any}; sigma_floor::Float64=0.08, temporal_unlock_multiplier::Float64=1.0)
+function build_state_from_reusable(
+    seed::Dict{String,Any},
+    specs_stage::Vector{ParamSpec},
+    reusable::Dict{String,Any};
+    sigma_floor::Float64=0.08,
+    temporal_unlock_multiplier::Float64=1.0,
+    covariance_inflation::Float64=1.75,
+    sigma_multiplier::Float64=1.25,
+    new_dimension_variance::Float64=2.0,
+)
     old_names = [String(x) for x in reusable["param_names"]]
     old_mean = Float64.(reusable["mean"])
     old_cov = Matrix{Float64}(reusable["covariance"])
@@ -180,17 +194,19 @@ function build_state_from_reusable(seed::Dict{String,Any}, specs_stage::Vector{P
     new_names = ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
     new_mean = initial_vector(seed, specs_stage)
     dim = length(new_names)
-    new_cov = Matrix{Float64}(I, dim, dim)
+    new_cov = new_dimension_variance .* Matrix{Float64}(I, dim, dim)
     old_p_c = haskey(reusable, "p_c") ? Float64.(reusable["p_c"]) : zeros(length(old_names))
     old_p_sigma = haskey(reusable, "p_sigma") ? Float64.(reusable["p_sigma"]) : zeros(length(old_names))
     new_p_c = zeros(dim)
     new_p_sigma = zeros(dim)
+    mapped = falses(dim)
     idx_map = Dict(name => i for (i, name) in enumerate(old_names))
     kept = Int[]
     for (j, name) in enumerate(new_names)
         haskey(idx_map, name) || continue
         i = idx_map[name]
         new_mean[j] = old_mean[i]
+        mapped[j] = true
         i <= length(old_p_c) && (new_p_c[j] = old_p_c[i])
         i <= length(old_p_sigma) && (new_p_sigma[j] = old_p_sigma[i])
         push!(kept, i)
@@ -199,7 +215,7 @@ function build_state_from_reusable(seed::Dict{String,Any}, specs_stage::Vector{P
         haskey(idx_map, name_a) && haskey(idx_map, name_b) || continue
         ia = idx_map[name_a]
         ib = idx_map[name_b]
-        new_cov[a, b] = old_cov[ia, ib]
+        new_cov[a, b] = covariance_inflation * old_cov[ia, ib]
     end
     # Phase 1 temporal unlock on resume:
     # keep scalar warm-starts stable, but loosen temporal params so the search can
@@ -211,20 +227,35 @@ function build_state_from_reusable(seed::Dict{String,Any}, specs_stage::Vector{P
         if spec.kind == :temporal
             for local_idx in 1:spec.length
                 pos = idx + local_idx - 1
-                # Later temporal buckets get stronger unlock.
+                # Keep newly introduced dimensions at their seed values and
+                # give them broad prior variance; only loosen transferred
+                # temporal dimensions around their posterior mean.
                 frac = spec.length <= 1 ? 1.0 : (local_idx - 1) / (spec.length - 1)
-                jitter_scale = temporal_mean_jitter * (0.5 + frac)
-                new_mean[pos] = clamp(
-                    new_mean[pos] + jitter_scale * (2rand() - 1),
-                    spec.lower,
-                    spec.upper,
-                )
-                new_cov[pos, pos] = max(new_cov[pos, pos] * temporal_covariance_inflation * (1.0 + frac), 1e-6)
+                if mapped[pos]
+                    jitter_scale = temporal_mean_jitter * (0.5 + frac)
+                    new_mean[pos] = clamp(
+                        new_mean[pos] + jitter_scale * (2rand() - 1),
+                        spec.lower,
+                        spec.upper,
+                    )
+                    new_cov[pos, pos] = max(
+                        new_cov[pos, pos] * temporal_covariance_inflation * (1.0 + frac),
+                        1e-6,
+                    )
+                else
+                    new_cov[pos, pos] = max(new_cov[pos, pos], new_dimension_variance)
+                end
             end
         end
         idx += spec.length
     end
-    return CMAState(new_mean, max(old_sigma, sigma_floor), new_cov, new_p_c, new_p_sigma)
+    return CMAState(
+        new_mean,
+        max(old_sigma * sigma_multiplier, sigma_floor),
+        new_cov,
+        new_p_c,
+        new_p_sigma,
+    )
 end
 
 function temporal_unlock_from_top_candidates!(state::CMAState, specs_stage::Vector{ParamSpec}, top_candidates)
@@ -450,6 +481,10 @@ function load_config(path::String)
         Int(get(posterior_raw, "max_depth", 8)),
         float(get(posterior_raw, "step_size", 0.05)),
         float(get(posterior_raw, "temperature", 1.0)),
+        float(get(posterior_raw, "transfer_covariance_inflation", 1.75)),
+        float(get(posterior_raw, "transfer_sigma_multiplier", 1.25)),
+        float(get(posterior_raw, "new_dimension_variance", 2.0)),
+        float(get(posterior_raw, "immigrant_fraction", 0.20)),
     )
     gt_dir = haskey(raw, "gt_dir") ?
         (isabspath(String(raw["gt_dir"])) ?
@@ -457,7 +492,13 @@ function load_config(path::String)
             normpath(joinpath(config_dir, String(raw["gt_dir"])))) :
         nothing
     external_sim = gt_dir !== nothing && haskey(raw, "julia_bin") && haskey(raw, "project_dir") && haskey(raw, "advanced_cli") ?
-        ExternalSimConfig(gt_dir, String(raw["julia_bin"]), String(raw["project_dir"]), String(raw["advanced_cli"])) :
+        ExternalSimConfig(
+            gt_dir,
+            String(raw["julia_bin"]),
+            String(raw["project_dir"]),
+            String(raw["advanced_cli"]),
+            Bool(get(raw, "disable_compiled_modules", false)),
+        ) :
         nothing
     stage_freeze = Dict{String,Vector{String}}()
     if haskey(raw, "stage_freeze")
@@ -571,10 +612,19 @@ function build_specs(seed::Dict{String,Any}, cfg::OptimizerConfig)
     return specs
 end
 
-function stage_specs(specs::Vector{ParamSpec}, cfg::OptimizerConfig, stage::StageConfig)
+function stage_specs(seed::Dict{String,Any}, specs::Vector{ParamSpec}, cfg::OptimizerConfig, stage::StageConfig)
     freeze = get(cfg.stage_freeze, stage.name, String[])
-    isempty(freeze) && return specs
-    return [spec for spec in specs if !(spec.name in freeze)]
+    active_specs = ParamSpec[]
+    for spec in specs
+        spec.name in freeze && continue
+        if spec.kind == :temporal
+            active_length = temporal_active_length(seed, spec, stage.fit_months, cfg)
+            push!(active_specs, ParamSpec(spec.name, spec.kind, max(active_length, 1), spec.lower, spec.upper))
+        else
+            push!(active_specs, spec)
+        end
+    end
+    return active_specs
 end
 
 function update_stage_freeze!(cfg::OptimizerConfig, stage::StageConfig, history::Vector{Any}, specs::Vector{ParamSpec}; min_calls::Int=5)
@@ -606,7 +656,7 @@ function initial_vector(seed::Dict{String,Any}, specs::Vector{ParamSpec})
             val = optcfg === nothing ? float(current) : encode_scalar_value(optcfg, seed, spec, current)
             push!(values, val)
         else
-            append!(values, map(float, current))
+            append!(values, map(float, current[1:spec.length]))
         end
     end
     return values
@@ -661,7 +711,10 @@ function vector_to_config(seed::Dict{String,Any}, specs::Vector{ParamSpec}, x::V
             idx += 1
         else
             current = map(float, get_nested(cfg, spec.name))
-            active = optcfg === nothing ? min(active_months, spec.length) : temporal_active_length(seed, spec, active_months, optcfg)
+            active = optcfg === nothing ? min(active_months, spec.length) : min(
+                spec.length,
+                temporal_active_length(seed, spec, active_months, optcfg),
+            )
             for i in 1:active
                 current[i] = x[idx]
                 idx += 1
@@ -698,7 +751,21 @@ function run_external_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, day
     daily_path = joinpath(workdir, "output_daily.jld2")
     summary_path = joinpath(workdir, "summary.jld2")
 
-    cmd = `$(simcfg.julia_bin) --project=$(simcfg.project_dir) --threads=4 $(simcfg.advanced_cli) $(config_path) --output-daily $(daily_path) --output-summary $(summary_path)`
+    cmd_args = String[
+        simcfg.julia_bin,
+        "--project=$(simcfg.project_dir)",
+    ]
+    simcfg.disable_compiled_modules && push!(cmd_args, "--compiled-modules=no")
+    append!(cmd_args, [
+        "--threads=4",
+        simcfg.advanced_cli,
+        config_path,
+        "--output-daily",
+        daily_path,
+        "--output-summary",
+        summary_path,
+    ])
+    cmd = Cmd(cmd_args)
     success = false
     try
         run(cmd)
@@ -1519,6 +1586,7 @@ function score_candidate(candidate::Dict{String,Any}, cfg::OptimizerConfig, days
         "metrics" => metrics,
         "early_reject" => false,
         "simulated" => "real",
+        "status" => isfinite(combined) ? "completed" : "failed",
         "workdir" => workdir,
     )
     if cfg.external_sim !== nothing
@@ -1725,14 +1793,23 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
     active_months = stage.fit_months
     days = active_months * cfg.monthly_days
     policy = determine_search_policy(cfg, stage)
-    specs_stage = stage_specs(specs, cfg, stage)
+    specs_stage = stage_specs(seed, specs, cfg, stage)
     dim = sum(spec.length for spec in specs_stage)
+    received_prior = state !== nothing
     if state === nothing
         x0 = initial_vector(seed, specs_stage)
         reusable_path = joinpath(cfg.output_dir, "full_reusable_state.json")
         reusable = load_full_reusable_state(reusable_path)
         if reusable !== nothing
-            state = build_state_from_reusable(seed, specs_stage, reusable; temporal_unlock_multiplier=policy.temporal_unlock_multiplier)
+            state = build_state_from_reusable(
+                seed,
+                specs_stage,
+                reusable;
+                temporal_unlock_multiplier=policy.temporal_unlock_multiplier,
+                covariance_inflation=cfg.posterior.transfer_covariance_inflation,
+                sigma_multiplier=cfg.posterior.transfer_sigma_multiplier,
+                new_dimension_variance=cfg.posterior.new_dimension_variance,
+            )
             stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
             top_candidates = latest_iteration_top_candidates(stage_root)
             state = temporal_unlock_from_bucket_errors!(state, specs_stage, top_candidates)
@@ -1789,6 +1866,21 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
     for iter in start_iter:stage.max_iterations
         @info "Starting iteration" stage=stage.name iteration=iter sigma=state.sigma best_score=best_score
         candidates, zs = cma_candidates(rng, state, stage.population_size)
+        immigrant_fraction = received_prior ?
+            max(policy.random_candidate_fraction, cfg.posterior.immigrant_fraction) :
+            policy.random_candidate_fraction
+        if immigrant_fraction > 0.0
+            for candidate_id in eachindex(candidates)
+                rand(rng) > immigrant_fraction && continue
+                idx = 1
+                for spec in specs_stage
+                    for _ in 1:spec.length
+                        candidates[candidate_id][idx] = spec.lower + rand(rng) * (spec.upper - spec.lower)
+                        idx += 1
+                    end
+                end
+            end
+        end
         iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
         mkpath(iter_root)
         safe_save_json(joinpath(iter_root, "cma_sampling_state.json"), Dict(
@@ -2021,8 +2113,10 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                 )
                 top_candidates[key] = candidate_entry
                 push!(iteration_top_candidates, candidate_entry)
-                push!(ranked, (score, cand, zs[ci]))
-                if score < best_score
+                if get(metrics, "status", "failed") == "completed" && isfinite(Float64(score))
+                    push!(ranked, (score, cand, zs[ci]))
+                end
+                if get(metrics, "status", "failed") == "completed" && score < best_score
                     best_score = score
                     best_vector = copy(x)
                     best_candidate = deepcopy(candidate_cfg)
@@ -2114,9 +2208,12 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
                 posterior_state = posterior_reusable_state(posterior_path)
                 state = build_state_from_reusable(
                     current_seed,
-                    stage_specs(specs, cfg, stage),
+                    stage_specs(current_seed, specs, cfg, stage),
                     posterior_state;
                     temporal_unlock_multiplier=1.0,
+                    covariance_inflation=cfg.posterior.transfer_covariance_inflation,
+                    sigma_multiplier=cfg.posterior.transfer_sigma_multiplier,
+                    new_dimension_variance=cfg.posterior.new_dimension_variance,
                 )
                 safe_save_json(
                     joinpath(stage_root, "posterior_reusable_state.json"),

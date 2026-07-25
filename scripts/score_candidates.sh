@@ -63,7 +63,7 @@ if command -v uv >/dev/null 2>&1; then
   uv pip install matplotlib numpy h5py >/dev/null 2>&1 || true
 fi
 
-if ! "$JULIA_BIN" --project="$PROJECT_DIR" --threads=4 "$ADVANCED_CLI" "$CFG" \
+if ! "$JULIA_BIN" --project="$PROJECT_DIR" --compiled-modules=no --threads=4 "$ADVANCED_CLI" "$CFG" \
   --output-daily "$OUT_DAILY" --output-summary "$OUT_SUMMARY"; then
   touch "$FAILED_OK"
   exit 1
