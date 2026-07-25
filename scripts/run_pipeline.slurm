@@ -7,7 +7,20 @@
 
 set -euo pipefail
 
-REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
+if [ -n "${REPO:-}" ]; then
+  REPO="$(cd "$REPO" && pwd)"
+elif [ -n "${SLURM_SUBMIT_DIR:-}" ]; then
+  SUBMIT_DIR="$(cd "$SLURM_SUBMIT_DIR" && pwd)"
+  if [ -f "$SUBMIT_DIR/pipeline_config.json" ]; then
+    REPO="$SUBMIT_DIR"
+  elif [ -f "$SUBMIT_DIR/../pipeline_config.json" ]; then
+    REPO="$(cd "$SUBMIT_DIR/.." && pwd)"
+  else
+    REPO="$SUBMIT_DIR"
+  fi
+else
+  REPO="$(cd "$(dirname "$0")/.." && pwd)"
+fi
 JULIA_BIN="${JULIA_BIN:-/home/mbodych/1.7.0-school_class/julia-1.7.0/bin/julia}"
 PIPELINE_CONFIG="${1:-$REPO/pipeline_config.json}"
 
