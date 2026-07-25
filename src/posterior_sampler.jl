@@ -32,6 +32,13 @@ function archive_bounds(rows, dim::Int)
     return lower, upper
 end
 
+function archive_objective(row)
+    if haskey(row, "vector_log_likelihood") && isfinite(Float64(row["vector_log_likelihood"]))
+        return -Float64(row["vector_log_likelihood"])
+    end
+    return Float64(row["score"])
+end
+
 function fit_diagonal_surrogate(rows, state_path::String; temperature::Float64=1.0)
     state = JSON.parsefile(state_path)
     center = Float64.(state["mean"])
@@ -46,10 +53,10 @@ function fit_diagonal_surrogate(rows, state_path::String; temperature::Float64=1
     transform = sigma .* eig.vectors * Diagonal(sqrt.(eigvals))
     scale = max.(sqrt.(diag(transform * transform')), 1e-6)
 
-    scores = Float64[Float64(row["score"]) for row in rows if isfinite(Float64(row["score"]))]
+    scores = Float64[archive_objective(row) for row in rows if isfinite(archive_objective(row))]
     isempty(scores) && error("Archive contains no finite scores")
     score_scale = max(median(abs.(scores .- minimum(scores))), 1e-6)
-    ordered = sort(rows, by=row -> Float64(row["score"]))
+    ordered = sort(rows, by=archive_objective)
     keep = ordered[1:min(length(ordered), max(20, 4 * dim))]
     lower, upper = archive_bounds(keep, dim)
     best = Float64.(keep[1]["x_evaluated"])
@@ -65,7 +72,7 @@ function fit_diagonal_surrogate(rows, state_path::String; temperature::Float64=1
             length(x) < i && continue
             dx = (x[i] - best[i]) / scale[i]
             push!(xs, dx)
-            push!(ys, (Float64(row["score"]) - minimum(scores)) / score_scale)
+            push!(ys, (archive_objective(row) - minimum(scores)) / score_scale)
             push!(ws, exp(-0.5 * (length(xs) - 1) / max(length(keep), 1)))
         end
         length(xs) < 3 && continue

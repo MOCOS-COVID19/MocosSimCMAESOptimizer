@@ -39,6 +39,7 @@ end
 
 struct PosteriorConfig
     enabled::Bool
+    likelihood::String
     draws::Int
     warmup::Int
     max_depth::Int
@@ -443,6 +444,7 @@ function load_config(path::String)
     posterior_raw = get(raw, "posterior", Dict{String,Any}())
     posterior = PosteriorConfig(
         Bool(get(posterior_raw, "enabled", true)),
+        String(get(posterior_raw, "likelihood", "diagonal_gaussian_weekly")),
         Int(get(posterior_raw, "draws", 500)),
         Int(get(posterior_raw, "warmup", 250)),
         Int(get(posterior_raw, "max_depth", 8)),
@@ -1225,11 +1227,59 @@ function temporal_bucket_error_distribution(daily_path::String, metric::String, 
     return errors
 end
 
+function vector_likelihood_payload(
+    daily_path::String,
+    gt::AbstractDict,
+    days::Int;
+    family::String="diagonal_gaussian_weekly",
+)
+    family == "diagonal_gaussian_weekly" ||
+        error("Unsupported vector likelihood family: $family")
+    dimensions = Any[]
+    log_likelihood = 0.0
+    for metric in sort!(collect(keys(gt)))
+        errors = weekly_error_distributions(daily_path, metric, gt[metric], days)
+        periods = errors["periods"]
+        observations = errors["observations"]
+        predictions = errors["predictions"]
+        length(periods) == length(observations) == length(predictions) || continue
+        for i in eachindex(periods)
+            observation = observations[i]
+            prediction = predictions[i]
+            residual = prediction - observation
+            scale = max(abs(observation), 1.0)
+            standardized_residual = residual / scale
+            contribution = -0.5 * (
+                standardized_residual^2 +
+                log(2.0 * pi * scale^2)
+            )
+            log_likelihood += contribution
+            push!(dimensions, Dict(
+                "metric" => metric,
+                "period" => periods[i],
+                "observation" => observation,
+                "prediction" => prediction,
+                "residual" => residual,
+                "scale" => scale,
+                "standardized_residual" => standardized_residual,
+                "log_likelihood_contribution" => contribution,
+            ))
+        end
+    end
+    return Dict(
+        "family" => family,
+        "scale_policy" => "max(abs(observation), 1.0)",
+        "log_likelihood" => log_likelihood,
+        "dimensions" => dimensions,
+    )
+end
+
 function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, days::Int; workdir::String)
     sim_ok, daily_path = run_external_sim(cfg, candidate, days; workdir=workdir)
     sim_ok || return Inf, Dict("sim_failed" => true)
     gt = load_gt_series(cfg.external_sim.gt_dir)
     weekly_control = weekly_control_score(daily_path, gt, days)
+    vector_likelihood = vector_likelihood_payload(daily_path, gt, days; family=cfg.posterior.likelihood)
     metrics = Dict{String,Float64}()
     for (metric, gtvals) in gt
         isempty(gtvals) && continue
@@ -1259,12 +1309,14 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
                get(weights, "daily_age_80_plus_deaths", 0.0) * get(metrics, "daily_age_80_plus_deaths", 0.0) +
                get(weights, "weekly_control", 1.0) * weekly_control
     metrics["weekly_control_score"] = weekly_control
+    metrics["vector_log_likelihood"] = vector_likelihood["log_likelihood"]
     return combined, metrics
 end
 
 function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
     gt = load_gt_series(cfg.external_sim.gt_dir)
     weekly_control = weekly_control_score(daily_path, gt, days)
+    vector_likelihood = vector_likelihood_payload(daily_path, gt, days; family=cfg.posterior.likelihood)
     metrics = Dict{String,Float64}()
     for (metric, gtvals) in gt
         isempty(gtvals) && continue
@@ -1294,6 +1346,7 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
                get(weights, "daily_age_80_plus_deaths", 0.0) * get(metrics, "daily_age_80_plus_deaths", 0.0) +
                get(weights, "weekly_control", 1.0) * weekly_control
     metrics["weekly_control_score"] = weekly_control
+    metrics["vector_log_likelihood"] = vector_likelihood["log_likelihood"]
     return combined, metrics
 end
 
@@ -1460,6 +1513,8 @@ function score_candidate(candidate::Dict{String,Any}, cfg::OptimizerConfig, days
     workdir == "" && (workdir = mktempdir(prefix="simrun_"; parent=joinpath(cfg.output_dir, "real_sims")))
     combined, metrics = score_with_real_sim(cfg, candidate, days; workdir=workdir)
     result = Dict(
+        "schema_version" => "experiment-v1",
+        "experiment_type" => "cma_candidate",
         "score" => combined,
         "metrics" => metrics,
         "early_reject" => false,
@@ -1486,6 +1541,10 @@ function score_candidate(candidate::Dict{String,Any}, cfg::OptimizerConfig, days
                 weekly_observations[metric] = errors["observations"]
                 weekly_predictions[metric] = errors["predictions"]
             end
+            result["vector_likelihood"] = vector_likelihood_payload(
+                daily_path, load_gt_series(cfg.external_sim.gt_dir), days;
+                family=cfg.posterior.likelihood
+            )
             result["weekly_absolute_errors"] = weekly_absolute_errors
             result["weekly_normalized_absolute_errors"] = weekly_normalized_absolute_errors
             result["weekly_mae"] = weekly_mae
@@ -1608,17 +1667,26 @@ function append_cma_candidate_record(
     clip_info::Dict{String,Any},
     state::CMAState,
     score,
+    metrics::AbstractDict,
     metrics_path::String,
+    parameter_names::Vector{String},
 )
+    metric_values = haskey(metrics, "metrics") && metrics["metrics"] isa AbstractDict ?
+        metrics["metrics"] :
+        metrics
     append_jsonl(joinpath(iter_root, "posterior_training_data.jsonl"), Dict(
+        "schema_version" => "experiment-v1",
+        "experiment_type" => "cma_candidate",
         "stage" => stage.name,
         "iteration" => iteration,
         "candidate" => candidate_id,
+        "parameter_names" => parameter_names,
         "x_raw" => raw_candidate,
         "x_evaluated" => evaluated_candidate,
         "z" => z,
         "clipping" => clip_info,
         "score" => score,
+        "vector_log_likelihood" => get(metric_values, "vector_log_likelihood", -Float64(score)),
         "metrics_path" => metrics_path,
         "simulation_distribution" => Dict(
             "mean" => state.mean,
@@ -1684,6 +1752,23 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
     )
 
     stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
+    safe_save_json(joinpath(stage_root, "experiment_manifest.json"), Dict(
+        "schema_version" => "experiment-v1",
+        "experiment_type" => "cma_stage",
+        "stage" => stage.name,
+        "fit_months" => active_months,
+        "monthly_days" => cfg.monthly_days,
+        "simulation_days" => days,
+        "parameter_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
+        "population_size" => stage.population_size,
+        "max_iterations" => stage.max_iterations,
+        "early_stop" => Dict(
+            "min_completion_fraction" => cfg.objective.min_completion_fraction,
+            "finish_iter_delay" => cfg.objective.finish_iter_delay,
+        ),
+        "weekly_control_metrics" => WEEKLY_CONTROL_METRICS,
+        "vector_likelihood" => cfg.posterior.likelihood,
+    ); label="experiment_manifest")
     resume_state = load_stage_state(stage_root)
     history = Any[]
     iter_log = Any[]
@@ -1773,6 +1858,9 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     weekly_observations = Dict{String,Any}()
                     weekly_predictions = Dict{String,Any}()
                     household = household_readout(daily_path, days)
+                    vector_likelihood = vector_likelihood_payload(
+                        daily_path, gt, days; family=cfg.posterior.likelihood
+                    )
                     for (metric, gtvals) in gt
                         weekly_errors = weekly_error_distributions(daily_path, metric, gtvals, days)
                         weekly_absolute_errors[metric] = weekly_errors["absolute_error"]
@@ -1784,6 +1872,8 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                         weekly_predictions[metric] = weekly_errors["predictions"]
                     end
                     metrics_payload = Dict(
+                        "schema_version" => "experiment-v1",
+                        "experiment_type" => "cma_candidate",
                         "score" => combined,
                         "daily_detections" => comp["daily_detections"],
                         "daily_hospitalizations" => comp["daily_hospitalizations"],
@@ -1805,6 +1895,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                         "weekly_error_periods" => weekly_error_periods,
                         "weekly_observations" => weekly_observations,
                         "weekly_predictions" => weekly_predictions,
+                        "vector_likelihood" => vector_likelihood,
                         "household_infections" => household["household_infections"],
                         "household_infection_rate" => household["household_infection_rate"],
                         "simulated" => "real",
@@ -1837,7 +1928,8 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                 if get(metrics, "status", "completed") == "completed" && isfinite(Float64(score))
                     append_cma_candidate_record(
                         iter_root, stage, iter, ci, cand, x, zs[ci], clip_info,
-                        state, score, joinpath(cand_dir, "metrics.json")
+                        state, score, metrics, joinpath(cand_dir, "metrics.json"),
+                        ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
                     )
                 end
                 append_jsonl(joinpath(stage_root, "iter_metrics.jsonl"), Dict(
@@ -1903,7 +1995,8 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                 if get(metrics, "status", "completed") == "completed" && isfinite(Float64(score))
                     append_cma_candidate_record(
                         iter_root, stage, iter, ci, cand, x, zs[ci], clip_info,
-                        state, score, joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)", "metrics.json")
+                        state, score, metrics, joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)", "metrics.json"),
+                        ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
                     )
                 end
                 push!(history, Dict(

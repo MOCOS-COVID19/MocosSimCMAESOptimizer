@@ -41,6 +41,7 @@
   },
   "posterior": {
     "enabled": true,
+    "likelihood": "diagonal_gaussian_weekly",
     "draws": 500,
     "warmup": 250,
     "max_depth": 8,
