@@ -39,6 +39,14 @@
     "min_completion_fraction": 0.5,
     "finish_iter_delay": 15
   },
+  "posterior": {
+    "enabled": true,
+    "draws": 500,
+    "warmup": 250,
+    "max_depth": 8,
+    "step_size": 0.05,
+    "temperature": 1.0
+  },
   "gt_dir": "./gt",
   "julia_bin": "/home/mbodych/1.7.0-school_class/julia-1.7.0/bin/julia",
   "project_dir": "/home/mbodych/1.7.0-school_class/MocosSimLauncher",

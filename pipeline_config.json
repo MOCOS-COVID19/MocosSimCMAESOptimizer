@@ -1,0 +1,24 @@
+{
+  "base_config": "./optimizer_config.json",
+  "output_root": "./runs/pipeline_cma_nuts",
+  "use_slurm": true,
+  "skip_short": false,
+  "early_stop": {
+    "min_completion_fraction": 0.5,
+    "finish_iter_delay": 15
+  },
+  "short": {
+    "name": "short_3m",
+    "fit_months": 3,
+    "max_iterations": 12,
+    "population_size": 16,
+    "sigma": 0.2
+  },
+  "long": {
+    "name": "long_12m",
+    "fit_months": 12,
+    "max_iterations": 30,
+    "population_size": 50,
+    "sigma": 0.2
+  }
+}

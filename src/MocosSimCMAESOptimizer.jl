@@ -11,7 +11,8 @@ using Printf
 const MANAGER_ROOT = abspath(joinpath(@__DIR__, ".."))
 const CURRENT_OPTIMIZER_CONFIG = Ref{Any}(nothing)
 
-export main, run_optimizer, run_long_horizon
+export main, run_optimizer, run_long_horizon, run_nuts_from_archive,
+       run_nuts_from_stage, posterior_reusable_state, safe_save_json
 
 struct ExternalSimConfig
     gt_dir::String
@@ -36,6 +37,15 @@ struct ObjectiveConfig
     search_policy::String
 end
 
+struct PosteriorConfig
+    enabled::Bool
+    draws::Int
+    warmup::Int
+    max_depth::Int
+    step_size::Float64
+    temperature::Float64
+end
+
 struct OptimizerConfig
     seed_config::String
     output_dir::String
@@ -48,7 +58,10 @@ struct OptimizerConfig
     external_sim::Union{Nothing,ExternalSimConfig}
     stage_freeze::Dict{String,Vector{String}}
     initial_state::Union{Nothing,Dict{String,Any}}
+    posterior::PosteriorConfig
 end
+
+include("posterior_sampler.jl")
 
 struct ParamSpec
     name::String
@@ -62,7 +75,12 @@ struct CMAState
     mean::Vector{Float64}
     sigma::Float64
     covariance::Matrix{Float64}
+    p_c::Vector{Float64}
+    p_sigma::Vector{Float64}
 end
+
+CMAState(mean::Vector{Float64}, sigma::Float64, covariance::Matrix{Float64}) =
+    CMAState(mean, sigma, covariance, zeros(length(mean)), zeros(length(mean)))
 
 struct SearchPolicy
     name::String
@@ -105,11 +123,13 @@ function full_reusable_state_from_cma(stage::StageConfig, specs_stage::Vector{Pa
     return Dict(
         "stage" => stage.name,
         "fit_months" => stage.fit_months,
-        "param_names" => [spec.name for spec in specs_stage],
+        "param_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
         "param_ranges" => [spec.kind == :temporal ? [spec.lower, spec.upper] : [spec.lower, spec.upper] for spec in specs_stage],
         "mean" => state.mean,
         "sigma" => state.sigma,
         "covariance" => state.covariance,
+        "p_c" => state.p_c,
+        "p_sigma" => state.p_sigma,
     )
 end
 
@@ -119,7 +139,9 @@ function stage_transition_state(prev::CMAState, stage::StageConfig, specs_stage:
     if size(cov, 1) != dim || size(cov, 2) != dim
         cov = Matrix{Float64}(I, dim, dim)
     end
-    cov = 0.5 .* cov .+ 0.5 .* Matrix{Float64}(I, dim, dim)
+    # Preserve the posterior-informed local geometry while adding a small
+    # regularization term for the next stage.
+    cov = 0.9 .* cov .+ 0.1 .* Matrix{Float64}(I, dim, dim)
     return CMAState(copy(prev.mean), max(stage.sigma, max(prev.sigma * sigma_scale, sigma_floor)), cov)
 end
 
@@ -135,7 +157,10 @@ function initial_state_from_config(cfg::OptimizerConfig, dim::Int, default_mean:
     end
     size(cov, 1) == dim && size(cov, 2) == dim || return nothing
     length(mean) == dim || return nothing
-    return CMAState(mean, sigma, cov)
+    p_c = haskey(raw, "p_c") ? Float64.(raw["p_c"]) : zeros(dim)
+    p_sigma = haskey(raw, "p_sigma") ? Float64.(raw["p_sigma"]) : zeros(dim)
+    length(p_c) == dim && length(p_sigma) == dim || return nothing
+    return CMAState(mean, sigma, cov, p_c, p_sigma)
 end
 
 function load_full_reusable_state(path::String)
@@ -151,16 +176,22 @@ function build_state_from_reusable(seed::Dict{String,Any}, specs_stage::Vector{P
     old_cov = Matrix{Float64}(reusable["covariance"])
     old_sigma = haskey(reusable, "sigma") ? Float64(reusable["sigma"]) : 0.3
 
-    new_names = [spec.name for spec in specs_stage]
+    new_names = ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
     new_mean = initial_vector(seed, specs_stage)
     dim = length(new_names)
     new_cov = Matrix{Float64}(I, dim, dim)
+    old_p_c = haskey(reusable, "p_c") ? Float64.(reusable["p_c"]) : zeros(length(old_names))
+    old_p_sigma = haskey(reusable, "p_sigma") ? Float64.(reusable["p_sigma"]) : zeros(length(old_names))
+    new_p_c = zeros(dim)
+    new_p_sigma = zeros(dim)
     idx_map = Dict(name => i for (i, name) in enumerate(old_names))
     kept = Int[]
     for (j, name) in enumerate(new_names)
         haskey(idx_map, name) || continue
         i = idx_map[name]
         new_mean[j] = old_mean[i]
+        i <= length(old_p_c) && (new_p_c[j] = old_p_c[i])
+        i <= length(old_p_sigma) && (new_p_sigma[j] = old_p_sigma[i])
         push!(kept, i)
     end
     for (a, name_a) in enumerate(new_names), (b, name_b) in enumerate(new_names)
@@ -192,7 +223,7 @@ function build_state_from_reusable(seed::Dict{String,Any}, specs_stage::Vector{P
         end
         idx += spec.length
     end
-    return CMAState(new_mean, max(old_sigma, sigma_floor), new_cov)
+    return CMAState(new_mean, max(old_sigma, sigma_floor), new_cov, new_p_c, new_p_sigma)
 end
 
 function temporal_unlock_from_top_candidates!(state::CMAState, specs_stage::Vector{ParamSpec}, top_candidates)
@@ -409,6 +440,15 @@ function load_config(path::String)
         Int(get(raw["objective"], "finish_iter_delay", 30)),
         String(get(raw["objective"], "search_policy", "baseline")),
     )
+    posterior_raw = get(raw, "posterior", Dict{String,Any}())
+    posterior = PosteriorConfig(
+        Bool(get(posterior_raw, "enabled", true)),
+        Int(get(posterior_raw, "draws", 500)),
+        Int(get(posterior_raw, "warmup", 250)),
+        Int(get(posterior_raw, "max_depth", 8)),
+        float(get(posterior_raw, "step_size", 0.05)),
+        float(get(posterior_raw, "temperature", 1.0)),
+    )
     gt_dir = haskey(raw, "gt_dir") ?
         (isabspath(String(raw["gt_dir"])) ?
             String(raw["gt_dir"]) :
@@ -424,7 +464,7 @@ function load_config(path::String)
         end
     end
     initial_state = haskey(raw, "initial_state") ? Dict{String,Any}(String(k) => v for (k, v) in raw["initial_state"]) : nothing
-    return OptimizerConfig(raw["seed_config"], raw["output_dir"], Int(raw["monthly_days"]), stages, scalar_bounds, temporal_bounds, scalar_preprocessing, objective, external_sim, stage_freeze, initial_state)
+    return OptimizerConfig(raw["seed_config"], raw["output_dir"], Int(raw["monthly_days"]), stages, scalar_bounds, temporal_bounds, scalar_preprocessing, objective, external_sim, stage_freeze, initial_state, posterior)
 end
 
 function scalar_preprocessing_entry(cfg::OptimizerConfig, spec::ParamSpec)
@@ -956,6 +996,8 @@ function weekly_error_distributions(daily_path::String, metric::String, gt_serie
         "mae" => Float64[],
         "rmae" => Float64[],
         "periods" => Vector{Vector{Int}}(),
+        "observations" => Float64[],
+        "predictions" => Float64[],
     )
     n = min(days, length(gt_series))
     absolute_errors = Float64[]
@@ -963,6 +1005,8 @@ function weekly_error_distributions(daily_path::String, metric::String, gt_serie
     maes = Float64[]
     rmaes = Float64[]
     periods = Vector{Vector{Int}}()
+    observations = Float64[]
+    predictions = Float64[]
     week_size = 7
     for start_day in 1:week_size:n
         end_day = min(start_day + week_size - 1, n)
@@ -992,6 +1036,11 @@ function weekly_error_distributions(daily_path::String, metric::String, gt_serie
             push!(maes, mae / counted)
             push!(rmaes, rmae / counted)
             push!(periods, [start_day, end_day])
+            push!(observations, sum(gt_series[valid_days]))
+            push!(predictions, mean([
+                sum(Float64[traj[day] for day in valid_days if day <= length(traj)])
+                for traj in trajs if any(day <= length(traj) for day in valid_days)
+            ]))
         end
     end
     return Dict{String,Any}(
@@ -1000,6 +1049,8 @@ function weekly_error_distributions(daily_path::String, metric::String, gt_serie
         "mae" => maes,
         "rmae" => rmaes,
         "periods" => periods,
+        "observations" => observations,
+        "predictions" => predictions,
     )
 end
 
@@ -1408,13 +1459,43 @@ end
 function score_candidate(candidate::Dict{String,Any}, cfg::OptimizerConfig, days::Int; workdir::String="")
     workdir == "" && (workdir = mktempdir(prefix="simrun_"; parent=joinpath(cfg.output_dir, "real_sims")))
     combined, metrics = score_with_real_sim(cfg, candidate, days; workdir=workdir)
-    return Dict(
+    result = Dict(
         "score" => combined,
         "metrics" => metrics,
         "early_reject" => false,
         "simulated" => "real",
         "workdir" => workdir,
     )
+    if cfg.external_sim !== nothing
+        daily_path = joinpath(workdir, "output_daily.jld2")
+        if isfile(daily_path)
+            weekly_absolute_errors = Dict{String,Any}()
+            weekly_normalized_absolute_errors = Dict{String,Any}()
+            weekly_mae = Dict{String,Any}()
+            weekly_rmae = Dict{String,Any}()
+            weekly_error_periods = Dict{String,Any}()
+            weekly_observations = Dict{String,Any}()
+            weekly_predictions = Dict{String,Any}()
+            for (metric, gtvals) in load_gt_series(cfg.external_sim.gt_dir)
+                errors = weekly_error_distributions(daily_path, metric, gtvals, days)
+                weekly_absolute_errors[metric] = errors["absolute_error"]
+                weekly_normalized_absolute_errors[metric] = errors["normalized_absolute_error"]
+                weekly_mae[metric] = errors["mae"]
+                weekly_rmae[metric] = errors["rmae"]
+                weekly_error_periods[metric] = errors["periods"]
+                weekly_observations[metric] = errors["observations"]
+                weekly_predictions[metric] = errors["predictions"]
+            end
+            result["weekly_absolute_errors"] = weekly_absolute_errors
+            result["weekly_normalized_absolute_errors"] = weekly_normalized_absolute_errors
+            result["weekly_mae"] = weekly_mae
+            result["weekly_rmae"] = weekly_rmae
+            result["weekly_error_periods"] = weekly_error_periods
+            result["weekly_observations"] = weekly_observations
+            result["weekly_predictions"] = weekly_predictions
+        end
+    end
+    return result
 end
 
 function cma_candidates(rng::AbstractRNG, state::CMAState, λ::Int)
@@ -1431,24 +1512,80 @@ function cma_candidates(rng::AbstractRNG, state::CMAState, λ::Int)
     return candidates, zs
 end
 
+function clip_candidate(candidate::Vector{Float64}, specs_stage::Vector{ParamSpec})
+    evaluated = copy(candidate)
+    lower_hits = Bool[]
+    upper_hits = Bool[]
+    idx = 1
+    for spec in specs_stage
+        for _ in 1:spec.length
+            value = evaluated[idx]
+            push!(lower_hits, value < spec.lower)
+            push!(upper_hits, value > spec.upper)
+            evaluated[idx] = clamp(value, spec.lower, spec.upper)
+            idx += 1
+        end
+    end
+    return evaluated, Dict(
+        "clipped" => any(lower_hits) || any(upper_hits),
+        "lower_bound_hits" => lower_hits,
+        "upper_bound_hits" => upper_hits,
+    )
+end
+
+function cma_diagnostics(state::CMAState)
+    values = eigen(Symmetric(state.covariance)).values
+    values = max.(Float64.(values), 1e-12)
+    return Dict(
+        "eigenvalues" => values,
+        "covariance_trace" => tr(state.covariance),
+        "covariance_condition_number" => maximum(values) / minimum(values),
+        "p_c_norm" => norm(state.p_c),
+        "p_sigma_norm" => norm(state.p_sigma),
+    )
+end
+
 function update_state(state::CMAState, ranked::Vector{Tuple{Float64,Vector{Float64},Vector{Float64}}})
-    μ = max(2, length(ranked) ÷ 2)
+    n = length(state.mean)
+    λ = length(ranked)
+    μ = max(2, λ ÷ 2)
     weights = [log(μ + 0.5) - log(i) for i in 1:μ]
     weights ./= sum(weights)
+    μ_eff = 1.0 / sum(weights .^ 2)
+    c_sigma = (μ_eff + 2.0) / (n + μ_eff + 5.0)
+    d_sigma = 1.0 + 2.0 * max(0.0, sqrt((μ_eff - 1.0) / (n + 1.0)) - 1.0) + c_sigma
+    c_c = (4.0 + μ_eff / n) / (n + 4.0 + 2.0 * μ_eff / n)
+    c_1 = 2.0 / ((n + sqrt(2.0))^2 + μ_eff)
+    c_mu = min(1.0 - c_1, 2.0 * (μ_eff - 2.0 + 1.0 / μ_eff) / ((n + 2.0)^2 + μ_eff))
     selected = ranked[1:μ]
     new_mean = zeros(length(state.mean))
     for (w, (_, x, _)) in zip(weights, selected)
         new_mean .+= w .* x
     end
-    centered = [x .- new_mean for (_, x, _) in selected]
-    cov = zeros(size(state.covariance))
-    for (w, c) in zip(weights, centered)
-        cov .+= w .* (c * c')
+    y_w = (new_mean .- state.mean) ./ max(state.sigma, 1e-12)
+    eig = eigen(Symmetric(state.covariance + 1e-10I))
+    eigvals = max.(eig.values, 1e-10)
+    invsqrt_c = eig.vectors * Diagonal(1.0 ./ sqrt.(eigvals)) * eig.vectors'
+    p_sigma = (1.0 - c_sigma) .* state.p_sigma .+
+              sqrt(c_sigma * (2.0 - c_sigma) * μ_eff) .* (invsqrt_c * y_w)
+    chi_n = sqrt(n) * (1.0 - 1.0 / (4.0 * n) + 1.0 / (21.0 * n^2))
+    norm_p_sigma = norm(p_sigma)
+    h_sigma = norm_p_sigma / sqrt(1.0 - (1.0 - c_sigma)^(2.0)) <
+              (1.4 + 2.0 / (n + 1.0)) * chi_n
+    p_c = (1.0 - c_c) .* state.p_c .+
+          (h_sigma ? 1.0 : 0.0) * sqrt(c_c * (2.0 - c_c) * μ_eff) .* y_w
+    rank_mu_cov = zeros(size(state.covariance))
+    for (w, (_, x, _)) in zip(weights, selected)
+        y = (x .- state.mean) ./ max(state.sigma, 1e-12)
+        rank_mu_cov .+= w .* (y * y')
     end
-    new_cov = 0.7 .* state.covariance .+ 0.3 .* cov
-    best_score = selected[1][1]
-    new_sigma = best_score < ranked[min(end, μ)][1] ? state.sigma * 0.98 : state.sigma * 1.01
-    return CMAState(new_mean, clamp(new_sigma, 0.02, 0.5), new_cov)
+    correction = (1.0 - h_sigma) * c_c * (2.0 - c_c)
+    new_cov = (1.0 - c_1 - c_mu) .* state.covariance .+
+              c_1 .* (p_c * p_c' + correction .* state.covariance) .+
+              c_mu .* rank_mu_cov
+    new_cov = 0.5 .* (new_cov + new_cov')
+    new_sigma = state.sigma * exp((c_sigma / d_sigma) * (norm_p_sigma / chi_n - 1.0))
+    return CMAState(new_mean, clamp(new_sigma, 0.02, 0.5), new_cov, p_c, p_sigma)
 end
 
 function safe_save_json(path::String, value; label::String=path)
@@ -1458,6 +1595,37 @@ function safe_save_json(path::String, value; label::String=path)
         @error "Failed to save JSON artifact" label path err
         rethrow(err)
     end
+end
+
+function append_cma_candidate_record(
+    iter_root::String,
+    stage::StageConfig,
+    iteration::Int,
+    candidate_id::Int,
+    raw_candidate::Vector{Float64},
+    evaluated_candidate::Vector{Float64},
+    z::Vector{Float64},
+    clip_info::Dict{String,Any},
+    state::CMAState,
+    score,
+    metrics_path::String,
+)
+    append_jsonl(joinpath(iter_root, "posterior_training_data.jsonl"), Dict(
+        "stage" => stage.name,
+        "iteration" => iteration,
+        "candidate" => candidate_id,
+        "x_raw" => raw_candidate,
+        "x_evaluated" => evaluated_candidate,
+        "z" => z,
+        "clipping" => clip_info,
+        "score" => score,
+        "metrics_path" => metrics_path,
+        "simulation_distribution" => Dict(
+            "mean" => state.mean,
+            "sigma" => state.sigma,
+            "covariance" => state.covariance,
+        ),
+    ))
 end
 
 
@@ -1505,9 +1673,15 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
             state = seeded === nothing ? CMAState(copy(x0), stage.sigma, Matrix{Float64}(I, dim, dim)) : seeded
         end
     else
-        state = stage_transition_state(state, stage, specs_stage)
+        state = stage_transition_state(state, stage, specs_stage; sigma_scale=1.25, sigma_floor=0.02)
     end
-    state = CMAState(copy(state.mean), state.sigma * policy.sigma_multiplier, copy(state.covariance))
+    state = CMAState(
+        copy(state.mean),
+        state.sigma * policy.sigma_multiplier,
+        copy(state.covariance),
+        copy(state.p_c),
+        copy(state.p_sigma),
+    )
 
     stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
     resume_state = load_stage_state(stage_root)
@@ -1520,7 +1694,9 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
     best_candidate = deepcopy(seed)
     if resume_state !== nothing && haskey(resume_state, "best_vector")
         sigma_raw = get(resume_state, "sigma", state.sigma)
-        state = CMAState(copy(best_vector), sigma_raw === nothing ? state.sigma : Float64(sigma_raw), state.covariance)
+        p_c = haskey(resume_state, "p_c") ? Float64.(resume_state["p_c"]) : zeros(dim)
+        p_sigma = haskey(resume_state, "p_sigma") ? Float64.(resume_state["p_sigma"]) : zeros(dim)
+        state = CMAState(copy(best_vector), sigma_raw === nothing ? state.sigma : Float64(sigma_raw), state.covariance, p_c, p_sigma)
     end
     start_iter = max(1, resume_from + 1)
     @info "Starting stage run" stage=stage.name fit_months=active_months start_iter=start_iter max_iterations=stage.max_iterations population_size=stage.population_size use_slurm=use_slurm search_policy=policy.name
@@ -1528,6 +1704,19 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
     for iter in start_iter:stage.max_iterations
         @info "Starting iteration" stage=stage.name iteration=iter sigma=state.sigma best_score=best_score
         candidates, zs = cma_candidates(rng, state, stage.population_size)
+        iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
+        mkpath(iter_root)
+        safe_save_json(joinpath(iter_root, "cma_sampling_state.json"), Dict(
+            "stage" => stage.name,
+            "iteration" => iter,
+            "param_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
+            "mean" => state.mean,
+            "sigma" => state.sigma,
+            "covariance" => state.covariance,
+            "p_c" => state.p_c,
+            "p_sigma" => state.p_sigma,
+            "diagnostics" => cma_diagnostics(state),
+        ); label="cma_sampling_state")
         ranked = Tuple{Float64,Vector{Float64},Vector{Float64}}[]
         iteration_top_candidates = Any[]
         # If external sim configured and slurm enabled, dispatch via Slurm array; otherwise score inline
@@ -1537,7 +1726,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
             list_file = joinpath(iter_root, "candidate_list.txt")
             open(list_file, "w") do io
                 for (ci, cand) in enumerate(candidates)
-                    x = clip!(copy(cand), specs_stage)
+                    x, clip_info = clip_candidate(cand, specs_stage)
                     candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
                     inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
                     cand_dir = joinpath(iter_root, @sprintf("cand_%02d", ci))
@@ -1562,7 +1751,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
 
             # collect scores from generated output_daily.jld2
             for (ci, cand) in enumerate(candidates)
-                x = clip!(copy(cand), specs_stage)
+                x, clip_info = clip_candidate(cand, specs_stage)
                 cand_dir = joinpath(iter_root, @sprintf("cand_%02d", ci))
                 daily_path = joinpath(cand_dir, "output_daily.jld2")
                 cand_cfg = vector_to_config(seed, specs_stage, x, active_months)
@@ -1581,6 +1770,8 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     weekly_mae = Dict{String,Any}()
                     weekly_rmae = Dict{String,Any}()
                     weekly_error_periods = Dict{String,Any}()
+                    weekly_observations = Dict{String,Any}()
+                    weekly_predictions = Dict{String,Any}()
                     household = household_readout(daily_path, days)
                     for (metric, gtvals) in gt
                         weekly_errors = weekly_error_distributions(daily_path, metric, gtvals, days)
@@ -1589,6 +1780,8 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                         weekly_mae[metric] = weekly_errors["mae"]
                         weekly_rmae[metric] = weekly_errors["rmae"]
                         weekly_error_periods[metric] = weekly_errors["periods"]
+                        weekly_observations[metric] = weekly_errors["observations"]
+                        weekly_predictions[metric] = weekly_errors["predictions"]
                     end
                     metrics_payload = Dict(
                         "score" => combined,
@@ -1610,6 +1803,8 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                         "weekly_mae" => weekly_mae,
                         "weekly_rmae" => weekly_rmae,
                         "weekly_error_periods" => weekly_error_periods,
+                        "weekly_observations" => weekly_observations,
+                        "weekly_predictions" => weekly_predictions,
                         "household_infections" => household["household_infections"],
                         "household_infection_rate" => household["household_infection_rate"],
                         "simulated" => "real",
@@ -1639,6 +1834,12 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     Dict("score" => Inf, "metrics" => Dict(), "simulated" => "real_missing", "status" => "failed")
                 end
                 score = metrics["score"]
+                if get(metrics, "status", "completed") == "completed" && isfinite(Float64(score))
+                    append_cma_candidate_record(
+                        iter_root, stage, iter, ci, cand, x, zs[ci], clip_info,
+                        state, score, joinpath(cand_dir, "metrics.json")
+                    )
+                end
                 append_jsonl(joinpath(stage_root, "iter_metrics.jsonl"), Dict(
                     "stage" => stage.name,
                     "iteration" => iter,
@@ -1681,7 +1882,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                 top_candidates[key] = candidate_entry
                 push!(iteration_top_candidates, candidate_entry)
                 if get(metrics, "status", "failed") == "completed"
-                    push!(ranked, (score, x, zs[ci]))
+                    push!(ranked, (score, cand, zs[ci]))
                 end
                 if get(metrics, "status", "failed") == "completed" && score < best_score
                     best_score = score
@@ -1693,12 +1894,18 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
             for (ci, cand) in enumerate(candidates)
                 iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
                 mkpath(iter_root)
-                x = clip!(copy(cand), specs_stage)
+                x, clip_info = clip_candidate(cand, specs_stage)
                 candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
                 inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
                 metrics = score_candidate(candidate_cfg, cfg, days; workdir=joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"))
                 safe_save_json(joinpath(joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"), "metrics.json"), metrics; label="candidate_metrics")
                 score = metrics["score"]
+                if get(metrics, "status", "completed") == "completed" && isfinite(Float64(score))
+                    append_cma_candidate_record(
+                        iter_root, stage, iter, ci, cand, x, zs[ci], clip_info,
+                        state, score, joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)", "metrics.json")
+                    )
+                end
                 push!(history, Dict(
                     "stage" => stage.name,
                     "iteration" => iter,
@@ -1721,7 +1928,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                 )
                 top_candidates[key] = candidate_entry
                 push!(iteration_top_candidates, candidate_entry)
-                push!(ranked, (score, x, zs[ci]))
+                push!(ranked, (score, cand, zs[ci]))
                 if score < best_score
                     best_score = score
                     best_vector = copy(x)
@@ -1733,11 +1940,6 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
         sort!(ranked, by=first)
         @info "Updating CMA state" stage=stage.name iteration=iter completed_candidates=length(ranked) best_iteration_score=ranked[1][1]
         state = update_state(state, ranked)
-        if state.sigma > stage.sigma
-            state = CMAState(copy(best_vector), state.sigma, state.covariance)
-        else
-            state.mean .= best_vector
-        end
         push!(iter_log, Dict(
             "stage" => stage.name,
             "iteration" => iter,
@@ -1753,6 +1955,10 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
             "best_score" => best_score,
             "sigma" => state.sigma,
             "covariance_trace" => tr(state.covariance),
+            "covariance" => state.covariance,
+            "p_c" => state.p_c,
+            "p_sigma" => state.p_sigma,
+            "cma_diagnostics" => cma_diagnostics(state),
             "best_vector" => best_vector,
         ); label="stage_state")
         iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
@@ -1774,6 +1980,8 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
         "best_vector" => best_vector,
         "sigma" => state.sigma,
         "covariance" => state.covariance,
+        "p_c" => state.p_c,
+        "p_sigma" => state.p_sigma,
         "history" => history,
         "iter_log" => iter_log,
     ), state
@@ -1799,6 +2007,31 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             @info "Resuming stage from artifacts" stage=stage.name resume_from=resume_from
         end
         result, state = run_stage(rng, current_seed, specs, cfg, stage, state; use_slurm=use_slurm, resume_from=resume_from)
+        posterior_path = nothing
+        if cfg.posterior.enabled
+            posterior_path = run_nuts_from_stage(
+                stage_root;
+                draws=cfg.posterior.draws,
+                warmup=cfg.posterior.warmup,
+                max_depth=cfg.posterior.max_depth,
+                step_size=cfg.posterior.step_size,
+                temperature=cfg.posterior.temperature,
+            )
+            if posterior_path !== nothing
+                posterior_state = posterior_reusable_state(posterior_path)
+                state = build_state_from_reusable(
+                    current_seed,
+                    stage_specs(specs, cfg, stage),
+                    posterior_state;
+                    temporal_unlock_multiplier=1.0,
+                )
+                safe_save_json(
+                    joinpath(stage_root, "posterior_reusable_state.json"),
+                    posterior_state;
+                    label="posterior_reusable_state",
+                )
+            end
+        end
         current_seed = result["best_candidate"]
         update_stage_freeze!(cfg, stage, result["history"], specs)
         push!(stage_outputs, Dict(
@@ -1808,6 +2041,7 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             "best_score" => result["best_score"],
             "top_k" => length(result["top_candidates"]),
             "sigma" => result["sigma"],
+            "posterior_samples" => posterior_path,
         ))
         append!(all_history, result["history"])
         safe_save_json(joinpath(cfg.output_dir, "$(stage.name)_best_candidate.json"), result["best_candidate"]; label="stage_best_candidate")
@@ -1819,6 +2053,7 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             "best_score" => result["best_score"],
             "top_k" => length(result["top_candidates"]),
             "sigma" => result["sigma"],
+            "posterior_samples" => posterior_path,
             "top_candidates" => result["top_candidates"],
             "iter_log" => result["iter_log"],
         ); label="stage_summary")
