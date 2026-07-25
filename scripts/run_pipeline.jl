@@ -45,6 +45,12 @@ function run_pipeline(batch_path::String)
     batch = JSON.parsefile(batch_path)
     base_path = resolve_path(String(batch["base_config"]), batch_dir)
     base_config = JSON.parsefile(base_path)
+    if haskey(base_config, "gt_dir")
+        base_config["gt_dir"] = resolve_path(
+            String(base_config["gt_dir"]),
+            dirname(abspath(base_path)),
+        )
+    end
     output_root = resolve_path(String(batch["output_root"]), batch_dir)
     mkpath(output_root)
     use_slurm = Bool(get(batch, "use_slurm", true))
