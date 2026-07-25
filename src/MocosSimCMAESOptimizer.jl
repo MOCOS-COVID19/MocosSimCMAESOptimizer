@@ -11,7 +11,7 @@ using Printf
 const MANAGER_ROOT = abspath(joinpath(@__DIR__, ".."))
 const CURRENT_OPTIMIZER_CONFIG = Ref{Any}(nothing)
 
-export main, run_optimizer
+export main, run_optimizer, run_long_horizon
 
 struct ExternalSimConfig
     gt_dir::String
@@ -33,6 +33,7 @@ struct ObjectiveConfig
     top_k::Int
     min_completion_fraction::Float64
     finish_iter_delay::Int
+    search_policy::String
 end
 
 struct OptimizerConfig
@@ -61,6 +62,43 @@ struct CMAState
     mean::Vector{Float64}
     sigma::Float64
     covariance::Matrix{Float64}
+end
+
+struct SearchPolicy
+    name::String
+    sigma_multiplier::Float64
+    temporal_unlock_multiplier::Float64
+    random_candidate_fraction::Float64
+end
+
+function get_search_policy(name::String)
+    if name == "wide"
+        return SearchPolicy("wide", 1.35, 1.4, 0.10)
+    elseif name == "narrow"
+        return SearchPolicy("narrow", 0.85, 0.9, 0.0)
+    elseif name == "temporal_escape"
+        return SearchPolicy("temporal_escape", 1.0, 1.8, 0.15)
+    else
+        return SearchPolicy("baseline", 1.0, 1.0, 0.0)
+    end
+end
+
+function candidate_search_policy_names()
+    return ["baseline", "wide", "narrow", "temporal_escape"]
+end
+
+function determine_search_policy(cfg::OptimizerConfig, stage::StageConfig)
+    requested = cfg.objective.search_policy
+    requested != "determine" && return get_search_policy(requested)
+    # Lightweight automatic policy selection heuristic.
+    # Prefer stronger exploration for later / harder horizons.
+    if stage.fit_months >= 10
+        return get_search_policy("temporal_escape")
+    elseif stage.fit_months >= 8
+        return get_search_policy("wide")
+    else
+        return get_search_policy("baseline")
+    end
 end
 
 function full_reusable_state_from_cma(stage::StageConfig, specs_stage::Vector{ParamSpec}, state::CMAState)
@@ -107,7 +145,7 @@ function load_full_reusable_state(path::String)
     return raw
 end
 
-function build_state_from_reusable(seed::Dict{String,Any}, specs_stage::Vector{ParamSpec}, reusable::Dict{String,Any}; sigma_floor::Float64=0.08)
+function build_state_from_reusable(seed::Dict{String,Any}, specs_stage::Vector{ParamSpec}, reusable::Dict{String,Any}; sigma_floor::Float64=0.08, temporal_unlock_multiplier::Float64=1.0)
     old_names = [String(x) for x in reusable["param_names"]]
     old_mean = Float64.(reusable["mean"])
     old_cov = Matrix{Float64}(reusable["covariance"])
@@ -134,8 +172,8 @@ function build_state_from_reusable(seed::Dict{String,Any}, specs_stage::Vector{P
     # Phase 1 temporal unlock on resume:
     # keep scalar warm-starts stable, but loosen temporal params so the search can
     # escape minima inherited from shorter horizons / older resumed states.
-    temporal_mean_jitter = 0.12
-    temporal_covariance_inflation = 2.5
+    temporal_mean_jitter = 0.12 * temporal_unlock_multiplier
+    temporal_covariance_inflation = 2.5 * temporal_unlock_multiplier
     idx = 1
     for spec in specs_stage
         if spec.kind == :temporal
@@ -354,6 +392,7 @@ end
 
 function load_config(path::String)
     raw = load_json(path)
+    config_dir = dirname(abspath(path))
     stages = [StageConfig(s["name"], s["fit_months"], s["max_iterations"], s["population_size"], float(s["sigma"])) for s in raw["stages"]]
     scalar_bounds = Dict(k => (float(v[1]), float(v[2])) for (k, v) in raw["scalar_bounds"])
     temporal_bounds = Dict(k => (float(v[1]), float(v[2])) for (k, v) in raw["temporal_bounds"])
@@ -368,9 +407,15 @@ function load_config(path::String)
         Int(get(raw["objective"], "top_k", 1)),
         float(get(raw["objective"], "min_completion_fraction", 1.0)),
         Int(get(raw["objective"], "finish_iter_delay", 30)),
+        String(get(raw["objective"], "search_policy", "baseline")),
     )
-    external_sim = haskey(raw, "gt_dir") && haskey(raw, "julia_bin") && haskey(raw, "project_dir") && haskey(raw, "advanced_cli") ?
-        ExternalSimConfig(String(raw["gt_dir"]), String(raw["julia_bin"]), String(raw["project_dir"]), String(raw["advanced_cli"])) :
+    gt_dir = haskey(raw, "gt_dir") ?
+        (isabspath(String(raw["gt_dir"])) ?
+            String(raw["gt_dir"]) :
+            normpath(joinpath(config_dir, String(raw["gt_dir"])))) :
+        nothing
+    external_sim = gt_dir !== nothing && haskey(raw, "julia_bin") && haskey(raw, "project_dir") && haskey(raw, "advanced_cli") ?
+        ExternalSimConfig(gt_dir, String(raw["julia_bin"]), String(raw["project_dir"]), String(raw["advanced_cli"])) :
         nothing
     stage_freeze = Dict{String,Vector{String}}()
     if haskey(raw, "stage_freeze")
@@ -655,11 +700,32 @@ function load_gt_series(gt_dir::String)
         end
         return values
     end
+    function load_optional(name)
+        path = joinpath(gt_dir, name)
+        isfile(path) || return Float64[]
+        return load_csv(name)
+    end
     return Dict(
         "daily_detections" => load_csv("daily_detections.csv"),
         "daily_hospitalizations" => load_csv("daily_hospitalizations.csv"),
         "daily_deaths" => load_csv("daily_deaths.csv"),
         "daily_student_detections" => load_csv("sax-scholars-infections-normalized.csv"),
+        "daily_age_total_detections" => load_optional("daily_age_total_detections.csv"),
+        "daily_age_00_04_detections" => load_optional("daily_age_00_04_detections.csv"),
+        "daily_age_05_14_detections" => load_optional("daily_age_05_14_detections.csv"),
+        "daily_age_15_34_detections" => load_optional("daily_age_15_34_detections.csv"),
+        "daily_age_35_59_detections" => load_optional("daily_age_35_59_detections.csv"),
+        "daily_age_60_79_detections" => load_optional("daily_age_60_79_detections.csv"),
+        "daily_age_80_plus_detections" => load_optional("daily_age_80_plus_detections.csv"),
+        "daily_age_total_deaths" => load_optional("daily_age_total_deaths.csv"),
+        "daily_age_00_04_deaths" => load_optional("daily_age_00_04_deaths.csv"),
+        "daily_age_05_14_deaths" => load_optional("daily_age_05_14_deaths.csv"),
+        "daily_age_15_34_deaths" => load_optional("daily_age_15_34_deaths.csv"),
+        "daily_age_35_59_deaths" => load_optional("daily_age_35_59_deaths.csv"),
+        "daily_age_60_79_deaths" => load_optional("daily_age_60_79_deaths.csv"),
+        "daily_age_80_plus_deaths" => load_optional("daily_age_80_plus_deaths.csv"),
+        "household_infections" => load_optional("household_infections.csv"),
+        "household_infection_rate" => load_optional("household_infection_rate.csv"),
     )
 end
 
@@ -911,6 +977,22 @@ function cumulative_error_distribution(daily_path::String, metric::String, gt_se
     return vals
 end
 
+function household_readout(daily_path::String, days::Int)
+    trajs = read_daily_metric(daily_path, "daily_detections")
+    trajs === nothing && return Dict{String,Float64}("household_infections" => NaN, "household_infection_rate" => NaN)
+    # Approximation: use detection trajectories as a proxy and provide a normalized readout.
+    # The LASUB household statistics are known to be biased, so treat this as graphable
+    # simulation telemetry rather than a ground-truth calibrated estimate.
+    household_proxy = Float64[]
+    for traj in trajs
+        s = Float64.(traj[1:min(end, days)])
+        push!(household_proxy, sum(s) / max(length(s), 1))
+    end
+    infections = mean(household_proxy)
+    rate = infections / max(days, 1)
+    return Dict("household_infections" => infections, "household_infection_rate" => rate)
+end
+
 function temporal_directional_guidance(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int, spec::ParamSpec, active_months::Int, cfg::OptimizerConfig)
     trajs = read_daily_metric(daily_path, metric)
     trajs === nothing && return Float64[]
@@ -977,45 +1059,63 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     gt = load_gt_series(cfg.external_sim.gt_dir)
     metrics = Dict{String,Float64}()
     for (metric, gtvals) in gt
+        isempty(gtvals) && continue
         metrics[metric] = per_trajectory_rmae(daily_path, metric, drop_missing(gtvals), days)
         metrics["$(metric)_cumulative"] = per_trajectory_cumulative_error(daily_path, metric, drop_missing(gtvals), days)
     end
     weights = cfg.objective.weights
-    combined = get(weights, "daily_detections", 1.0) * metrics["daily_detections"] +
-               get(weights, "daily_hospitalizations", 0.0) * metrics["daily_hospitalizations"] +
-               get(weights, "daily_deaths", 1.0) * metrics["daily_deaths"] +
+    combined = get(weights, "daily_detections", 1.0) * get(metrics, "daily_detections", 0.0) +
+               get(weights, "daily_hospitalizations", 0.0) * get(metrics, "daily_hospitalizations", 0.0) +
+               get(weights, "daily_deaths", 1.0) * get(metrics, "daily_deaths", 0.0) +
                get(weights, "daily_student_detections", 1.0) * get(metrics, "daily_student_detections", 0.0) +
                get(weights, "daily_detections_cumulative", 1.0) * get(metrics, "daily_detections_cumulative", 0.0) +
                get(weights, "daily_hospitalizations_cumulative", 0.0) * get(metrics, "daily_hospitalizations_cumulative", 0.0) +
                get(weights, "daily_deaths_cumulative", 1.0) * get(metrics, "daily_deaths_cumulative", 0.0) +
-               get(weights, "daily_student_detections_cumulative", 1.0) * get(metrics, "daily_student_detections_cumulative", 0.0)
+               get(weights, "daily_student_detections_cumulative", 1.0) * get(metrics, "daily_student_detections_cumulative", 0.0) +
+               get(weights, "daily_age_00_04_detections", 0.0) * get(metrics, "daily_age_00_04_detections", 0.0) +
+               get(weights, "daily_age_05_14_detections", 0.0) * get(metrics, "daily_age_05_14_detections", 0.0) +
+               get(weights, "daily_age_15_34_detections", 0.0) * get(metrics, "daily_age_15_34_detections", 0.0) +
+               get(weights, "daily_age_35_59_detections", 0.0) * get(metrics, "daily_age_35_59_detections", 0.0) +
+               get(weights, "daily_age_60_79_detections", 0.0) * get(metrics, "daily_age_60_79_detections", 0.0) +
+               get(weights, "daily_age_80_plus_detections", 0.0) * get(metrics, "daily_age_80_plus_detections", 0.0) +
+               get(weights, "daily_age_00_04_deaths", 0.0) * get(metrics, "daily_age_00_04_deaths", 0.0) +
+               get(weights, "daily_age_05_14_deaths", 0.0) * get(metrics, "daily_age_05_14_deaths", 0.0) +
+               get(weights, "daily_age_15_34_deaths", 0.0) * get(metrics, "daily_age_15_34_deaths", 0.0) +
+               get(weights, "daily_age_35_59_deaths", 0.0) * get(metrics, "daily_age_35_59_deaths", 0.0) +
+               get(weights, "daily_age_60_79_deaths", 0.0) * get(metrics, "daily_age_60_79_deaths", 0.0) +
+               get(weights, "daily_age_80_plus_deaths", 0.0) * get(metrics, "daily_age_80_plus_deaths", 0.0)
     return combined, metrics
 end
 
 function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
     gt = load_gt_series(cfg.external_sim.gt_dir)
     metrics = Dict{String,Float64}()
-    metrics["daily_detections"] = per_trajectory_rmae(daily_path, "daily_detections", gt["daily_detections"], days)
-    metrics["daily_hospitalizations"] = per_trajectory_rmae(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], days)
-    metrics["daily_deaths"] = per_trajectory_rmae(daily_path, "daily_deaths", gt["daily_deaths"], days)
-    if haskey(gt, "daily_student_detections")
-        metrics["daily_student_detections"] = per_trajectory_rmae(daily_path, "daily_student_detections", gt["daily_student_detections"], days)
-    end
-    metrics["daily_detections_cumulative"] = per_trajectory_cumulative_error(daily_path, "daily_detections", gt["daily_detections"], days)
-    metrics["daily_hospitalizations_cumulative"] = per_trajectory_cumulative_error(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], days)
-    metrics["daily_deaths_cumulative"] = per_trajectory_cumulative_error(daily_path, "daily_deaths", gt["daily_deaths"], days)
-    if haskey(gt, "daily_student_detections")
-        metrics["daily_student_detections_cumulative"] = per_trajectory_cumulative_error(daily_path, "daily_student_detections", gt["daily_student_detections"], days)
+    for (metric, gtvals) in gt
+        isempty(gtvals) && continue
+        metrics[metric] = per_trajectory_rmae(daily_path, metric, gtvals, days)
+        metrics["$(metric)_cumulative"] = per_trajectory_cumulative_error(daily_path, metric, gtvals, days)
     end
     weights = cfg.objective.weights
-    combined = get(weights, "daily_detections", 1.0) * metrics["daily_detections"] +
-               get(weights, "daily_hospitalizations", 0.0) * metrics["daily_hospitalizations"] +
-               get(weights, "daily_deaths", 1.0) * metrics["daily_deaths"] +
+    combined = get(weights, "daily_detections", 1.0) * get(metrics, "daily_detections", 0.0) +
+               get(weights, "daily_hospitalizations", 0.0) * get(metrics, "daily_hospitalizations", 0.0) +
+               get(weights, "daily_deaths", 1.0) * get(metrics, "daily_deaths", 0.0) +
                get(weights, "daily_student_detections", 1.0) * get(metrics, "daily_student_detections", 0.0) +
                get(weights, "daily_detections_cumulative", 1.0) * get(metrics, "daily_detections_cumulative", 0.0) +
                get(weights, "daily_hospitalizations_cumulative", 0.0) * get(metrics, "daily_hospitalizations_cumulative", 0.0) +
                get(weights, "daily_deaths_cumulative", 1.0) * get(metrics, "daily_deaths_cumulative", 0.0) +
-               get(weights, "daily_student_detections_cumulative", 0.0) * get(metrics, "daily_student_detections_cumulative", 0.0)
+               get(weights, "daily_student_detections_cumulative", 0.0) * get(metrics, "daily_student_detections_cumulative", 0.0) +
+               get(weights, "daily_age_00_04_detections", 0.0) * get(metrics, "daily_age_00_04_detections", 0.0) +
+               get(weights, "daily_age_05_14_detections", 0.0) * get(metrics, "daily_age_05_14_detections", 0.0) +
+               get(weights, "daily_age_15_34_detections", 0.0) * get(metrics, "daily_age_15_34_detections", 0.0) +
+               get(weights, "daily_age_35_59_detections", 0.0) * get(metrics, "daily_age_35_59_detections", 0.0) +
+               get(weights, "daily_age_60_79_detections", 0.0) * get(metrics, "daily_age_60_79_detections", 0.0) +
+               get(weights, "daily_age_80_plus_detections", 0.0) * get(metrics, "daily_age_80_plus_detections", 0.0) +
+               get(weights, "daily_age_00_04_deaths", 0.0) * get(metrics, "daily_age_00_04_deaths", 0.0) +
+               get(weights, "daily_age_05_14_deaths", 0.0) * get(metrics, "daily_age_05_14_deaths", 0.0) +
+               get(weights, "daily_age_15_34_deaths", 0.0) * get(metrics, "daily_age_15_34_deaths", 0.0) +
+               get(weights, "daily_age_35_59_deaths", 0.0) * get(metrics, "daily_age_35_59_deaths", 0.0) +
+               get(weights, "daily_age_60_79_deaths", 0.0) * get(metrics, "daily_age_60_79_deaths", 0.0) +
+               get(weights, "daily_age_80_plus_deaths", 0.0) * get(metrics, "daily_age_80_plus_deaths", 0.0)
     return combined, metrics
 end
 
@@ -1233,9 +1333,35 @@ function safe_save_json(path::String, value; label::String=path)
     end
 end
 
+
+function long_horizon_stage_name(days::Int, monthly_days::Int)
+    months = ceil(Int, days / max(monthly_days, 1))
+    return "stable_$(months)m"
+end
+
+function run_long_horizon(cfg_path::String; days::Int=730, output_dir::Union{Nothing,String}=nothing, seed_config::Union{Nothing,String}=nothing)
+    cfg = load_config(cfg_path)
+    root = output_dir === nothing ? joinpath(cfg.output_dir, "stable_long_run") : output_dir
+    mkpath(root)
+    seed_path = seed_config === nothing ? cfg.seed_config : seed_config
+    seed = load_json(seed_path)
+    stage_name = long_horizon_stage_name(days, cfg.monthly_days)
+    stage = StageConfig(stage_name, ceil(Int, days / max(cfg.monthly_days, 1)), 1, 1, 0.0)
+    specset = load_param_specs(seed, cfg, stage)
+    state = nothing
+    rng = MersenneTwister(42)
+    result, _ = run_stage(rng, seed, specset, cfg, stage, state; use_slurm=false, resume_from=0)
+    safe_save_json(joinpath(root, "long_horizon_summary.json"), Dict(
+        "days" => days,
+        "stage" => stage_name,
+        "result" => result,
+    ); label="long_horizon_summary")
+    return result
+end
 function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{ParamSpec}, cfg::OptimizerConfig, stage::StageConfig, state::Union{Nothing,CMAState}; use_slurm::Bool=false, resume_from::Int=0)
     active_months = stage.fit_months
     days = active_months * cfg.monthly_days
+    policy = determine_search_policy(cfg, stage)
     specs_stage = stage_specs(specs, cfg, stage)
     dim = sum(spec.length for spec in specs_stage)
     if state === nothing
@@ -1243,7 +1369,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
         reusable_path = joinpath(cfg.output_dir, "full_reusable_state.json")
         reusable = load_full_reusable_state(reusable_path)
         if reusable !== nothing
-            state = build_state_from_reusable(seed, specs_stage, reusable)
+            state = build_state_from_reusable(seed, specs_stage, reusable; temporal_unlock_multiplier=policy.temporal_unlock_multiplier)
             stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
             top_candidates = latest_iteration_top_candidates(stage_root)
             state = temporal_unlock_from_bucket_errors!(state, specs_stage, top_candidates)
@@ -1254,6 +1380,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
     else
         state = stage_transition_state(state, stage, specs_stage)
     end
+    state = CMAState(copy(state.mean), state.sigma * policy.sigma_multiplier, copy(state.covariance))
 
     stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
     resume_state = load_stage_state(stage_root)
@@ -1269,7 +1396,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
         state = CMAState(copy(best_vector), sigma_raw === nothing ? state.sigma : Float64(sigma_raw), state.covariance)
     end
     start_iter = max(1, resume_from + 1)
-    @info "Starting stage run" stage=stage.name fit_months=active_months start_iter=start_iter max_iterations=stage.max_iterations population_size=stage.population_size use_slurm=use_slurm
+    @info "Starting stage run" stage=stage.name fit_months=active_months start_iter=start_iter max_iterations=stage.max_iterations population_size=stage.population_size use_slurm=use_slurm search_policy=policy.name
 
     for iter in start_iter:stage.max_iterations
         @info "Starting iteration" stage=stage.name iteration=iter sigma=state.sigma best_score=best_score
@@ -1322,6 +1449,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     combined, comp = score_from_daily(cfg, daily_path, days)
                     gt = load_gt_series(cfg.external_sim.gt_dir)
                     bucket_errors = Dict{String,Any}()
+                    household = household_readout(daily_path, days)
                     metrics_payload = Dict(
                         "score" => combined,
                         "daily_detections" => comp["daily_detections"],
@@ -1336,6 +1464,8 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                         "daily_detections_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_detections", gt["daily_detections"], days),
                         "daily_hospitalizations_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], days),
                         "daily_deaths_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_deaths", gt["daily_deaths"], days),
+                        "household_infections" => household["household_infections"],
+                        "household_infection_rate" => household["household_infection_rate"],
                         "simulated" => "real",
                     )
                     for spec in specs_stage
@@ -1369,6 +1499,10 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                         metrics_payload["daily_student_detections_per_trajectory"] = trajectory_metric_values(daily_path, "daily_student_detections", gt["daily_student_detections"], days)
                         metrics_payload["daily_student_detections_cumulative_per_trajectory"] = cumulative_error_distribution(daily_path, "daily_student_detections", gt["daily_student_detections"], days)
                     end
+                    if haskey(comp, "household_infections")
+                        metrics_payload["household_infections"] = comp["household_infections"]
+                        metrics_payload["household_infection_rate"] = get(comp, "household_infection_rate", NaN)
+                    end
                     safe_save_json(joinpath(cand_dir, "metrics.json"), metrics_payload; label="candidate_metrics")
                     Dict("score" => combined, "metrics" => comp, "simulated" => "real", "status" => "completed")
                 else
@@ -1381,6 +1515,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     "stage" => stage.name,
                     "iteration" => iter,
                     "candidate" => ci,
+                    "search_policy" => policy.name,
                     "score" => score,
                     "simulated" => metrics["simulated"],
                     "status" => get(metrics, "status", "unknown"),
@@ -1397,6 +1532,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     "stage" => stage.name,
                     "iteration" => iter,
                     "candidate" => ci,
+                    "search_policy" => policy.name,
                     "fit_months" => active_months,
                     "score" => score,
                     "status" => get(metrics, "status", "unknown"),
@@ -1407,6 +1543,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     "stage" => stage.name,
                     "iteration" => iter,
                     "candidate" => ci,
+                    "search_policy" => policy.name,
                     "fit_months" => active_months,
                     "score" => score,
                     "status" => get(metrics, "status", "unknown"),
@@ -1438,6 +1575,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     "stage" => stage.name,
                     "iteration" => iter,
                     "candidate" => ci,
+                    "search_policy" => policy.name,
                     "fit_months" => active_months,
                     "score" => score,
                     "metrics" => metrics,
@@ -1447,6 +1585,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     "stage" => stage.name,
                     "iteration" => iter,
                     "candidate" => ci,
+                    "search_policy" => policy.name,
                     "fit_months" => active_months,
                     "score" => score,
                     "config" => deepcopy(candidate_cfg),
@@ -1474,12 +1613,14 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
         push!(iter_log, Dict(
             "stage" => stage.name,
             "iteration" => iter,
+            "search_policy" => policy.name,
             "best_score" => best_score,
             "sigma" => state.sigma,
             "covariance_trace" => tr(state.covariance),
         ))
         safe_save_json(joinpath(stage_root, "stage_state.json"), Dict(
             "stage" => stage.name,
+            "search_policy" => policy.name,
             "fit_months" => active_months,
             "best_score" => best_score,
             "sigma" => state.sigma,
@@ -1497,6 +1638,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
 
     return Dict(
         "stage" => stage.name,
+        "search_policy" => policy.name,
         "fit_months" => active_months,
         "best_score" => best_score,
         "best_candidate" => best_candidate,
@@ -1533,6 +1675,7 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
         update_stage_freeze!(cfg, stage, result["history"], specs)
         push!(stage_outputs, Dict(
             "stage" => result["stage"],
+            "search_policy" => result["search_policy"],
             "fit_months" => result["fit_months"],
             "best_score" => result["best_score"],
             "top_k" => length(result["top_candidates"]),
@@ -1543,6 +1686,7 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
         safe_save_json(joinpath(cfg.output_dir, "$(stage.name)_top_candidates.json"), result["top_candidates"]; label="stage_top_candidates")
         safe_save_json(joinpath(cfg.output_dir, "$(stage.name)_summary.json"), Dict(
             "stage" => result["stage"],
+            "search_policy" => result["search_policy"],
             "fit_months" => result["fit_months"],
             "best_score" => result["best_score"],
             "top_k" => length(result["top_candidates"]),
@@ -1555,7 +1699,28 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
     safe_save_json(joinpath(cfg.output_dir, "optimizer_history.json"), all_history; label="optimizer_history")
     safe_save_json(joinpath(cfg.output_dir, "stage_summary.json"), stage_outputs; label="stage_summary")
     safe_save_json(joinpath(cfg.output_dir, "final_best_candidate.json"), current_seed; label="final_best_candidate")
-    return Dict("stage_summary" => stage_outputs, "output_dir" => cfg.output_dir, "top_k" => cfg.objective.top_k)
+    scores_by_policy = Dict{String,Vector{Float64}}()
+    for stage_out in stage_outputs
+        policy_name = String(stage_out["search_policy"])
+        push!(get!(scores_by_policy, policy_name, Float64[]), Float64(stage_out["best_score"]))
+    end
+    leaderboard_entries = Any[]
+    for policy_name in sort(collect(keys(scores_by_policy)))
+        vals = scores_by_policy[policy_name]
+        push!(leaderboard_entries, Dict(
+            "search_policy" => policy_name,
+            "best_score" => minimum(vals),
+            "mean_stage_score" => mean(vals),
+            "stages" => length(vals),
+        ))
+    end
+    leaderboard = Dict(
+        "requested_search_policy" => cfg.objective.search_policy,
+        "available_policies" => candidate_search_policy_names(),
+        "entries" => leaderboard_entries,
+    )
+    safe_save_json(joinpath(cfg.output_dir, "policy_leaderboard.json"), leaderboard; label="policy_leaderboard")
+    return Dict("stage_summary" => stage_outputs, "output_dir" => cfg.output_dir, "top_k" => cfg.objective.top_k, "search_policy" => cfg.objective.search_policy)
 end
 
 function main()

@@ -13,6 +13,7 @@ The current production path is centered on:
 - external simulation via Slurm array jobs
 - partial-completion iteration cutoffs
 - resume-time temporal de-locking to avoid inherited local minima
+- selectable search policies for optimizer behavior
 
 ---
 
@@ -51,6 +52,38 @@ The optimizer uses a CMA-style population search:
 6. update mean/covariance/sigma from the best subset
 
 The optimizer persists stage state so later reruns can resume from previous search state.
+
+---
+
+## Objective configuration fields
+
+The current `objective` block supports:
+
+- `weights`
+- `top_k`
+- `min_completion_fraction`
+- `finish_iter_delay`
+- `search_policy`
+
+### Meaning
+
+#### `weights`
+Controls the contribution of each active metric to the combined objective.
+
+#### `top_k`
+How many best candidates to retain in:
+
+- per-iteration `top_candidates.json`
+- stage-level top-candidate artifacts
+
+#### `min_completion_fraction`
+Fraction of the population that must finish before the grace timer starts.
+
+#### `finish_iter_delay`
+Grace delay in **seconds** after the completion threshold is reached.
+
+#### `search_policy`
+Selects a named search-policy variant for optimizer behavior.
 
 ---
 
@@ -113,6 +146,39 @@ When reusable state is loaded, the optimizer reads the latest iteration top cand
 - smaller bucket error => weaker perturbation
 
 This makes the optimizer less sticky exactly where weekly GT fit is poor.
+
+---
+
+## Search policies (Epic 3)
+
+The optimizer now supports named search policies via:
+
+```json
+"search_policy": "baseline"
+```
+
+Current built-in policies:
+
+- `baseline`
+- `wide`
+- `narrow`
+- `temporal_escape`
+
+### Current policy effects
+
+Policies currently affect:
+
+- sigma scaling
+- temporal unlock intensity on resume
+- reserved structure for future diversity/policy extensions
+
+### Intended use
+
+This is the first step toward a policy-tournament workflow inspired by microprediction:
+
+- compare multiple search behaviors
+- persist policy identity in outputs
+- summarize policy performance with lightweight leaderboard artifacts
 
 ---
 
@@ -247,6 +313,32 @@ This supports shortlist analysis and future ensemble-style workflows.
 
 ---
 
+## Policy persistence and leaderboard
+
+Search policy identity is persisted into:
+
+- `iter_metrics.jsonl`
+- candidate history records
+- top-candidate artifacts
+- `stage_state.json`
+- stage summaries
+- global stage summary
+
+The optimizer also writes:
+
+```text
+policy_leaderboard.json
+```
+
+Current fields include:
+
+- `search_policy`
+- `best_score`
+- `mean_stage_score`
+- `stages`
+
+---
+
 ## Resume bookkeeping
 
 The optimizer infers resume state from persisted stage artifacts.
@@ -323,7 +415,8 @@ and verify that:
   },
   "top_k": 5,
   "min_completion_fraction": 0.5,
-  "finish_iter_delay": 15
+  "finish_iter_delay": 15,
+  "search_policy": "temporal_escape"
 }
 ```
 

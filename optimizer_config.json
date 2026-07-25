@@ -1,13 +1,16 @@
 {
-  "seed_config": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/seed/config12.json",
-  "output_dir": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/runs/config12",
+  "seed_config": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/seed/config13.json",
+  "output_dir": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/runs/config13",
   "monthly_days": 30,
   "stages": [
-    {"name": "stage_11m", "fit_months": 11, "max_iterations": 30, "population_size": 50, "sigma": 0.2}
+    {"name": "stage_6m", "fit_months": 6, "max_iterations": 30, "population_size": 50, "sigma": 0.2},
+   {"name": "stage_12m", "fit_months": 12, "max_iterations": 30, "population_size": 70, "sigma": 0.25}
+
 ],
   "scalar_bounds": {
     "transmission_probabilities.school": [0.05, 0.3],
-    "transmission_probabilities.class": [0.1, 0.4]
+    "transmission_probabilities.class": [0.1, 0.4],
+    "transmission_probabilities.age_coupling_param": [0.59, 0.62]
   },
   "temporal_bounds": {
     "infection_modulation.params.interval_values": [0.0, 1.0],
@@ -25,7 +28,7 @@
       "daily_detections": 1.0,
       "daily_hospitalizations": 0.0,
       "daily_deaths": 1.0,
-      "daily_student_detections": 0.2,
+      "daily_student_detections": 0.0,
       "daily_detections_cumulative": 1.0,
       "daily_hospitalizations_cumulative": 0.0,
       "daily_deaths_cumulative": 1.0,
