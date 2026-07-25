@@ -706,9 +706,9 @@ function load_gt_series(gt_dir::String)
         return load_csv(name)
     end
     return Dict(
-        "daily_detections" => load_csv("daily_detections.csv"),
+        "daily_detections" => load_csv("daily_age_total_detections.csv"),
         "daily_hospitalizations" => load_csv("daily_hospitalizations.csv"),
-        "daily_deaths" => load_csv("daily_deaths.csv"),
+        "daily_deaths" => load_csv("daily_age_total_deaths.csv"),
         "daily_student_detections" => load_csv("sax-scholars-infections-normalized.csv"),
         "daily_age_total_detections" => load_optional("daily_age_total_detections.csv"),
         "daily_age_00_04_detections" => load_optional("daily_age_00_04_detections.csv"),
@@ -948,6 +948,127 @@ function trajectory_metric_values(daily_path::String, metric::String, gt_series:
     return vals
 end
 
+function weekly_error_distributions(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int)
+    trajs = read_daily_metric(daily_path, metric)
+    trajs === nothing && return Dict{String,Any}(
+        "absolute_error" => Float64[],
+        "normalized_absolute_error" => Float64[],
+        "mae" => Float64[],
+        "rmae" => Float64[],
+        "periods" => Vector{Vector{Int}}(),
+    )
+    n = min(days, length(gt_series))
+    absolute_errors = Float64[]
+    normalized_absolute_errors = Float64[]
+    maes = Float64[]
+    rmaes = Float64[]
+    periods = Vector{Vector{Int}}()
+    week_size = 7
+    for start_day in 1:week_size:n
+        end_day = min(start_day + week_size - 1, n)
+        valid_days = [day for day in start_day:end_day if gt_series[day] !== missing]
+        isempty(valid_days) && continue
+        absolute_error = 0.0
+        normalized_absolute_error = 0.0
+        mae = 0.0
+        rmae = 0.0
+        counted = 0
+        for traj in trajs
+            length(traj) < first(valid_days) && continue
+            sim_week = Float64[traj[day] for day in valid_days if day <= length(traj)]
+            paired_gt = Float64[gt_series[day] for day in valid_days if day <= length(traj)]
+            isempty(sim_week) && continue
+            absolute_error += abs(sum(sim_week) - sum(paired_gt))
+            normalized_absolute_error += abs(sum(sim_week) - sum(paired_gt)) /
+                                        max(sum(abs.(paired_gt)), 1.0)
+            trajectory_mae = mean(abs.(sim_week .- paired_gt))
+            mae += trajectory_mae
+            rmae += trajectory_mae / max(mean(abs.(paired_gt)), 1e-9)
+            counted += 1
+        end
+        if counted > 0
+            push!(absolute_errors, absolute_error / counted)
+            push!(normalized_absolute_errors, normalized_absolute_error / counted)
+            push!(maes, mae / counted)
+            push!(rmaes, rmae / counted)
+            push!(periods, [start_day, end_day])
+        end
+    end
+    return Dict{String,Any}(
+        "absolute_error" => absolute_errors,
+        "normalized_absolute_error" => normalized_absolute_errors,
+        "mae" => maes,
+        "rmae" => rmaes,
+        "periods" => periods,
+    )
+end
+
+const WEEKLY_CONTROL_METRICS = [
+    "daily_age_total_detections",
+    "daily_age_total_deaths",
+    "daily_age_00_04_detections",
+    "daily_age_05_14_detections",
+    "daily_age_15_34_detections",
+    "daily_age_35_59_detections",
+    "daily_age_60_79_detections",
+    "daily_age_80_plus_detections",
+    "daily_age_00_04_deaths",
+    "daily_age_05_14_deaths",
+    "daily_age_15_34_deaths",
+    "daily_age_35_59_deaths",
+    "daily_age_60_79_deaths",
+    "daily_age_80_plus_deaths",
+]
+
+function weekly_control_score(daily_path::String, gt::AbstractDict, days::Int)
+    metric_scores = Float64[]
+    for metric in WEEKLY_CONTROL_METRICS
+        haskey(gt, metric) || continue
+        errors = weekly_error_distributions(daily_path, metric, gt[metric], days)
+        rmaes = errors["rmae"]
+        normalized_absolute_errors = errors["normalized_absolute_error"]
+        isempty(rmaes) && continue
+        n = min(length(rmaes), length(normalized_absolute_errors))
+        score = mean(0.7 .* rmaes[1:n] .+ 0.3 .* normalized_absolute_errors[1:n])
+        isfinite(score) && push!(metric_scores, score)
+    end
+    isempty(metric_scores) && return Inf
+    return mean(metric_scores)
+end
+
+function weekly_control_bucket_errors(
+    daily_path::String,
+    gt::AbstractDict,
+    days::Int,
+    spec::ParamSpec,
+    active_months::Int,
+    cfg::OptimizerConfig,
+)
+    bucket_ranges = temporal_bucket_day_ranges(load_json(cfg.seed_config), spec, active_months, cfg)
+    errors_by_metric = Dict{String,Any}()
+    for metric in WEEKLY_CONTROL_METRICS
+        haskey(gt, metric) || continue
+        errors_by_metric[metric] = weekly_error_distributions(daily_path, metric, gt[metric], days)
+    end
+    errors = zeros(Float64, spec.length)
+    for (bi, (start_day, end_day)) in enumerate(bucket_ranges)
+        bucket_values = Float64[]
+        for metric_errors in values(errors_by_metric)
+            periods = metric_errors["periods"]
+            rmaes = metric_errors["rmae"]
+            normalized_absolute_errors = metric_errors["normalized_absolute_error"]
+            for (pi, period) in enumerate(periods)
+                period[1] <= end_day && period[2] >= start_day || continue
+                pi > length(rmaes) && continue
+                pi > length(normalized_absolute_errors) && continue
+                push!(bucket_values, 0.7 * rmaes[pi] + 0.3 * normalized_absolute_errors[pi])
+            end
+        end
+        errors[bi] = isempty(bucket_values) ? 0.0 : mean(bucket_values)
+    end
+    return errors
+end
+
 function cumulative_metric_values(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int)
     trajs = read_daily_metric(daily_path, metric)
     trajs === nothing && return Float64[]
@@ -1057,6 +1178,7 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     sim_ok, daily_path = run_external_sim(cfg, candidate, days; workdir=workdir)
     sim_ok || return Inf, Dict("sim_failed" => true)
     gt = load_gt_series(cfg.external_sim.gt_dir)
+    weekly_control = weekly_control_score(daily_path, gt, days)
     metrics = Dict{String,Float64}()
     for (metric, gtvals) in gt
         isempty(gtvals) && continue
@@ -1083,12 +1205,15 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
                get(weights, "daily_age_15_34_deaths", 0.0) * get(metrics, "daily_age_15_34_deaths", 0.0) +
                get(weights, "daily_age_35_59_deaths", 0.0) * get(metrics, "daily_age_35_59_deaths", 0.0) +
                get(weights, "daily_age_60_79_deaths", 0.0) * get(metrics, "daily_age_60_79_deaths", 0.0) +
-               get(weights, "daily_age_80_plus_deaths", 0.0) * get(metrics, "daily_age_80_plus_deaths", 0.0)
+               get(weights, "daily_age_80_plus_deaths", 0.0) * get(metrics, "daily_age_80_plus_deaths", 0.0) +
+               get(weights, "weekly_control", 1.0) * weekly_control
+    metrics["weekly_control_score"] = weekly_control
     return combined, metrics
 end
 
 function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
     gt = load_gt_series(cfg.external_sim.gt_dir)
+    weekly_control = weekly_control_score(daily_path, gt, days)
     metrics = Dict{String,Float64}()
     for (metric, gtvals) in gt
         isempty(gtvals) && continue
@@ -1115,7 +1240,9 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
                get(weights, "daily_age_15_34_deaths", 0.0) * get(metrics, "daily_age_15_34_deaths", 0.0) +
                get(weights, "daily_age_35_59_deaths", 0.0) * get(metrics, "daily_age_35_59_deaths", 0.0) +
                get(weights, "daily_age_60_79_deaths", 0.0) * get(metrics, "daily_age_60_79_deaths", 0.0) +
-               get(weights, "daily_age_80_plus_deaths", 0.0) * get(metrics, "daily_age_80_plus_deaths", 0.0)
+               get(weights, "daily_age_80_plus_deaths", 0.0) * get(metrics, "daily_age_80_plus_deaths", 0.0) +
+               get(weights, "weekly_control", 1.0) * weekly_control
+    metrics["weekly_control_score"] = weekly_control
     return combined, metrics
 end
 
@@ -1449,7 +1576,20 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     combined, comp = score_from_daily(cfg, daily_path, days)
                     gt = load_gt_series(cfg.external_sim.gt_dir)
                     bucket_errors = Dict{String,Any}()
+                    weekly_absolute_errors = Dict{String,Any}()
+                    weekly_normalized_absolute_errors = Dict{String,Any}()
+                    weekly_mae = Dict{String,Any}()
+                    weekly_rmae = Dict{String,Any}()
+                    weekly_error_periods = Dict{String,Any}()
                     household = household_readout(daily_path, days)
+                    for (metric, gtvals) in gt
+                        weekly_errors = weekly_error_distributions(daily_path, metric, gtvals, days)
+                        weekly_absolute_errors[metric] = weekly_errors["absolute_error"]
+                        weekly_normalized_absolute_errors[metric] = weekly_errors["normalized_absolute_error"]
+                        weekly_mae[metric] = weekly_errors["mae"]
+                        weekly_rmae[metric] = weekly_errors["rmae"]
+                        weekly_error_periods[metric] = weekly_errors["periods"]
+                    end
                     metrics_payload = Dict(
                         "score" => combined,
                         "daily_detections" => comp["daily_detections"],
@@ -1458,38 +1598,26 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                         "daily_detections_cumulative" => comp["daily_detections_cumulative"],
                         "daily_hospitalizations_cumulative" => comp["daily_hospitalizations_cumulative"],
                         "daily_deaths_cumulative" => comp["daily_deaths_cumulative"],
+                        "weekly_control_score" => comp["weekly_control_score"],
                         "daily_detections_per_trajectory" => trajectory_metric_values(daily_path, "daily_detections", gt["daily_detections"], days),
                         "daily_hospitalizations_per_trajectory" => trajectory_metric_values(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], days),
                         "daily_deaths_per_trajectory" => trajectory_metric_values(daily_path, "daily_deaths", gt["daily_deaths"], days),
                         "daily_detections_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_detections", gt["daily_detections"], days),
                         "daily_hospitalizations_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], days),
                         "daily_deaths_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_deaths", gt["daily_deaths"], days),
+                        "weekly_absolute_errors" => weekly_absolute_errors,
+                        "weekly_normalized_absolute_errors" => weekly_normalized_absolute_errors,
+                        "weekly_mae" => weekly_mae,
+                        "weekly_rmae" => weekly_rmae,
+                        "weekly_error_periods" => weekly_error_periods,
                         "household_infections" => household["household_infections"],
                         "household_infection_rate" => household["household_infection_rate"],
                         "simulated" => "real",
                     )
                     for spec in specs_stage
                         spec.kind == :temporal || continue
-                        metric_name = if startswith(spec.name, "infection_modulation")
-                            "daily_detections"
-                        elseif startswith(spec.name, "mild_detection_modulation")
-                            "daily_student_detections"
-                        elseif startswith(spec.name, "tracing_modulation")
-                            "daily_detections"
-                        else
-                            nothing
-                        end
-                        metric_name === nothing && continue
-                        gt_key = metric_name
-                        haskey(gt, gt_key) || continue
-                        bucket_errors[spec.name] = temporal_bucket_error_distribution(
-                            daily_path,
-                            metric_name,
-                            gt[gt_key],
-                            days,
-                            spec,
-                            active_months,
-                            cfg,
+                        bucket_errors[spec.name] = weekly_control_bucket_errors(
+                            daily_path, gt, days, spec, active_months, cfg
                         )
                     end
                     metrics_payload["bucket_errors"] = bucket_errors

@@ -32,7 +32,8 @@
       "daily_detections_cumulative": 1.0,
       "daily_hospitalizations_cumulative": 0.0,
       "daily_deaths_cumulative": 1.0,
-      "daily_student_detections_cumulative": 0.0
+      "daily_student_detections_cumulative": 0.0,
+      "weekly_control": 1.0
     },
     "top_k": 5,
     "min_completion_fraction": 0.5,
