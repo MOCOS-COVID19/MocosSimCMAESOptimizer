@@ -79,13 +79,16 @@ end
 
 struct CMAState
     mean::Vector{Float64}
-    sigma::Float64
+    sigma::Vector{Float64}
     covariance::Matrix{Float64}
     p_c::Vector{Float64}
     p_sigma::Vector{Float64}
 end
 
-CMAState(mean::Vector{Float64}, sigma::Float64, covariance::Matrix{Float64}) =
+CMAState(mean::Vector{Float64}, sigma::Real, covariance::Matrix{Float64}) =
+    CMAState(mean, fill(Float64(sigma), length(mean)), covariance, zeros(length(mean)), zeros(length(mean)))
+
+CMAState(mean::Vector{Float64}, sigma::Vector{Float64}, covariance::Matrix{Float64}) =
     CMAState(mean, sigma, covariance, zeros(length(mean)), zeros(length(mean)))
 
 struct SearchPolicy
@@ -148,21 +151,48 @@ function stage_transition_state(prev::CMAState, stage::StageConfig, specs_stage:
     # Preserve the posterior-informed local geometry while adding a small
     # regularization term for the next stage.
     cov = 0.9 .* cov .+ 0.1 .* Matrix{Float64}(I, dim, dim)
-    return CMAState(copy(prev.mean), max(stage.sigma, max(prev.sigma * sigma_scale, sigma_floor)), cov)
+    return CMAState(
+        copy(prev.mean),
+        max.(prev.sigma .* sigma_scale, 0.75 * stage.sigma, sigma_floor),
+        cov,
+    )
+end
+
+function matrix_from_json(value, dim::Int)
+    if value isa AbstractMatrix
+        matrix = Float64.(value)
+        size(matrix, 1) == dim && size(matrix, 2) == dim || error("Invalid covariance dimensions")
+        return matrix
+    end
+    rows = collect(value)
+    length(rows) == dim || error("Invalid covariance row count")
+    matrix = Matrix{Float64}(undef, dim, dim)
+    for i in 1:dim
+        row = Float64.(rows[i])
+        length(row) == dim || error("Invalid covariance column count")
+        matrix[i, :] .= row
+    end
+    return matrix
 end
 
 function initial_state_from_config(cfg::OptimizerConfig, dim::Int, default_mean::Vector{Float64})
     cfg.initial_state === nothing && return nothing
     raw = cfg.initial_state
     mean = haskey(raw, "mean") ? Float64.(raw["mean"]) : copy(default_mean)
-    sigma = haskey(raw, "sigma") ? Float64(raw["sigma"]) : 0.3
+    sigma = if haskey(raw, "sigma")
+        raw_sigma = raw["sigma"]
+        raw_sigma isa AbstractVector ? Float64.(raw_sigma) : fill(Float64(raw_sigma), dim)
+    else
+        fill(0.3, dim)
+    end
     cov = if haskey(raw, "covariance")
-        Matrix{Float64}(raw["covariance"])
+        matrix_from_json(raw["covariance"], dim)
     else
         Matrix{Float64}(I, dim, dim)
     end
     size(cov, 1) == dim && size(cov, 2) == dim || return nothing
     length(mean) == dim || return nothing
+    length(sigma) == dim || return nothing
     p_c = haskey(raw, "p_c") ? Float64.(raw["p_c"]) : zeros(dim)
     p_sigma = haskey(raw, "p_sigma") ? Float64.(raw["p_sigma"]) : zeros(dim)
     length(p_c) == dim && length(p_sigma) == dim || return nothing
@@ -188,13 +218,19 @@ function build_state_from_reusable(
 )
     old_names = [String(x) for x in reusable["param_names"]]
     old_mean = Float64.(reusable["mean"])
-    old_cov = Matrix{Float64}(reusable["covariance"])
-    old_sigma = haskey(reusable, "sigma") ? Float64(reusable["sigma"]) : 0.3
+    old_cov = matrix_from_json(reusable["covariance"], length(old_mean))
+    old_sigma = if haskey(reusable, "sigma")
+        raw_sigma = reusable["sigma"]
+        raw_sigma isa AbstractVector ? Float64.(raw_sigma) : fill(Float64(raw_sigma), length(old_mean))
+    else
+        fill(0.3, length(old_mean))
+    end
 
     new_names = ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
     new_mean = initial_vector(seed, specs_stage)
     dim = length(new_names)
     new_cov = new_dimension_variance .* Matrix{Float64}(I, dim, dim)
+    new_sigma = fill(sigma_floor, dim)
     old_p_c = haskey(reusable, "p_c") ? Float64.(reusable["p_c"]) : zeros(length(old_names))
     old_p_sigma = haskey(reusable, "p_sigma") ? Float64.(reusable["p_sigma"]) : zeros(length(old_names))
     new_p_c = zeros(dim)
@@ -206,6 +242,7 @@ function build_state_from_reusable(
         haskey(idx_map, name) || continue
         i = idx_map[name]
         new_mean[j] = old_mean[i]
+        new_sigma[j] = max(old_sigma[i] * sigma_multiplier, sigma_floor)
         mapped[j] = true
         i <= length(old_p_c) && (new_p_c[j] = old_p_c[i])
         i <= length(old_p_sigma) && (new_p_sigma[j] = old_p_sigma[i])
@@ -251,7 +288,7 @@ function build_state_from_reusable(
     end
     return CMAState(
         new_mean,
-        max(old_sigma * sigma_multiplier, sigma_floor),
+        new_sigma,
         new_cov,
         new_p_c,
         new_p_sigma,
@@ -890,7 +927,9 @@ end
 function rmae_series(a::Vector{Float64}, b::Vector{Float64})
     n = min(length(a), length(b))
     n == 0 && return Inf
-    denom = max(mean(abs.(b[1:n])), 1e-9)
+    # Keep zero-observation metrics finite without letting one simulated
+    # event produce an artificial million-scale ratio.
+    denom = max(mean(abs.(b[1:n])), 1.0)
     return mae_series(a, b) / denom
 end
 
@@ -1022,7 +1061,7 @@ function per_trajectory_cumulative_error(daily_path::String, metric::String, gt_
     for traj in trajs
         s = Float64.(traj[1:min(end, days)])
         s = cumulative_series(s)
-        push!(vals, abs(last(s) - last(g)) / max(abs(last(g)), 1e-9))
+        push!(vals, abs(last(s) - last(g)) / max(abs(last(g)), 1.0))
     end
     isempty(vals) && return Inf
     return sum(vals) / length(vals)
@@ -1096,7 +1135,7 @@ function weekly_error_distributions(daily_path::String, metric::String, gt_serie
                                         max(sum(abs.(paired_gt)), 1.0)
             trajectory_mae = mean(abs.(sim_week .- paired_gt))
             mae += trajectory_mae
-            rmae += trajectory_mae / max(mean(abs.(paired_gt)), 1e-9)
+            rmae += trajectory_mae / max(mean(abs.(paired_gt)), 1.0)
             counted += 1
         end
         if counted > 0
@@ -1198,7 +1237,7 @@ function cumulative_metric_values(daily_path::String, metric::String, gt_series:
     for traj in trajs
         s = Float64.(traj[1:min(end, days)])
         s = cumulative_series(s)
-        push!(vals, abs(last(s) - last(g)) / max(abs(last(g)), 1e-9))
+        push!(vals, abs(last(s) - last(g)) / max(abs(last(g)), 1.0))
     end
     return vals
 end
@@ -1208,7 +1247,7 @@ function cumulative_error_distribution(daily_path::String, metric::String, gt_se
     trajs === nothing && return Float64[]
     g = drop_missing(gt_series[1:min(end, days)])
     g = cumulative_series(g)
-    denom = max(abs(last(g)), 1e-9)
+    denom = max(abs(last(g)), 1.0)
     vals = Float64[]
     for traj in trajs
         s = Float64.(traj[1:min(end, days)])
@@ -1667,6 +1706,8 @@ function cma_diagnostics(state::CMAState)
         "eigenvalues" => values,
         "covariance_trace" => tr(state.covariance),
         "covariance_condition_number" => maximum(values) / minimum(values),
+        "sigma_min" => minimum(state.sigma),
+        "sigma_max" => maximum(state.sigma),
         "p_c_norm" => norm(state.p_c),
         "p_sigma_norm" => norm(state.p_sigma),
     )
@@ -1689,7 +1730,7 @@ function update_state(state::CMAState, ranked::Vector{Tuple{Float64,Vector{Float
     for (w, (_, x, _)) in zip(weights, selected)
         new_mean .+= w .* x
     end
-    y_w = (new_mean .- state.mean) ./ max(state.sigma, 1e-12)
+    y_w = (new_mean .- state.mean) ./ max.(state.sigma, 1e-12)
     eig = eigen(Symmetric(state.covariance + 1e-10I))
     eigvals = max.(eig.values, 1e-10)
     invsqrt_c = eig.vectors * Diagonal(1.0 ./ sqrt.(eigvals)) * eig.vectors'
@@ -1703,7 +1744,7 @@ function update_state(state::CMAState, ranked::Vector{Tuple{Float64,Vector{Float
           (h_sigma ? 1.0 : 0.0) * sqrt(c_c * (2.0 - c_c) * μ_eff) .* y_w
     rank_mu_cov = zeros(size(state.covariance))
     for (w, (_, x, _)) in zip(weights, selected)
-        y = (x .- state.mean) ./ max(state.sigma, 1e-12)
+        y = (x .- state.mean) ./ max.(state.sigma, 1e-12)
         rank_mu_cov .+= w .* (y * y')
     end
     correction = (1.0 - h_sigma) * c_c * (2.0 - c_c)
@@ -1711,8 +1752,12 @@ function update_state(state::CMAState, ranked::Vector{Tuple{Float64,Vector{Float
               c_1 .* (p_c * p_c' + correction .* state.covariance) .+
               c_mu .* rank_mu_cov
     new_cov = 0.5 .* (new_cov + new_cov')
-    new_sigma = state.sigma * exp((c_sigma / d_sigma) * (norm_p_sigma / chi_n - 1.0))
-    return CMAState(new_mean, clamp(new_sigma, 0.02, 0.5), new_cov, p_c, p_sigma)
+    # Coordinate-wise step-size adaptation. This deliberately replaces the
+    # single global sigma so transferred posterior uncertainty is preserved
+    # per parameter dimension.
+    chi_1 = sqrt(2.0 / pi)
+    new_sigma = state.sigma .* exp.((c_sigma / d_sigma) .* (abs.(p_sigma) ./ chi_1 .- 1.0))
+    return CMAState(new_mean, clamp.(new_sigma, 0.02, 0.5), new_cov, p_c, p_sigma)
 end
 
 function safe_save_json(path::String, value; label::String=path)
@@ -1805,6 +1850,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                 seed,
                 specs_stage,
                 reusable;
+                sigma_floor=max(0.08, 0.75 * stage.sigma),
                 temporal_unlock_multiplier=policy.temporal_unlock_multiplier,
                 covariance_inflation=cfg.posterior.transfer_covariance_inflation,
                 sigma_multiplier=cfg.posterior.transfer_sigma_multiplier,
@@ -1856,9 +1902,12 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
     best_candidate = deepcopy(seed)
     if resume_state !== nothing && haskey(resume_state, "best_vector")
         sigma_raw = get(resume_state, "sigma", state.sigma)
+        sigma_resume = sigma_raw isa AbstractVector ?
+            Float64.(sigma_raw) :
+            fill(Float64(sigma_raw), dim)
         p_c = haskey(resume_state, "p_c") ? Float64.(resume_state["p_c"]) : zeros(dim)
         p_sigma = haskey(resume_state, "p_sigma") ? Float64.(resume_state["p_sigma"]) : zeros(dim)
-        state = CMAState(copy(best_vector), sigma_raw === nothing ? state.sigma : Float64(sigma_raw), state.covariance, p_c, p_sigma)
+        state = CMAState(copy(best_vector), sigma_resume, state.covariance, p_c, p_sigma)
     end
     start_iter = max(1, resume_from + 1)
     @info "Starting stage run" stage=stage.name fit_months=active_months start_iter=start_iter max_iterations=stage.max_iterations population_size=stage.population_size use_slurm=use_slurm search_policy=policy.name
@@ -2210,6 +2259,7 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
                     current_seed,
                     stage_specs(current_seed, specs, cfg, stage),
                     posterior_state;
+                    sigma_floor=max(0.08, 0.75 * stage.sigma),
                     temporal_unlock_multiplier=1.0,
                     covariance_inflation=cfg.posterior.transfer_covariance_inflation,
                     sigma_multiplier=cfg.posterior.transfer_sigma_multiplier,

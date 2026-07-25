@@ -7,9 +7,9 @@ Inputs:
     * final_best_candidate.json (configuration used)
     * stage_*_best_candidate.json (optional; not directly used)
 - Ground truth CSVs with header, two columns: day,value
-    * daily_detections.csv
+    * daily_age_total_detections.csv
     * daily_hospitalizations.csv
-    * daily_deaths.csv
+    * daily_age_total_deaths.csv
 
 Because the Julia optimizer here runs a synthetic simulation inside Julia and does
 not emit daily trajectories, this script visualizes the synthetic series produced
@@ -61,8 +61,8 @@ def load_weekly_series(gt_dir: Path, filename: str, total_days: int) -> np.ndarr
 def load_gt(gt_dir: Path) -> Dict[str, np.ndarray]:
     gt = {}
     files = {
-        "detections": gt_dir / "daily_detections.csv",
-        "deaths": gt_dir / "daily_deaths.csv",
+        "detections": gt_dir / "daily_age_total_detections.csv",
+        "deaths": gt_dir / "daily_age_total_deaths.csv",
         "hospitalizations": gt_dir / "daily_hospitalizations.csv",
         "student_detections": gt_dir / "daily_student_detections.csv",
     }
@@ -221,7 +221,7 @@ def plot(gt: Dict[str, np.ndarray], sim: Dict[str, np.ndarray], out_path: Path, 
     }
 
     total_days = min(max(len(gt[m]) for m, *_ in metrics), stop_day)
-    start_date = np.datetime64("2020-09-01")
+    start_date = np.datetime64("2020-09-03")
     dates = date_range(start_date, total_days)
     date_numbers = mdates.date2num([np.datetime64(d, "D").astype(object) for d in dates])
 

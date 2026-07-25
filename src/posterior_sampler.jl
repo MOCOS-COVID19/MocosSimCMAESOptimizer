@@ -43,14 +43,16 @@ function fit_diagonal_surrogate(rows, state_path::String; temperature::Float64=1
     state = JSON.parsefile(state_path)
     center = Float64.(state["mean"])
     dim = length(center)
-    sigma = Float64(state["sigma"])
+    sigma = state["sigma"] isa AbstractVector ?
+        Float64.(state["sigma"]) :
+        fill(Float64(state["sigma"]), dim)
     covariance = Matrix{Float64}(undef, dim, dim)
     for i in 1:dim
         covariance[i, :] .= Float64.(state["covariance"][i])
     end
     eig = eigen(Symmetric(covariance + 1e-10I))
     eigvals = max.(eig.values, 1e-10)
-    transform = sigma .* eig.vectors * Diagonal(sqrt.(eigvals))
+    transform = Diagonal(sigma) * eig.vectors * Diagonal(sqrt.(eigvals))
     scale = max.(sqrt.(diag(transform * transform')), 1e-6)
 
     scores = Float64[archive_objective(row) for row in rows if isfinite(archive_objective(row))]
@@ -330,8 +332,8 @@ function posterior_reusable_state(posterior_path::String)
     end
     covariance = 0.5 .* (covariance + covariance')
     stds = sqrt.(max.(diag(covariance), 1e-8))
-    sigma = clamp(median(stds), 0.02, 0.5)
-    normalized_covariance = covariance ./ sigma^2
+    sigma = clamp.(stds, 0.02, 0.5)
+    normalized_covariance = covariance ./ (sigma * sigma')
     normalized_covariance += 1e-6I
     return Dict(
         "stage" => "posterior",
