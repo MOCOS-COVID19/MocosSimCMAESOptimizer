@@ -1228,6 +1228,9 @@ const WEEKLY_CONTROL_METRICS = [
     "daily_age_80_plus_deaths",
 ]
 
+const TEMPORAL_ERROR_LOOKAHEAD = 5
+const TEMPORAL_ERROR_WEIGHTS = fill(0.2, TEMPORAL_ERROR_LOOKAHEAD)
+
 function age_metric_share(gt::AbstractDict, metric::String)
     startswith(metric, "daily_age_") || return 1.0
     occursin("daily_age_total_", metric) && return 1.0
@@ -1240,6 +1243,14 @@ function age_metric_share(gt::AbstractDict, metric::String)
     total = sum(skipmissing(gt[total_metric]))
     total <= 0.0 && return 0.0
     return clamp(group_total / total, 0.0, 1.0)
+end
+
+function forward_error_average(values::AbstractVector{Float64}, start_index::Int)
+    isempty(values) && return 0.0
+    first_index = clamp(start_index, 1, length(values))
+    last_index = min(length(values), first_index + TEMPORAL_ERROR_LOOKAHEAD - 1)
+    weights = TEMPORAL_ERROR_WEIGHTS[1:(last_index - first_index + 1)]
+    return sum(values[first_index:last_index] .* weights) / sum(weights)
 end
 
 function weekly_control_score(daily_path::String, gt::AbstractDict, days::Int)
@@ -1310,18 +1321,25 @@ function weekly_control_bucket_errors(
     errors = zeros(Float64, spec.length)
     for (bi, (start_day, end_day)) in enumerate(bucket_ranges)
         bucket_values = Float64[]
-        for metric_errors in values(errors_by_metric)
+        bucket_weights = Float64[]
+        for (metric, metric_errors) in errors_by_metric
             periods = metric_errors["periods"]
             rmaes = metric_errors["rmae"]
             normalized_absolute_errors = metric_errors["normalized_absolute_error"]
-            for (pi, period) in enumerate(periods)
-                period[1] <= end_day && period[2] >= start_day || continue
-                pi > length(rmaes) && continue
-                pi > length(normalized_absolute_errors) && continue
-                push!(bucket_values, 0.7 * rmaes[pi] + 0.3 * normalized_absolute_errors[pi])
-            end
+            isempty(periods) && continue
+            first_period = findfirst(period -> period[1] >= start_day, periods)
+            first_period === nothing && continue
+            n = min(length(rmaes), length(normalized_absolute_errors))
+            first_period > n && continue
+            period_scores = Float64[
+                0.7 * rmaes[i] + 0.3 * normalized_absolute_errors[i]
+                for i in 1:n
+            ]
+            push!(bucket_values, forward_error_average(period_scores, first_period))
+            push!(bucket_weights, age_metric_share(gt, metric))
         end
-        errors[bi] = isempty(bucket_values) ? 0.0 : mean(bucket_values)
+        errors[bi] = isempty(bucket_values) ? 0.0 :
+            sum(bucket_values .* bucket_weights) / sum(bucket_weights)
     end
     return errors
 end
@@ -1392,7 +1410,7 @@ function temporal_directional_guidance(daily_path::String, metric::String, gt_se
         end
         guidance[bi] = err / length(trajs)
     end
-    return guidance
+    return Float64[forward_error_average(guidance, bi) for bi in eachindex(guidance)]
 end
 
 function temporal_bucket_error_distribution(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int, spec::ParamSpec, active_months::Int, cfg::OptimizerConfig)
@@ -1428,7 +1446,7 @@ function temporal_bucket_error_distribution(daily_path::String, metric::String, 
         end
         errors[bi] = counted == 0 ? 0.0 : err / counted
     end
-    return errors
+    return Float64[forward_error_average(errors, bi) for bi in eachindex(errors)]
 end
 
 function vector_likelihood_payload(
