@@ -509,7 +509,7 @@ function load_config(path::String)
         float(get(raw["objective"], "min_completion_fraction", 1.0)),
         Int(get(raw["objective"], "finish_iter_delay", 30)),
         String(get(raw["objective"], "search_policy", "baseline")),
-        float(get(raw["objective"], "temporal_jump_weight", 0.1)),
+        float(get(raw["objective"], "temporal_jump_weight", 0.2)),
     )
     posterior_raw = get(raw, "posterior", Dict{String,Any}())
     posterior = PosteriorConfig(

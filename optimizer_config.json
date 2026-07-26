@@ -3,19 +3,48 @@
   "output_dir": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/runs/config13",
   "monthly_days": 30,
   "stages": [
-    {"name": "stage_6m", "fit_months": 6, "max_iterations": 30, "population_size": 50, "sigma": 0.2},
-   {"name": "stage_12m", "fit_months": 12, "max_iterations": 30, "population_size": 70, "sigma": 0.25}
-
-],
+    {
+      "name": "stage_6m",
+      "fit_months": 6,
+      "max_iterations": 30,
+      "population_size": 50,
+      "sigma": 0.2
+    },
+    {
+      "name": "stage_12m",
+      "fit_months": 12,
+      "max_iterations": 30,
+      "population_size": 70,
+      "sigma": 0.25
+    }
+  ],
   "scalar_bounds": {
-    "transmission_probabilities.school": [0.05, 0.3],
-    "transmission_probabilities.class": [0.1, 0.4],
-    "transmission_probabilities.age_coupling_param": [0.59, 0.62]
+    "transmission_probabilities.school": [
+      0.05,
+      0.3
+    ],
+    "transmission_probabilities.class": [
+      0.1,
+      0.4
+    ],
+    "transmission_probabilities.age_coupling_param": [
+      0.59,
+      0.62
+    ]
   },
   "temporal_bounds": {
-    "infection_modulation.params.interval_values": [0.0, 1.0],
-    "mild_detection_modulation.params.interval_values": [0.0, 1.0],
-    "tracing_modulation.params.interval_values": [0.0, 1.0]
+    "infection_modulation.params.interval_values": [
+      0.0,
+      1.0
+    ],
+    "mild_detection_modulation.params.interval_values": [
+      0.0,
+      1.0
+    ],
+    "tracing_modulation.params.interval_values": [
+      0.0,
+      1.0
+    ]
   },
   "objective": {
     "weights": {
@@ -38,7 +67,7 @@
     "top_k": 5,
     "min_completion_fraction": 0.5,
     "finish_iter_delay": 15,
-    "temporal_jump_weight": 0.1
+    "temporal_jump_weight": 0.2
   },
   "posterior": {
     "enabled": true,
