@@ -4,18 +4,11 @@
   "monthly_days": 30,
   "stages": [
     {
-      "name": "stage_6m",
-      "fit_months": 6,
+      "name": "short_3m",
+      "fit_months": 3,
       "max_iterations": 30,
       "population_size": 50,
       "sigma": 0.2
-    },
-    {
-      "name": "stage_12m",
-      "fit_months": 12,
-      "max_iterations": 30,
-      "population_size": 70,
-      "sigma": 0.25
     }
   ],
   "scalar_bounds": {
@@ -67,7 +60,8 @@
     "top_k": 5,
     "min_completion_fraction": 0.5,
     "finish_iter_delay": 15,
-    "temporal_jump_weight": 0.2
+    "temporal_jump_weight": 0.5,
+    "infection_extrema_weight": 0.1
   },
   "posterior": {
     "enabled": true,

@@ -141,9 +141,11 @@ def rolling_avg(arr: np.ndarray, window: int = 7) -> np.ndarray:
     if len(arr) == 0:
         return arr
     out = np.zeros_like(arr, dtype=float)
+    radius = window // 2
     for i in range(len(arr)):
-        lo = max(0, i - window + 1)
-        out[i] = arr[lo:i+1].mean()
+        lo = max(0, i - radius)
+        hi = min(len(arr), i + radius + 1)
+        out[i] = arr[lo:hi].mean()
     return out
 
 
@@ -151,9 +153,11 @@ def rolling_mean(arr: np.ndarray, window: int = 7) -> np.ndarray:
     if len(arr) == 0:
         return arr
     out = np.zeros_like(arr, dtype=float)
+    radius = window // 2
     for i in range(len(arr)):
-        lo = max(0, i - window + 1)
-        out[i] = arr[lo:i+1].mean()
+        lo = max(0, i - radius)
+        hi = min(len(arr), i + radius + 1)
+        out[i] = arr[lo:hi].mean()
     return out
 
 
@@ -217,7 +221,7 @@ def plot(gt: Dict[str, np.ndarray], sim: Dict[str, np.ndarray], out_path: Path, 
                ("hospitalizations", "7-day Hospitalizations (roll sum)", "#FF9800"),
                ("deaths", "Daily Deaths", "#F44336")]
     gt_avg_labels = {
-        "student_detections": "GT 7d avg",
+        "student_detections": "GT sparse observations",
     }
 
     total_days = min(max(len(gt[m]) for m, *_ in metrics), stop_day)
@@ -234,11 +238,19 @@ def plot(gt: Dict[str, np.ndarray], sim: Dict[str, np.ndarray], out_path: Path, 
         s = pad(sim[key], total_days)
         if key == "hospitalizations":
             s = rolling_mean(s, 7)
-        ax.bar(date_numbers, g, color=color, alpha=0.25, width=0.9, label="GT raw")
-        gt_label = gt_avg_labels.get(key, "GT 7d avg")
         if key == "student_detections":
-            ax.plot(date_numbers, rolling_avg(g), color=color, lw=2, label=gt_label)
+            observed = g > 0
+            ax.scatter(
+                date_numbers[observed],
+                g[observed],
+                color=color,
+                s=18,
+                zorder=4,
+                label=gt_avg_labels[key],
+            )
         else:
+            ax.bar(date_numbers, g, color=color, alpha=0.25, width=0.9, label="GT raw")
+            gt_label = gt_avg_labels.get(key, "GT 7d avg")
             ax.plot(date_numbers, rolling_avg(g), color=color, lw=2, label=gt_label)
         ax.bar(date_numbers, s, color="#607D8B", alpha=0.18, width=0.9, label="Sim raw")
         ax.plot(date_numbers, rolling_avg(s), color="#37474F", lw=2, ls="--", label="Sim 7d avg")
@@ -280,6 +292,141 @@ def plot(gt: Dict[str, np.ndarray], sim: Dict[str, np.ndarray], out_path: Path, 
     plt.close(fig2)
     print(f"Saved: {out_path}")
     print(f"Saved: {cum_path}")
+
+
+def plot_age_comparison(daily_path: Path, gt_dir: Path, out_path: Path, stop_day: int):
+    age_groups = ["00_04", "05_14", "15_34", "35_59", "60_79", "80_plus"]
+    metrics = [
+        ("detections", "Detections", "#2196F3"),
+        ("deaths", "Deaths", "#F44336"),
+    ]
+    gt_files = {
+        "detections": "daily_age_{age}_detections.csv",
+        "deaths": "daily_age_{age}_deaths.csv",
+    }
+    total_days = min(
+        stop_day,
+        max(
+            len(load_weekly_series(gt_dir, gt_files[key].format(age=age), stop_day))
+            for key, _, _ in metrics
+            for age in age_groups
+        ),
+    )
+    start_date = np.datetime64("2020-09-03")
+    dates = date_range(start_date, total_days)
+    date_numbers = mdates.date2num([np.datetime64(d, "D").astype(object) for d in dates])
+
+    fig, axes = plt.subplots(6, 2, figsize=(14, 15), sharex=True)
+    fig.suptitle("Age-specific Ground Truth vs Simulation", fontsize=13)
+    for row, age in enumerate(age_groups):
+        for col, (key, title, color) in enumerate(metrics):
+            ax = axes[row, col]
+            gt_values = load_weekly_series(
+                gt_dir,
+                gt_files[key].format(age=age),
+                total_days,
+            )
+            sim_path = f"daily_age_{age}_{key}"
+            sim_values = read_daily_metric(str(daily_path), sim_path)
+            if sim_values is None:
+                ax.text(0.5, 0.5, "missing simulation metric", ha="center", va="center")
+                continue
+            sim_values = np.asarray(sim_values[:total_days], dtype=float)
+            sim_values = pad(sim_values, total_days)
+            gt_values = gt_values[:total_days]
+            mae = float(np.mean(np.abs(sim_values - gt_values))) if len(gt_values) else 0.0
+            ax.bar(
+                date_numbers,
+                gt_values,
+                color=color,
+                alpha=0.25,
+                width=0.9,
+                label="GT raw",
+            )
+            ax.plot(
+                date_numbers,
+                rolling_avg(gt_values),
+                color=color,
+                lw=1.8,
+                label="GT 7d avg",
+            )
+            ax.bar(
+                date_numbers,
+                sim_values,
+                color="#607D8B",
+                alpha=0.18,
+                width=0.9,
+                label="Sim raw",
+            )
+            ax.plot(
+                date_numbers,
+                rolling_avg(sim_values),
+                color="#37474F",
+                lw=1.8,
+                ls="--",
+                label="Sim 7d avg",
+            )
+            ax.set_title(f"{age} · {title} · MAE={mae:.2f}", fontsize=9)
+            ax.grid(axis="y", alpha=0.25)
+            if col == 0:
+                ax.set_ylabel(title, fontsize=8)
+            if row == 0:
+                ax.legend(fontsize=7, loc="upper left")
+            ax.xaxis.set_major_locator(mdates.MonthLocator())
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+            ax.tick_params(axis="x", rotation=30, labelsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+    cumulative_path = out_path.with_name("gt_vs_sim_age_cumulative.png")
+    fig, axes = plt.subplots(6, 2, figsize=(14, 15), sharex=True)
+    fig.suptitle("Age-specific Ground Truth vs Simulation (Cumulative)", fontsize=13)
+    for row, age in enumerate(age_groups):
+        for col, (key, title, color) in enumerate(metrics):
+            ax = axes[row, col]
+            gt_values = load_weekly_series(
+                gt_dir,
+                gt_files[key].format(age=age),
+                total_days,
+            )
+            sim_values = read_daily_metric(
+                str(daily_path),
+                f"daily_age_{age}_{key}",
+            )
+            if sim_values is None:
+                ax.text(0.5, 0.5, "missing simulation metric", ha="center", va="center")
+                continue
+            sim_values = pad(np.asarray(sim_values[:total_days], dtype=float), total_days)
+            ax.plot(
+                date_numbers,
+                cumulative(gt_values[:total_days]),
+                color=color,
+                lw=1.8,
+                label="GT cumulative",
+            )
+            ax.plot(
+                date_numbers,
+                cumulative(sim_values),
+                color="#37474F",
+                lw=1.8,
+                ls="--",
+                label="Sim cumulative",
+            )
+            ax.set_title(f"{age} · {title}", fontsize=9)
+            ax.grid(axis="y", alpha=0.25)
+            if col == 0:
+                ax.set_ylabel("Cumulative", fontsize=8)
+            if row == 0:
+                ax.legend(fontsize=7, loc="upper left")
+            ax.xaxis.set_major_locator(mdates.MonthLocator())
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+            ax.tick_params(axis="x", rotation=30, labelsize=8)
+    fig.tight_layout()
+    fig.savefig(cumulative_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {cumulative_path}")
 
 
 def main():
@@ -343,6 +490,9 @@ def main():
             out_path = (base / "plots" / "gt_vs_sim.png")
     stop_day = int(cfg.get("stop_simulation_time", max_days)) if cfg is not None else max_days
     plot(gt, sim, Path(out_path), args.gt_dir.resolve(), stop_day)
+    if args.daily:
+        age_comparison_path = Path(out_path).with_name("gt_vs_sim_age.png")
+        plot_age_comparison(args.daily, args.gt_dir.resolve(), age_comparison_path, stop_day)
 
 
 if __name__ == "__main__":

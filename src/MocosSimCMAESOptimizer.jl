@@ -37,6 +37,7 @@ struct ObjectiveConfig
     finish_iter_delay::Int
     search_policy::String
     temporal_jump_weight::Float64
+    infection_extrema_weight::Float64
 end
 
 struct PosteriorConfig
@@ -510,6 +511,7 @@ function load_config(path::String)
         Int(get(raw["objective"], "finish_iter_delay", 30)),
         String(get(raw["objective"], "search_policy", "baseline")),
         float(get(raw["objective"], "temporal_jump_weight", 0.2)),
+        float(get(raw["objective"], "infection_extrema_weight", 0.1)),
     )
     posterior_raw = get(raw, "posterior", Dict{String,Any}())
     posterior = PosteriorConfig(
@@ -1027,6 +1029,18 @@ function student_weekly_aligned_vectors(gt_daily::AbstractVector{T}, sim_daily::
     return out_g, out_s
 end
 
+function student_sparse_aligned_vectors(gt_daily::AbstractVector{T}, sim_daily::AbstractVector{Float64}, days::Int) where {T<:Union{Missing,Float64}}
+    n = min(days, length(sim_daily), length(gt_daily))
+    out_g = Float64[]
+    out_s = Float64[]
+    for day in 1:n
+        gt_daily[day] === missing && continue
+        push!(out_g, Float64(gt_daily[day]))
+        push!(out_s, sim_daily[day])
+    end
+    return out_g, out_s
+end
+
 function per_trajectory_rmae(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int)
     trajs = read_daily_metric(daily_path, metric)
     trajs === nothing && return Inf
@@ -1036,11 +1050,9 @@ function per_trajectory_rmae(daily_path::String, metric::String, gt_series::Abst
     for traj in trajs
         s = Float64.(traj[1:min(end, days)])
         if metric == "daily_student_detections"
-            # Missing-aware weekly alignment:
-            # build weekly vectors from the *original* gt_series (with missing), but sim already has numbers.
             gt_daily = gt_series[1:min(end, days)]
             sim_daily = traj[1:min(end, days)]
-            gg, ss = student_weekly_aligned_vectors(gt_daily, Float64.(sim_daily), days)
+            gg, ss = student_sparse_aligned_vectors(gt_daily, Float64.(sim_daily), days)
             if isempty(gg)
                 continue
             end
@@ -1110,6 +1122,41 @@ function weekly_error_distributions(daily_path::String, metric::String, gt_serie
         "predictions" => Float64[],
     )
     n = min(days, length(gt_series))
+    if metric == "daily_student_detections"
+        observations = Float64[]
+        predictions = Float64[]
+        absolute_errors = Float64[]
+        normalized_absolute_errors = Float64[]
+        maes = Float64[]
+        rmaes = Float64[]
+        periods = Vector{Vector{Int}}()
+        n = min(days, length(gt_series))
+        for day in 1:n
+            gt_series[day] === missing && continue
+            sim_values = [Float64(traj[day]) for traj in trajs if day <= length(traj)]
+            isempty(sim_values) && continue
+            observation = Float64(gt_series[day])
+            prediction = mean(sim_values)
+            residual = prediction - observation
+            scale = max(abs(observation), 1.0)
+            push!(absolute_errors, abs(residual))
+            push!(normalized_absolute_errors, abs(residual) / scale)
+            push!(maes, mean(abs.(sim_values .- observation)))
+            push!(rmaes, mean(abs.(sim_values .- observation)) / scale)
+            push!(periods, [day, day])
+            push!(observations, observation)
+            push!(predictions, prediction)
+        end
+        return Dict{String,Any}(
+            "absolute_error" => absolute_errors,
+            "normalized_absolute_error" => normalized_absolute_errors,
+            "mae" => maes,
+            "rmae" => rmaes,
+            "periods" => periods,
+            "observations" => observations,
+            "predictions" => predictions,
+        )
+    end
     absolute_errors = Float64[]
     normalized_absolute_errors = Float64[]
     maes = Float64[]
@@ -1132,12 +1179,12 @@ function weekly_error_distributions(daily_path::String, metric::String, gt_serie
             sim_week = Float64[traj[day] for day in valid_days if day <= length(traj)]
             paired_gt = Float64[gt_series[day] for day in valid_days if day <= length(traj)]
             isempty(sim_week) && continue
-            absolute_error += abs(sum(sim_week) - sum(paired_gt))
-            normalized_absolute_error += abs(sum(sim_week) - sum(paired_gt)) /
-                                        max(sum(abs.(paired_gt)), 1.0)
-            trajectory_mae = mean(abs.(sim_week .- paired_gt))
-            mae += trajectory_mae
-            rmae += trajectory_mae / max(mean(abs.(paired_gt)), 1.0)
+            weekly_error = abs(sum(sim_week) - sum(paired_gt))
+            weekly_scale = max(abs(sum(paired_gt)), 1.0)
+            absolute_error += weekly_error
+            normalized_absolute_error += weekly_error / weekly_scale
+            mae += weekly_error
+            rmae += weekly_error / weekly_scale
             counted += 1
         end
         if counted > 0
@@ -1181,8 +1228,23 @@ const WEEKLY_CONTROL_METRICS = [
     "daily_age_80_plus_deaths",
 ]
 
+function age_metric_share(gt::AbstractDict, metric::String)
+    startswith(metric, "daily_age_") || return 1.0
+    occursin("daily_age_total_", metric) && return 1.0
+    suffix = endswith(metric, "_detections") ? "detections" :
+             endswith(metric, "_deaths") ? "deaths" : nothing
+    suffix === nothing && return 1.0
+    total_metric = "daily_age_total_$(suffix)"
+    haskey(gt, total_metric) || return 1.0
+    group_total = sum(skipmissing(gt[metric]))
+    total = sum(skipmissing(gt[total_metric]))
+    total <= 0.0 && return 0.0
+    return clamp(group_total / total, 0.0, 1.0)
+end
+
 function weekly_control_score(daily_path::String, gt::AbstractDict, days::Int)
     metric_scores = Float64[]
+    metric_weights = Float64[]
     for metric in WEEKLY_CONTROL_METRICS
         haskey(gt, metric) || continue
         errors = weekly_error_distributions(daily_path, metric, gt[metric], days)
@@ -1191,10 +1253,14 @@ function weekly_control_score(daily_path::String, gt::AbstractDict, days::Int)
         isempty(rmaes) && continue
         n = min(length(rmaes), length(normalized_absolute_errors))
         score = mean(0.7 .* rmaes[1:n] .+ 0.3 .* normalized_absolute_errors[1:n])
-        isfinite(score) && push!(metric_scores, score)
+        weight = age_metric_share(gt, metric)
+        if isfinite(score) && weight > 0.0
+            push!(metric_scores, score)
+            push!(metric_weights, weight)
+        end
     end
     isempty(metric_scores) && return Inf
-    return mean(metric_scores)
+    return sum(metric_scores .* metric_weights) / sum(metric_weights)
 end
 
 function temporal_jump_penalty(cfg::OptimizerConfig, candidate::AbstractDict)
@@ -1211,6 +1277,20 @@ function temporal_jump_penalty(cfg::OptimizerConfig, candidate::AbstractDict)
         push!(penalties, mean(abs.(diff(values))))
     end
     return isempty(penalties) ? 0.0 : mean(penalties)
+end
+
+function infection_extrema_penalty(cfg::OptimizerConfig, candidate::AbstractDict)
+    path = "infection_modulation.params.interval_values"
+    values = try
+        Float64.(get_nested(candidate, path))
+    catch
+        return 0.0
+    end
+    length(values) < 3 && return 0.0
+    differences = diff(values)
+    signs = [sign(value) for value in differences if abs(value) > 1e-12]
+    length(signs) < 2 && return 0.0
+    return count(i -> signs[i] != signs[i - 1], 2:length(signs)) / (length(signs) - 1)
 end
 
 function weekly_control_bucket_errors(
@@ -1435,8 +1515,12 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     metrics["weekly_control_score"] = weekly_control
     jump_penalty = temporal_jump_penalty(cfg, candidate)
     metrics["temporal_jump_penalty"] = jump_penalty
+    extrema_penalty = infection_extrema_penalty(cfg, candidate)
+    metrics["infection_extrema_penalty"] = extrema_penalty
     metrics["vector_log_likelihood"] = vector_likelihood["log_likelihood"]
-    return combined + cfg.objective.temporal_jump_weight * jump_penalty, metrics
+    return combined +
+           cfg.objective.temporal_jump_weight * jump_penalty +
+           cfg.objective.infection_extrema_weight * extrema_penalty, metrics
 end
 
 function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int, candidate::Union{Nothing,AbstractDict}=nothing)
@@ -1474,8 +1558,12 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int, c
     metrics["weekly_control_score"] = weekly_control
     jump_penalty = candidate === nothing ? 0.0 : temporal_jump_penalty(cfg, candidate)
     metrics["temporal_jump_penalty"] = jump_penalty
+    extrema_penalty = candidate === nothing ? 0.0 : infection_extrema_penalty(cfg, candidate)
+    metrics["infection_extrema_penalty"] = extrema_penalty
     metrics["vector_log_likelihood"] = vector_likelihood["log_likelihood"]
-    return combined + cfg.objective.temporal_jump_weight * jump_penalty, metrics
+    return combined +
+           cfg.objective.temporal_jump_weight * jump_penalty +
+           cfg.objective.infection_extrema_weight * extrema_penalty, metrics
 end
 
 function top_k_entries(entries, k::Int)
@@ -1700,24 +1788,47 @@ function cma_candidates(rng::AbstractRNG, state::CMAState, λ::Int)
     return candidates, zs
 end
 
+const MODULATION_LIPSCHITZ_DELTA = 0.15
+
 function clip_candidate(candidate::Vector{Float64}, specs_stage::Vector{ParamSpec})
     evaluated = copy(candidate)
     lower_hits = Bool[]
     upper_hits = Bool[]
+    lipschitz_hits = Bool[]
     idx = 1
     for spec in specs_stage
+        start_idx = idx
         for _ in 1:spec.length
             value = evaluated[idx]
             push!(lower_hits, value < spec.lower)
             push!(upper_hits, value > spec.upper)
+            push!(lipschitz_hits, false)
             evaluated[idx] = clamp(value, spec.lower, spec.upper)
             idx += 1
         end
+        if spec.kind == :temporal &&
+           (spec.name == "tracing_modulation.params.interval_values" ||
+            spec.name == "mild_detection_modulation.params.interval_values")
+            for position in 2:spec.length
+                current_idx = start_idx + position - 1
+                previous_idx = current_idx - 1
+                limited = clamp(
+                    evaluated[current_idx],
+                    evaluated[previous_idx] - MODULATION_LIPSCHITZ_DELTA,
+                    evaluated[previous_idx] + MODULATION_LIPSCHITZ_DELTA,
+                )
+                if limited != evaluated[current_idx]
+                    lipschitz_hits[current_idx] = true
+                    evaluated[current_idx] = clamp(limited, spec.lower, spec.upper)
+                end
+            end
+        end
     end
     return evaluated, Dict(
-        "clipped" => any(lower_hits) || any(upper_hits),
+        "clipped" => any(lower_hits) || any(upper_hits) || any(lipschitz_hits),
         "lower_bound_hits" => lower_hits,
         "upper_bound_hits" => upper_hits,
+        "lipschitz_hits" => lipschitz_hits,
     )
 end
 
@@ -2137,7 +2248,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                 top_candidates[key] = candidate_entry
                 push!(iteration_top_candidates, candidate_entry)
                 if get(metrics, "status", "failed") == "completed"
-                    push!(ranked, (score, cand, zs[ci]))
+                    push!(ranked, (score, x, zs[ci]))
                 end
                 if get(metrics, "status", "failed") == "completed" && score < best_score
                     best_score = score
@@ -2185,7 +2296,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                 top_candidates[key] = candidate_entry
                 push!(iteration_top_candidates, candidate_entry)
                 if get(metrics, "status", "failed") == "completed" && isfinite(Float64(score))
-                    push!(ranked, (score, cand, zs[ci]))
+                    push!(ranked, (score, x, zs[ci]))
                 end
                 if get(metrics, "status", "failed") == "completed" && score < best_score
                     best_score = score
@@ -2324,6 +2435,19 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
     safe_save_json(joinpath(cfg.output_dir, "optimizer_history.json"), all_history; label="optimizer_history")
     safe_save_json(joinpath(cfg.output_dir, "stage_summary.json"), stage_outputs; label="stage_summary")
     safe_save_json(joinpath(cfg.output_dir, "final_best_candidate.json"), current_seed; label="final_best_candidate")
+    if cfg.external_sim !== nothing && !isempty(cfg.stages)
+        plot_script = joinpath(MANAGER_ROOT, "scripts", "plot_best_modulation_detections.py")
+        if isfile(plot_script)
+            try
+                python_bin = get(ENV, "PYTHON_BIN", "python3")
+                stage_dir = joinpath(cfg.output_dir, "real_sims", cfg.stages[end].name)
+                plot_output = joinpath(cfg.output_dir, "infection_modulation_best.png")
+                run(`$python_bin $plot_script --stage-dir $stage_dir --gt-dir $(cfg.external_sim.gt_dir) --out $plot_output`)
+            catch err
+                @warn "Failed to generate final modulation plot" err
+            end
+        end
+    end
     scores_by_policy = Dict{String,Vector{Float64}}()
     for stage_out in stage_outputs
         policy_name = String(stage_out["search_policy"])
