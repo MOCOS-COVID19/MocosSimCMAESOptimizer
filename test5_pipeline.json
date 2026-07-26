@@ -1,0 +1,21 @@
+{
+  "base_config": "./optimizer_config.json",
+  "output_root": "./pipeline_cma_nuts_test5",
+  "use_slurm": true,
+  "skip_short": true,
+  "initial_posterior": "./pipeline_cma_nuts_test4/short_3m/real_sims/short_3m/posterior_samples.json",
+  "short": {
+    "name": "short_3m",
+    "fit_months": 3,
+    "max_iterations": 12,
+    "population_size": 16,
+    "sigma": 0.2
+  },
+  "long": {
+    "name": "long_12m",
+    "fit_months": 12,
+    "max_iterations": 30,
+    "population_size": 50,
+    "sigma": 0.2
+  }
+}

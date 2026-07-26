@@ -63,13 +63,14 @@ def main():
     detection_values = detection["interval_values"][:26]
     tracing_values = tracing["interval_values"][:26]
 
-    days = 180
-    gt = load_gt(args.gt_dir / "daily_age_total_detections.csv", days)
     with h5py.File(candidate_dir / "output_daily.jld2", "r") as handle:
         trajectories = [
-            np.asarray(handle[key]["daily_detections"], dtype=float).ravel()[:days]
+            np.asarray(handle[key]["daily_detections"], dtype=float).ravel()
             for key in handle.keys()
         ]
+    days = min(180, min(len(values) for values in trajectories))
+    gt = load_gt(args.gt_dir / "daily_age_total_detections.csv", days)
+    trajectories = [values[:days] for values in trajectories]
     simulation = np.mean(np.asarray(trajectories), axis=0)
     timeline = np.arange(1, days + 1)
 

@@ -150,6 +150,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("pipeline_root", type=Path)
     parser.add_argument("--template", type=Path, default=Path(__file__).with_name("index_template.html"))
+    parser.add_argument("--gt-dir", type=Path, default=Path(__file__).resolve().parents[1] / "gt")
     args = parser.parse_args()
     root = args.pipeline_root.resolve()
     stage_dirs = sorted(
@@ -168,6 +169,13 @@ def main():
     long_posterior_path = long_dir / "posterior_samples.json"
     posterior_path = long_posterior_path if long_posterior_path.exists() else short_posterior_path
     posterior, posterior_info = posterior_data(posterior_path)
+    short_candidates = candidate_data(short_dir, f"{short_stage}/real_sims/{short_dir.name}")
+    long_candidates = candidate_data(long_dir, f"{long_stage}/real_sims/{long_dir.name}")
+    for candidate in short_candidates:
+        candidate["stage"] = short_stage
+    for candidate in long_candidates:
+        candidate["stage"] = long_stage
+    candidates = sorted(short_candidates + long_candidates, key=lambda row: row["score"])
     data = {
         "pipeline": {},
         "short": {"best": short_summary.get("best_score"), "stage": short_stage, "sigma": short_summary.get("sigma")},
@@ -176,11 +184,28 @@ def main():
         "sigmas": sigma_history(short_dir),
         "posterior": posterior,
         "posteriorInfo": posterior_info,
-        "top": candidate_data(short_dir, f"{short_stage}/real_sims/{short_dir.name}")[:5],
+        "iterations": stage_history(short_dir),
+        "candidates": candidates,
+        "total_candidates": len(candidates),
+        "dimensions": len(posterior),
         "paramCount": len(posterior),
         "infection": modulation_data(short_dir),
     }
-    make_scalar_plot(short_dir, root / "short_6m" / "scalar_parameters_evolution.png")
+    make_scalar_plot(short_dir, root / short_stage / "scalar_parameters_evolution.png")
+    modulation_plotter = Path(__file__).with_name("plot_best_modulation_detections.py")
+    if modulation_plotter.exists() and args.gt_dir.exists():
+        for stage_dir in sorted(set([short_dir, long_dir])):
+            output = stage_dir.parent.parent / "infection_modulation_best.png"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(modulation_plotter),
+                    "--stage-dir", str(stage_dir),
+                    "--gt-dir", str(args.gt_dir),
+                    "--out", str(output),
+                ],
+                check=False,
+            )
     template = args.template.read_text()
     output = (
         template
