@@ -36,6 +36,7 @@ struct ObjectiveConfig
     min_completion_fraction::Float64
     finish_iter_delay::Int
     search_policy::String
+    temporal_jump_weight::Float64
 end
 
 struct PosteriorConfig
@@ -508,6 +509,7 @@ function load_config(path::String)
         float(get(raw["objective"], "min_completion_fraction", 1.0)),
         Int(get(raw["objective"], "finish_iter_delay", 30)),
         String(get(raw["objective"], "search_policy", "baseline")),
+        float(get(raw["objective"], "temporal_jump_weight", 0.1)),
     )
     posterior_raw = get(raw, "posterior", Dict{String,Any}())
     posterior = PosteriorConfig(
@@ -1195,6 +1197,22 @@ function weekly_control_score(daily_path::String, gt::AbstractDict, days::Int)
     return mean(metric_scores)
 end
 
+function temporal_jump_penalty(cfg::OptimizerConfig, candidate::AbstractDict)
+    # Penalize the raw configured buckets, before MocosSimLauncher applies
+    # any runtime seasonal multiplier to infection transmission.
+    penalties = Float64[]
+    for path in keys(cfg.temporal_bounds)
+        values = try
+            Float64.(get_nested(candidate, path))
+        catch
+            continue
+        end
+        length(values) < 2 && continue
+        push!(penalties, mean(abs.(diff(values))))
+    end
+    return isempty(penalties) ? 0.0 : mean(penalties)
+end
+
 function weekly_control_bucket_errors(
     daily_path::String,
     gt::AbstractDict,
@@ -1415,11 +1433,13 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
                get(weights, "daily_age_80_plus_deaths", 0.0) * get(metrics, "daily_age_80_plus_deaths", 0.0) +
                get(weights, "weekly_control", 1.0) * weekly_control
     metrics["weekly_control_score"] = weekly_control
+    jump_penalty = temporal_jump_penalty(cfg, candidate)
+    metrics["temporal_jump_penalty"] = jump_penalty
     metrics["vector_log_likelihood"] = vector_likelihood["log_likelihood"]
-    return combined, metrics
+    return combined + cfg.objective.temporal_jump_weight * jump_penalty, metrics
 end
 
-function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
+function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int, candidate::Union{Nothing,AbstractDict}=nothing)
     gt = load_gt_series(cfg.external_sim.gt_dir)
     weekly_control = weekly_control_score(daily_path, gt, days)
     vector_likelihood = vector_likelihood_payload(daily_path, gt, days; family=cfg.posterior.likelihood)
@@ -1452,8 +1472,10 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
                get(weights, "daily_age_80_plus_deaths", 0.0) * get(metrics, "daily_age_80_plus_deaths", 0.0) +
                get(weights, "weekly_control", 1.0) * weekly_control
     metrics["weekly_control_score"] = weekly_control
+    jump_penalty = candidate === nothing ? 0.0 : temporal_jump_penalty(cfg, candidate)
+    metrics["temporal_jump_penalty"] = jump_penalty
     metrics["vector_log_likelihood"] = vector_likelihood["log_likelihood"]
-    return combined, metrics
+    return combined + cfg.objective.temporal_jump_weight * jump_penalty, metrics
 end
 
 function top_k_entries(entries, k::Int)
@@ -1988,7 +2010,7 @@ function run_stage(rng::AbstractRNG, seed::Dict{String,Any}, specs::Vector{Param
                     safe_save_json(joinpath(cand_dir, "metrics.json"), metrics_payload; label="candidate_metrics")
                     Dict("score" => Inf, "metrics" => Dict(), "simulated" => "real_skipped", "status" => "skipped")
                 elseif isfile(daily_path)
-                    combined, comp = score_from_daily(cfg, daily_path, days)
+                    combined, comp = score_from_daily(cfg, daily_path, days, cand_cfg)
                     gt = load_gt_series(cfg.external_sim.gt_dir)
                     bucket_errors = Dict{String,Any}()
                     weekly_absolute_errors = Dict{String,Any}()

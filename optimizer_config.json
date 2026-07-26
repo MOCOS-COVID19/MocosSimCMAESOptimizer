@@ -37,7 +37,8 @@
     },
     "top_k": 5,
     "min_completion_fraction": 0.5,
-    "finish_iter_delay": 15
+    "finish_iter_delay": 15,
+    "temporal_jump_weight": 0.1
   },
   "posterior": {
     "enabled": true,
