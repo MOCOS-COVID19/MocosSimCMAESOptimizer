@@ -66,12 +66,37 @@ const JULIA = get(ENV, "JULIA", "/Users/marcinbodych/Workspace/saxocov/julia-1.7
     @test all(s["gate"]["status"] == "passed" for s in summary["stages"])
     @test all(isfile(joinpath(s["stage_root"], "preflight_manifest.json"))
               for s in summary["stages"])
+        @test all(isfile(joinpath(s["stage_root"], "metrics.json")) &&
+                  isfile(joinpath(s["stage_root"], "survivor_selection_report.json")) &&
+                  isfile(joinpath(s["stage_root"], "provenance_validation.json"))
+                  for s in summary["stages"])
     # Trusted trajectory/CMA state must be durable at every handoff, not just
     # represented by the scalar archive identifiers.
     trajectory_ids = String[]
     for (i, stage) in enumerate(summary["stages"])
         state = JSON.parsefile(joinpath(stage["stage_root"], "stage_state.json"))
         reusable = JSON.parsefile(joinpath(stage["stage_root"], "full_reusable_state.json"))
+        metrics = JSON.parsefile(joinpath(stage["stage_root"], "metrics.json"))
+        selection = JSON.parsefile(joinpath(stage["stage_root"], "survivor_selection_report.json"))
+        provenance = JSON.parsefile(joinpath(stage["stage_root"], "provenance_validation.json"))
+        @test provenance["status"] == "consistent"
+        @test isempty(provenance["contradictions"])
+        @test selection["archive_count"] == length(JSON.parsefile(joinpath(stage["stage_root"], "survivor_archive.json")))
+        @test selection["effective_quality_band"] == selection["quality_band"]
+        @test selection["adaptive_target_status"] in ("met", "constrained")
+        @test haskey(selection, "diversity")
+        @test selection["rejected_total"] == sum(Int.(values(selection["rejected_counts"])))
+        @test all(haskey(row, "source_config_identity") &&
+                  haskey(row, "source_seed_identity") &&
+                  haskey(row, "horizon") &&
+                  haskey(row, "adapter_mode") &&
+                  haskey(row, "metric_version") &&
+                  haskey(row, "score_evidence") &&
+                  haskey(row, "output_paths") &&
+                  haskey(row, "failure_class")
+                  for row in metrics)
+        @test reusable["selection_report_path"] == joinpath(stage["stage_root"], "survivor_selection_report.json")
+        @test reusable["selection_report_archive_ids"] == stage["archive_ids"]
         @test haskey(state, "trajectory_identity")
         @test haskey(state, "historical_trajectory")
         @test haskey(state, "prefix_hash")

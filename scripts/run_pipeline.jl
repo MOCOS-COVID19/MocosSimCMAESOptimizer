@@ -42,6 +42,66 @@ function write_phase_config(path, cfg)
     end
 end
 
+function fixture_file_identity(path)
+    p = path === nothing ? nothing : String(path)
+    if p === nothing || isempty(p) || !isfile(p)
+        return Dict{String,Any}("path" => p, "exists" => false)
+    end
+    return Dict{String,Any}("path" => abspath(p), "exists" => true,
+        "sha256" => bytes2hex(sha256(read(p))))
+end
+
+function fixture_provenance(preflight, base_config, stage, index, stage_root)
+    config_path = get(preflight, "config_path", nothing)
+    seed_path = get(preflight, "seed_config", get(base_config, "seed_config", nothing))
+    return Dict{String,Any}(
+        "source_config" => fixture_file_identity(config_path),
+        "source_seed" => fixture_file_identity(seed_path),
+        "source_config_path" => config_path,
+        "source_seed_path" => seed_path,
+        "stage" => stage["name"], "iteration" => 1,
+        "horizon" => Dict("requested_months" => stage["fit_months"],
+            "effective_months" => stage["effective_months"],
+            "requested_days" => stage["requested_days"],
+            "effective_days" => stage["effective_days"]),
+        "adapter_mode" => "deterministic_fixture",
+        "adapter_command_identity" => "fixture-adapter-v1:no-launch",
+        "metric_version" => "objective-metrics-v1",
+        "output_paths" => Dict("stage_root" => stage_root,
+            "metrics" => joinpath(stage_root, "metrics.json"),
+            "archive" => joinpath(stage_root, "survivor_archive.json"),
+            "selection_report" => joinpath(stage_root, "survivor_selection_report.json")),
+        "pipeline_stage_index" => index)
+end
+
+function validate_fixture_provenance(stage_root, entries, archive, report, state, reusable)
+    contradictions = String[]
+    ids = Set(String(get(x, "candidate", "")) for x in archive)
+    entry_ids = Set(String(get(x, "candidate", "")) for x in entries)
+    ids ⊆ entry_ids || push!(contradictions, "archive candidate is absent from metrics")
+    Int(get(report, "archive_count", -1)) == length(archive) ||
+        push!(contradictions, "selection report archive_count disagrees with archive")
+    if Int(get(report, "rejected_total", -1)) !=
+       sum(values(get(report, "rejected_counts", Dict())))
+        push!(contradictions, "selection report rejected_total disagrees with rejected_counts")
+    end
+    get(state, "archive_ids", Any[]) == [get(x, "candidate", nothing) for x in archive] ||
+        push!(contradictions, "stage state archive_ids disagree with archive order")
+    get(reusable, "admitted_ids", Any[]) == get(state, "transfer_archive_ids", Any[]) ||
+        push!(contradictions, "reusable state admitted_ids disagree with transfer ids")
+    get(reusable, "selected_archive_ids", Any[]) == [get(x, "candidate", nothing) for x in archive] ||
+        push!(contradictions, "reusable state selected_archive_ids disagree with archive")
+    for entry in entries
+        for field in ("provenance", "score_evidence", "output_paths", "horizon",
+                      "source_config_identity", "source_seed_identity")
+            haskey(entry, field) || push!(contradictions, "candidate missing $field")
+        end
+    end
+    return Dict{String,Any}("status" => isempty(contradictions) ? "consistent" : "contradictory",
+        "contradictions" => contradictions, "candidate_count" => length(entries),
+        "archive_count" => length(archive), "reusable_admitted_ids" => get(reusable, "admitted_ids", Any[]))
+end
+
 function validate_fixture_stage_plan(batch, monthly_days)
     raw_stages = get(batch, "stages", nothing)
     raw_stages isa AbstractVector && !isempty(raw_stages) ||
@@ -142,6 +202,8 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
         manifest["source_stage"] = index == 1 ? nothing : plan[index - 1]["name"]
         manifest["output_root_created"] = true
         manifest["adapter_mode"] = "deterministic_fixture"
+        stage_provenance = fixture_provenance(preflight, base_config, stage, index, stage_root)
+        manifest["provenance"] = stage_provenance
         O.safe_save_json(joinpath(stage_root, "preflight_manifest.json"), manifest;
                          label="fixture_preflight_manifest")
         entries = Any[]
@@ -154,6 +216,11 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
                 "requested_horizon" => stage["fit_months"],
                 "effective_scoring_horizon" => stage["fit_months"],
                 "score" => 1.0 + 0.01 * slot,
+                "score_evidence" => Dict("total" => 1.0 + 0.01 * slot,
+                    "metrics" => Dict("weekly_control_score" => 0.8 + 0.01 * slot,
+                        "daily_detections_cumulative" => 0.9,
+                        "temporal_jump_penalty" => 0.0),
+                    "metric_version" => "objective-metrics-v1", "scored_days" => stage["effective_days"]),
                 "evaluated_vector" => [0.1 * slot, 0.2 * slot],
                 "parameter_names" => ["fixture.beta[1]", "fixture.beta[2]"],
                 "trajectory_identity" => trajectory_identity,
@@ -167,8 +234,22 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
                                   "temporal_jump_penalty" => 0.0),
                 "provenance" => Dict("adapter" => "deterministic_fixture",
                                      "source_config" => preflight["config_path"],
+                                     "source_config_identity" => stage_provenance["source_config"],
+                                     "source_seed_identity" => stage_provenance["source_seed"],
                                      "source_stage" => index == 1 ? nothing : plan[index - 1]["name"],
-                                     "output_root" => stage_root),
+                                     "output_root" => stage_root,
+                                     "adapter_mode" => "deterministic_fixture",
+                                     "adapter_command_identity" => "fixture-adapter-v1:no-launch",
+                                     "metric_version" => "objective-metrics-v1"),
+                "source_config_identity" => stage_provenance["source_config"],
+                "source_seed_identity" => stage_provenance["source_seed"],
+                "horizon" => stage_provenance["horizon"],
+                "output_paths" => Dict("stage_root" => stage_root,
+                    "candidate_metrics" => joinpath(stage_root, "metrics.json"),
+                    "candidate_output" => joinpath(stage_root, "candidate_outputs", id)),
+                "adapter_mode" => "deterministic_fixture",
+                "metric_version" => "objective-metrics-v1",
+                "failure_class" => nothing,
                 "transition_delta_report" => Dict(
                     "coordinate_space" => "effective_named",
                     "candidate_class" => index == 1 ? "new_dimension" : "archive_transfer",
@@ -183,11 +264,22 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
             current_stage=stage["name"], current_fit_months=stage["fit_months"],
             target_size=3, max_size=200, return_report=true)
         archive = report["archive"]
+        report["rejected_total"] = sum(values(report["rejected_counts"]))
+        report["effective_quality_band"] = report["quality_band"]
+        report["selection_stage"] = stage["name"]
+        report["selection_iteration"] = 1
+        report["source_config_identity"] = stage_provenance["source_config"]
+        report["source_seed_identity"] = stage_provenance["source_seed"]
+        report["horizon"] = stage_provenance["horizon"]
+        report["adapter_mode"] = "deterministic_fixture"
+        report["metric_version"] = "objective-metrics-v1"
         # Terminal classifications are persisted independently of the
         # selection result.  Resume must consume these records, rather than
         # inferring completion from candidate directories.
         O.safe_save_json(joinpath(stage_root, "top_candidates.json"), entries;
                          label="fixture_top_candidates")
+        O.safe_save_json(joinpath(stage_root, "metrics.json"), entries;
+                         label="fixture_candidate_metrics")
         open(joinpath(stage_root, "iter_metrics.jsonl"), "w") do io
             for entry in entries
                 JSON.print(io, entry)
@@ -196,6 +288,8 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
         end
         archive_path = joinpath(stage_root, "survivor_archive.json")
         O.safe_save_json(archive_path, archive; label="fixture_survivor_archive")
+        selection_report_path = joinpath(stage_root, "survivor_selection_report.json")
+        O.safe_save_json(selection_report_path, report; label="fixture_survivor_selection_report")
         manifest_path = O.persist_archive_transfer_manifest(stage_root, archive;
             archive_path=archive_path, stage=stage["name"], fit_months=stage["fit_months"])
         gate = O.archive_quality_gate(archive; current_stage=stage["name"],
@@ -245,6 +339,9 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
             "fit_months" => stage["fit_months"], "requested_days" => stage["requested_days"],
             "effective_days" => stage["effective_days"], "archive_path" => manifest_path,
             "archive_ids" => current_ids, "transfer_archive_ids" => transfer_ids,
+            "selection_report_path" => selection_report_path,
+            "selection_report_archive_ids" => current_ids,
+            "provenance_validation_path" => joinpath(stage_root, "provenance_validation.json"),
             "best_candidate" => current_ids[1],
             "current_archive_ids" => current_ids,
             "source_archive_path" => incoming_path,
@@ -263,7 +360,7 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
             "covariance" => [[0.04, 0.0], [0.0, 0.04]],
             "p_c" => [0.0, 0.0], "p_sigma" => [0.0, 0.0],
             "source_archive_ids" => transfer_ids)
-        O.safe_save_json(joinpath(stage_root, "full_reusable_state.json"), Dict(
+        reusable_state = Dict(
             "status" => "committed", "stage" => stage["name"],
             "source_archive_path" => incoming_path, "admitted_ids" => transfer_ids,
             "parameter_names" => ["fixture.beta[1]", "fixture.beta[2]"],
@@ -274,9 +371,20 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
             "locked_intervals" => locked_intervals,
             "cma_state" => cma_state,
             "source_archive_ids" => transfer_ids,
+            "selected_archive_ids" => current_ids,
             "state_provenance" => Dict("source" => incoming_path,
                 "admitted_predecessor_ids" => transfer_ids,
-                "scalar_best_usable" => false)))
+                "scalar_best_usable" => false),
+            "selection_report_path" => selection_report_path,
+            "selection_report_archive_ids" => current_ids,
+            "provenance" => stage_provenance)
+        O.safe_save_json(joinpath(stage_root, "full_reusable_state.json"), reusable_state)
+        state = JSON.parsefile(joinpath(stage_root, "stage_state.json"))
+        provenance_check = validate_fixture_provenance(stage_root, entries, archive, report, state, reusable_state)
+        O.safe_save_json(joinpath(stage_root, "provenance_validation.json"), provenance_check;
+                         label="fixture_provenance_validation")
+        provenance_check["status"] == "consistent" ||
+            error("fixture provenance contradiction: $(provenance_check["contradictions"])")
         O.atomic_save_json(joinpath(stage_root, "iter_1", "iteration_commit.json"),
             Dict("status" => "committed", "stage" => stage["name"],
                  "iteration" => 1,
@@ -285,6 +393,8 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
             "archive_path" => manifest_path, "archive_ids" => current_ids,
             "transfer_archive_ids" => transfer_ids,
             "current_archive_ids" => current_ids,
+            "selection_report_path" => selection_report_path,
+            "provenance_validation_path" => joinpath(stage_root, "provenance_validation.json"),
             "source_archive_path" => incoming_path,
             "source_archive_id" => incoming_manifest === nothing ? nothing : incoming_manifest["archive_id"],
             "trajectory_identity" => trajectory_identity,
@@ -299,7 +409,9 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
             "multi_seed" => "DEFERRED", "slurm" => "DEFERRED",
             "validation_replicates" => "DEFERRED"),
         "provenance" => Dict("config_path" => preflight["config_path"],
-            "threshold" => 0.9, "preflight_before_execution" => true))
+            "threshold" => 0.9, "preflight_before_execution" => true,
+            "metric_version" => "objective-metrics-v1",
+            "selection_reports" => [s["selection_report_path"] for s in stages]))
     O.safe_save_json(joinpath(output_root, "pipeline_summary.json"), summary;
                      label="fixture_pipeline_summary")
     return summary
