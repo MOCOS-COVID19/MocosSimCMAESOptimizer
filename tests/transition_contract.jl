@@ -1,0 +1,48 @@
+using Test
+using LinearAlgebra
+using Random
+
+push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
+using MocosSimCMAESOptimizer
+const O = MocosSimCMAESOptimizer
+
+@testset "transition contract" begin
+    specs_old = [O.ParamSpec("a", :scalar, 1, 0.0, 1.0),
+                 O.ParamSpec("curve", :temporal, 2, 0.0, 1.0)]
+    specs_new = [O.ParamSpec("curve", :temporal, 3, 0.0, 1.0),
+                 O.ParamSpec("b", :scalar, 1, 0.0, 1.0),
+                 O.ParamSpec("a", :scalar, 1, 0.0, 1.0)]
+    prev = O.CMAState([0.2, 0.3, 0.4], [0.04, 0.05, 0.06],
+                      Matrix{Float64}(I, 3, 3), [1.0, 2.0, 3.0], [4.0, 5.0, 6.0])
+    state = O.stage_transition_state(prev, O.StageConfig("next", 3, 1, 2, 0.1),
+                                     specs_new; previous_specs=specs_old)
+    @test state.mean[[1, 2, 5]] == [0.3, 0.4, 0.2]
+    @test state.mean[3] == 0.4
+    @test length(state.mean) == 5
+    @test O.validate_cma_state(state, 5)["valid"]
+
+    seed = Dict{String,Any}("curve" => Dict{String,Any}(
+        "interval_values" => [0.2, 0.4, 0.8],
+        "interval_times" => [1, 30, 31]))
+    cfg = O.OptimizerConfig("seed", "out", 30, O.StageConfig[],
+        Dict{String,Tuple{Float64,Float64}}(), Dict("curve" => (0.0, 1.0)),
+        Dict{String,Dict{String,Any}}(), "monthly", Dict{String,Float64}(),
+        Dict{String,Any}(), O.ObjectiveConfig(Dict{String,Float64}(), 1, 1.0, 0,
+        "baseline", 0.0, 0.0), nothing, Dict{String,Vector{String}}(), nothing,
+        O.PosteriorConfig(false, "", 1, 1, 1, .1, 1., 1., 1., 1., 0.))
+    O.CURRENT_OPTIMIZER_CONFIG[] = cfg
+    spec = [O.ParamSpec("curve.interval_values", :temporal, 3, 0., 1.)]
+    @test O.initial_vector(seed, spec) == [0.4, 0.8, 0.8]
+    candidate = O.vector_to_config(seed, spec, [0.1, 0.2, 0.3], 2)
+    @test candidate["curve"]["interval_values"] == [0.1, 0.1, 0.2]
+    @test candidate["stop_simulation_time"] == 60
+    @test O.monthly_bucket(30, 30) == 1
+    @test O.monthly_bucket(31, 30) == 2
+    @test_throws ArgumentError O.validate_interval_times([1, 1])
+
+    rng = MersenneTwister(17)
+    snapshot = O.rng_snapshot(rng)
+    expected = rand(rng, 4)
+    restored = O.restore_rng(snapshot)
+    @test rand(restored, 4) == expected
+end
