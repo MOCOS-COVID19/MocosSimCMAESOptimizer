@@ -660,15 +660,17 @@ function validate_committed_artifacts(stage_root::String)
             String(get(commit, "stage", "")) == stage &&
             Int(get(commit, "iteration", -1)) == iteration
         # A commit is only trusted when its hash manifest is self-consistent.
-        # Older hand-built fixtures may omit the optional manifest, but every
-        # production commit written by run_stage includes it.
+        # Older hand-built fixtures may omit the manifest; production commits
+        # are never allowed to use that compatibility path.
         if haskey(commit, "artifact_hashes")
             hashes = commit["artifact_hashes"]
             hashes isa AbstractDict || push!(contradictions, "artifact hash manifest is not an object")
             if hashes isa AbstractDict
                 keys_manifest = sort(String.(collect(keys(hashes))))
+                haskey(commit, "artifact_key_set") ||
+                    push!(contradictions, "committed artifact key set is missing")
                 expected_keys = haskey(commit, "artifact_key_set") ?
-                    sort(String.(commit["artifact_key_set"])) : keys_manifest
+                    sort(String.(commit["artifact_key_set"])) : String[]
                 keys_manifest == expected_keys ||
                     push!(contradictions, "artifact hash manifest key set mismatch")
                 sort(intersect(keys_manifest, sort(collect(keys(paths))))) ==
@@ -681,6 +683,13 @@ function validate_committed_artifacts(stage_root::String)
                     String(commit["artifact_hash_manifest"]) == digest ||
                         push!(contradictions, "artifact hash manifest integrity mismatch")
                 end
+                haskey(commit, "artifact_integrity_digest") ||
+                    push!(contradictions, "committed artifact integrity digest is missing")
+                if haskey(commit, "artifact_integrity_digest")
+                    digest = bytes2hex(SHA.sha256(JSON.json(hashes)))
+                    String(commit["artifact_integrity_digest"]) == digest ||
+                        push!(contradictions, "committed artifact integrity digest mismatch")
+                end
                 for (relative, expected) in hashes
                     artifact = joinpath(stage_root, String(relative))
                     isfile(artifact) || push!(contradictions, "missing committed artifact: $relative")
@@ -688,6 +697,11 @@ function validate_committed_artifacts(stage_root::String)
                         push!(contradictions, "committed artifact hash mismatch: $relative")
                 end
             end
+        elseif committed
+            # This is the production path, so a new commit without an exact
+            # manifest must fail closed rather than silently downgrade to the
+            # legacy fixture behavior.
+            push!(contradictions, "committed iteration has no artifact hash manifest")
         end
     end
     committed || push!(contradictions, "missing or mismatched committed iteration manifest")
@@ -703,7 +717,6 @@ function validate_committed_artifacts(stage_root::String)
         status_by_id[identity] = String(get(row, "status", ""))
         score_by_id[identity] = Float64(get(row, "score", Inf))
         identity[1] == stage || push!(contradictions, "iter_metrics stage mismatch: $identity")
-        identity[2] == iteration || push!(contradictions, "iter_metrics iteration mismatch: $identity")
     end
     function check_entry(entry, label)
         entry isa AbstractDict || (push!(contradictions, "$label is not an object"); return nothing)
@@ -3758,6 +3771,12 @@ function run_stage(
     dim = sum(spec.length for spec in specs_stage)
     stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
     resume_state = load_stage_state(stage_root)
+    if resume_state !== nothing
+        committed_check = validate_committed_artifacts(stage_root)
+        committed_check["valid"] ||
+            throw(ArgumentError("committed stage artifacts failed validation: " *
+                                join(String.(committed_check["contradictions"]), "; ")))
+    end
     if resume_state !== nothing && haskey(resume_state, "rng_state")
         # Restore before reusable-state construction or unlock logic can
         # consume a different stream position.
@@ -4270,6 +4289,7 @@ function run_stage(
         push!(iter_log, Dict(
             "stage" => stage.name,
             "iteration" => iter,
+            "param_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
             "search_policy" => policy.name,
             "best_score" => best_score,
             "sigma" => state.sigma,
@@ -4282,6 +4302,8 @@ function run_stage(
             candidate_class=isempty(transfer_archive) ? "new_dimension" : "archive_transfer")
         safe_save_json(joinpath(stage_root, "stage_state.json"), Dict(
             "stage" => stage.name,
+            "iteration" => iter,
+            "param_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
             "search_policy" => policy.name,
             "fit_months" => active_months,
             "best_score" => best_score,
@@ -4297,7 +4319,12 @@ function run_stage(
         ); label="stage_state")
         iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
         mkpath(iter_root)
-        safe_save_json(joinpath(iter_root, "top_candidates.json"), safe_iteration_top_k(iteration_top_candidates, cfg.objective.top_k); label="iteration_top_candidates")
+        iteration_top_payload = safe_iteration_top_k(iteration_top_candidates, cfg.objective.top_k)
+        safe_save_json(joinpath(iter_root, "top_candidates.json"), iteration_top_payload; label="iteration_top_candidates")
+        # Keep a canonical stage-level copy for validators and fresh-process
+        # resume.  It is replaced only after the iteration has been fully
+        # evaluated and is covered by the commit hash manifest.
+        safe_save_json(joinpath(stage_root, "top_candidates.json"), iteration_top_payload; label="stage_top_candidates")
         archive_report = survivor_archive_update(
             survivor_archive, iteration_top_candidates;
             current_stage=stage.name, current_fit_months=active_months,
@@ -4316,16 +4343,27 @@ function run_stage(
         # This is the sole resume authority for an iteration.  It is written
         # last, after every cross-file artifact, and contains identity fields
         # so a stale manifest can never make another iteration look complete.
+        committed_artifacts = [
+            "stage_state.json", "iter_metrics.jsonl", "top_candidates.json",
+            "survivor_archive.json", "survivor_archive_summary.json",
+            "full_reusable_state.json", "archive_transfer_manifest.json",
+            joinpath("iter_$(iter)", "candidate_list.txt"),
+            joinpath("iter_$(iter)", "cma_sampling_state.json"),
+            joinpath("iter_$(iter)", "top_candidates.json"),
+        ]
+        artifact_hashes = Dict{String,Any}(
+            relative => bytes2hex(SHA.sha256(read(joinpath(stage_root, relative))))
+            for relative in committed_artifacts
+        )
+        artifact_digest = bytes2hex(SHA.sha256(JSON.json(artifact_hashes)))
         atomic_save_json(joinpath(iter_root, "iteration_commit.json"), Dict(
             "status" => "committed",
             "stage" => stage.name,
             "iteration" => iter,
-            "artifacts" => [
-                "candidate_list.txt", "top_candidates.json",
-                joinpath("..", "stage_state.json"),
-                joinpath("..", "full_reusable_state.json"),
-                joinpath("..", "iter_metrics.jsonl"),
-            ],
+            "artifact_key_set" => committed_artifacts,
+            "artifact_hashes" => artifact_hashes,
+            "artifact_hash_manifest" => artifact_digest,
+            "artifact_integrity_digest" => artifact_digest,
         ); label="iteration_commit")
         @info "Finished iteration" stage=stage.name iteration=iter best_score=best_score sigma=state.sigma top_candidates_written=length(iteration_top_candidates)
     end
@@ -4368,6 +4406,13 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
 
     for (stage_index, stage) in enumerate(cfg.stages)
         stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
+        if stage_index > 1
+            predecessor_root = joinpath(cfg.output_dir, "real_sims", cfg.stages[stage_index - 1].name)
+            predecessor_check = validate_committed_artifacts(predecessor_root)
+            predecessor_check["valid"] ||
+                throw(ArgumentError("predecessor stage artifacts failed validation: " *
+                                    join(String.(predecessor_check["contradictions"]), "; ")))
+        end
         resume_info = stage_resume_info(stage_root)
         resume_from = if resume_info === nothing
             0
