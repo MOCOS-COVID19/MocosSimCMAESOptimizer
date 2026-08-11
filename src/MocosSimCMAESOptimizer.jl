@@ -689,14 +689,15 @@ function load_immediate_predecessor_state(cfg::OptimizerConfig, stage::StageConf
         expected_fit_months=predecessor.fit_months,
         expected_manifest_path=joinpath(root, "archive_transfer_manifest.json"),
         stage_order=[s.name for s in cfg.stages])
-    archive_ids = [get(x, "candidate", nothing) for x in archive]
+    archive_ids = [String(get(x, "candidate", get(x, "id", ""))) for x in archive]
     prior_ids = get(prior_state, "archive_ids", nothing)
     reusable_ids = get(reusable, "archive_ids", nothing)
     selected_ids = get(reusable, "selected_archive_ids", nothing)
     prior_ids isa AbstractVector && reusable_ids isa AbstractVector &&
         selected_ids isa AbstractVector ||
         throw(ArgumentError("trusted predecessor admitted IDs missing"))
-    prior_ids == archive_ids && reusable_ids == archive_ids && selected_ids == archive_ids ||
+    string.(prior_ids) == archive_ids && string.(reusable_ids) == archive_ids &&
+        string.(selected_ids) == archive_ids ||
         throw(ArgumentError("trusted predecessor admitted IDs mismatch"))
     lineage = get(reusable, "archive_lineage", nothing)
     lineage isa AbstractDict || throw(ArgumentError("trusted predecessor archive lineage missing"))
@@ -821,10 +822,11 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
     identities = Tuple{String,Int,Int}[]
     status_by_id = Dict{Tuple{String,Int,Int},String}()
     score_by_id = Dict{Tuple{String,Int,Int},Float64}()
+    candidate_int(value) = value isa Integer ? Int(value) : parse(Int, string(value))
     for row in metrics
         row isa AbstractDict || (push!(contradictions, "non-object iter_metrics row"); continue)
         identity = (String(get(row, "stage", "")), Int(get(row, "iteration", 0)),
-            Int(get(row, "candidate", 0)))
+            candidate_int(get(row, "candidate", 0)))
         identity in identities && push!(contradictions, "duplicate iter_metrics identity: $identity")
         push!(identities, identity)
         status_by_id[identity] = String(get(row, "status", ""))
@@ -834,7 +836,7 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
     function check_entry(entry, label)
         entry isa AbstractDict || (push!(contradictions, "$label is not an object"); return nothing)
         identity = (String(get(entry, "stage", "")), Int(get(entry, "iteration", 0)),
-            Int(get(entry, "candidate", 0)))
+            candidate_int(get(entry, "candidate", 0)))
         identity in identities || push!(contradictions, "$label orphan identity: $identity")
         identity[1] == stage || push!(contradictions, "$label stage mismatch: $identity")
         identity[2] == iteration || push!(contradictions, "$label iteration mismatch: $identity")
@@ -864,7 +866,7 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
     admitted = get(reusable, "archive_ids", Any[])
     admitted isa AbstractVector || push!(contradictions, "reusable state archive_ids is not an array")
     for id in admitted
-        any(get(e, "candidate", 0) == id for e in archive) ||
+        any(string(get(e, "candidate", get(e, "id", ""))) == string(id) for e in archive) ||
             push!(contradictions, "reusable state references non-admitted archive id: $id")
     end
     counts = Dict("completed" => 0, "failed" => 0, "skipped" => 0, "pending" => 0)
@@ -878,9 +880,9 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
         haskey(stage_state, field) && Int(stage_state[field]) != counts[status] &&
             push!(contradictions, "stage_state $field mismatch")
     end
-    if best_id !== nothing && haskey(score_by_id, (stage, iteration, Int(best_id))) &&
+    if best_id !== nothing && haskey(score_by_id, (stage, iteration, candidate_int(best_id))) &&
        haskey(stage_state, "best_score") &&
-       Float64(stage_state["best_score"]) != score_by_id[(stage, iteration, Int(best_id))]
+       Float64(stage_state["best_score"]) != score_by_id[(stage, iteration, candidate_int(best_id))]
         push!(contradictions, "stage_state best_score mismatch")
     end
     haskey(reusable, "param_names") && reusable["param_names"] != names &&
@@ -1359,7 +1361,8 @@ function load_transfer_survivor_archive(output_dir::String, current_stage::Strin
         for x in values
             haskey(x, "candidate") || haskey(x, "id") || return reject("archive_id_missing")
             id = haskey(x, "candidate") ? x["candidate"] : x["id"]
-            id isa AbstractString && !isempty(id) || return reject("archive_id_invalid")
+            (id isa AbstractString || id isa Integer) || return reject("archive_id_invalid")
+            id isa AbstractString && isempty(id) && return reject("archive_id_invalid")
             push!(payload_ids, String(id))
         end
         payload_ids == admitted_ids || return reject("archive_payload_order_mismatch")
