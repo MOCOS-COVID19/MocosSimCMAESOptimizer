@@ -1368,10 +1368,23 @@ end
 
 function _materialize_terminal_artifact!(candidate_dir::String,
     status::AbstractDict)
-    # Never replace a scorer's richer metrics payload.  Missing terminal
-    # evidence is filled with a deterministic status/Inf record instead.
+    # The marker is the authoritative terminal source.  Reconcile the
+    # canonical fields even when a candidate directory already contains a
+    # stale status.json, while retaining unrelated diagnostic fields written
+    # by the scorer.
     status_path = joinpath(candidate_dir, "status.json")
-    isfile(status_path) || safe_save_json(status_path, status; label="candidate_status")
+    materialized = Dict{String,Any}()
+    if isfile(status_path)
+        try
+            existing = load_json(status_path)
+            existing isa AbstractDict && merge!(materialized, existing)
+        catch
+            # A malformed stale artifact must not prevent terminal
+            # reconciliation.  Replace it with the marker-derived record.
+        end
+    end
+    merge!(materialized, Dict{String,Any}(String(k) => v for (k, v) in status))
+    atomic_save_json(status_path, materialized; label="candidate_status")
     metrics_path = joinpath(candidate_dir, "metrics.json")
     if !isfile(metrics_path) && status["status"] != "pending"
         safe_save_json(metrics_path, Dict{String,Any}(

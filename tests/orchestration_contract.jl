@@ -48,6 +48,24 @@ end
     @test result["statuses"][1]["failure_class"] == "marker_conflict"
 end
 
+@testset "explicit terminal marker reconciles stale status artifact" begin
+    root = mktempdir()
+    cand = joinpath(root, "candidate")
+    mkpath(cand)
+    O.safe_save_json(joinpath(cand, "status.json"),
+        Dict("status" => "completed", "terminal" => true,
+             "failure_class" => nothing, "stale" => true))
+    touch(joinpath(cand, "failed.ok"))
+    result = O.normalized_iteration_result([cand]; min_completion_fraction=1.0)
+    @test result["failed"] == 1
+    @test result["done"] == 0
+    status = O.load_json(joinpath(cand, "status.json"))
+    @test status["status"] == "failed"
+    @test status["failure_class"] == "adapter_failure"
+    @test status["terminal"] == true
+    @test status["stale"] == true
+end
+
 @testset "normalized local accounting uses configured threshold" begin
     root = mktempdir()
     dirs = [joinpath(root, "cand_$(lpad(i, 2, '0'))") for i in 1:10]
