@@ -1846,13 +1846,11 @@ end
 function trajectory_metric_values(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int)
     trajs = read_daily_metric(daily_path, metric)
     trajs === nothing && return Float64[]
-    g = drop_missing(gt_series[1:min(end, days)])
-    g = rolling_sum(g, 7)
     vals = Float64[]
     for traj in trajs
-        s = Float64.(traj[1:min(end, days)])
-        s = rolling_sum(s, 7)
-        push!(vals, rmae_series(s, g))
+        g, s, _ = paired_observations(gt_series, traj, days)
+        isempty(g) && continue
+        push!(vals, rmae_series(rolling_sum(s, 7), rolling_sum(g, 7)))
     end
     return vals
 end
@@ -2187,14 +2185,13 @@ end
 function cumulative_error_distribution(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int)
     trajs = read_daily_metric(daily_path, metric)
     trajs === nothing && return Float64[]
-    g = drop_missing(gt_series[1:min(end, days)])
-    g = cumulative_series(g)
-    denom = max(abs(last(g)), 1.0)
     vals = Float64[]
     for traj in trajs
-        s = Float64.(traj[1:min(end, days)])
-        s = cumulative_series(s)
-        push!(vals, abs(last(s) - last(g)) / denom)
+        g, s, _ = paired_observations(gt_series, traj, days)
+        isempty(g) && continue
+        gc = cumulative_series(g)
+        sc = cumulative_series(s)
+        push!(vals, abs(last(sc) - last(gc)) / max(abs(last(gc)), 1.0))
     end
     return vals
 end
@@ -2388,7 +2385,9 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     gt = load_gt_series(cfg.external_sim.gt_dir)
     weekly_control = weekly_control_score(cfg, daily_path, gt, days)
     vector_likelihood = vector_likelihood_payload(daily_path, gt, days; family=cfg.posterior.likelihood)
-    metrics = Dict{String,Float64}()
+    # Validation carries structured diagnostics (window, retained indices,
+    # and per-metric scores), so keep the score manifest heterogeneous.
+    metrics = Dict{String,Any}()
     for (metric, gtvals) in gt
         isempty(gtvals) && continue
         metrics[metric] = per_trajectory_rmae(daily_path, metric, drop_missing(gtvals), days)
@@ -2411,7 +2410,9 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int, c
     gt = load_gt_series(cfg.external_sim.gt_dir)
     weekly_control = weekly_control_score(cfg, daily_path, gt, days)
     vector_likelihood = vector_likelihood_payload(daily_path, gt, days; family=cfg.posterior.likelihood)
-    metrics = Dict{String,Float64}()
+    # The validation window is a structured diagnostic, not a scalar metric.
+    # A heterogeneous payload prevents assigning it to a Float64-only dict.
+    metrics = Dict{String,Any}()
     for (metric, gtvals) in gt
         isempty(gtvals) && continue
         metrics[metric] = per_trajectory_rmae(daily_path, metric, gtvals, days)
