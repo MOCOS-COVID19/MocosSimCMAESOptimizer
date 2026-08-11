@@ -1407,7 +1407,8 @@ function materialize_terminal_candidate!(candidate_dir::String, terminal_status:
 end
 
 """Read terminal states without waiting or changing pending candidates."""
-function normalized_iteration_result(candidate_dirs::AbstractVector{<:AbstractString})
+function normalized_iteration_result(candidate_dirs::AbstractVector{<:AbstractString};
+    min_completion_fraction::Float64=0.9, iteration_truncated::Bool=false)
     done_count = 0
     failed_count = 0
     skipped_count = 0
@@ -1422,11 +1423,17 @@ function normalized_iteration_result(candidate_dirs::AbstractVector{<:AbstractSt
         status["status"] == "skipped" && (skipped_count += 1)
         status["status"] == "pending" && push!(pending, String(candidate_dir))
     end
+    target_done = max(1, ceil(Int, length(candidate_dirs) *
+        clamp(min_completion_fraction, 0.0, 1.0)))
     return Dict{String,Any}(
         "done" => done_count, "failed" => failed_count, "skipped" => skipped_count,
         "pending" => pending, "pending_count" => length(pending),
-        "statuses" => statuses, "threshold_reached" => false,
-        "iteration_truncated" => false,
+        "statuses" => statuses,
+        "threshold_reached" => done_count >= target_done,
+        # Skipped candidates are terminal, but they are evidence that the
+        # population was not fully accounted for.  Keep this identical for
+        # local and collected/Slurm-style collection.
+        "iteration_truncated" => iteration_truncated || skipped_count > 0,
     )
 end
 
@@ -3137,7 +3144,7 @@ function wait_for_iteration_outputs(list_file::String; poll::Float64=10.0,
                 "skipped" => skipped_count, "pending" => String[],
                 "pending_count" => 0, "statuses" => statuses,
                 "threshold_reached" => done_count >= target_done,
-                "iteration_truncated" => false,
+                "iteration_truncated" => skipped_count > 0,
             )
         end
 
@@ -3958,6 +3965,7 @@ function run_stage(
                 joinpath(iter_root, @sprintf("cand_%02d", candidate_id))
                 for candidate_id in 1:length(candidates)
             ]
+            local_iter_records = Any[]
             mkpath.(local_candidate_dirs)
             open(joinpath(iter_root, "candidate_list.txt"), "w") do io
                 foreach(d -> println(io, d), local_candidate_dirs)
@@ -3983,12 +3991,28 @@ function run_stage(
                     candidate_class=candidate_class, policy="reject")
                 transition_report = transition["report"]
                 candidate_cfg = transition["config"]
-                metrics = transition["status"] == "rejected" ?
+                existing_terminal = candidate_terminal_status(cand_dir)
+                # A caller-created skipped marker is authoritative.  In
+                # particular, local scoring must not turn an explicitly
+                # skipped candidate back into a completed one.
+                metrics = existing_terminal["status"] == "skipped" ?
+                    Dict{String,Any}("score" => Inf, "status" => "skipped",
+                                     "simulated" => "real_skipped",
+                                     "failure_class" => "iteration_truncated") :
+                    existing_terminal["status"] == "failed" ?
+                    Dict{String,Any}("score" => Inf, "status" => "failed",
+                                     "simulated" => "real_failed",
+                                     "failure_class" => get(existing_terminal, "failure_class", "adapter_failure")) :
+                    transition["status"] == "rejected" ?
                     Dict{String,Any}("score" => Inf, "status" => "failed",
                                      "simulated" => "transition_rejected",
                                      "failure_class" => "transition_policy_reject") :
                     score_candidate(candidate_cfg, cfg, days; workdir=cand_dir)
-                if transition["status"] == "rejected"
+                if existing_terminal["status"] == "skipped"
+                    _materialize_terminal_artifact!(cand_dir, existing_terminal)
+                elseif existing_terminal["status"] == "failed"
+                    _materialize_terminal_artifact!(cand_dir, existing_terminal)
+                elseif transition["status"] == "rejected"
                     materialize_terminal_candidate!(cand_dir, "failed";
                         failure_class="transition_policy_reject",
                         details=Dict("stage" => stage.name, "iteration" => iter,
@@ -4050,19 +4074,30 @@ function run_stage(
                     best_vector = copy(x)
                     best_candidate = deepcopy(candidate_cfg)
                 end
-                local_wait_result = normalized_iteration_result(local_candidate_dirs)
-                # Construct the normalized local result before writing metrics,
-                # matching the accounting schema used by the Slurm path.
-                append_jsonl(joinpath(stage_root, "iter_metrics.jsonl"), Dict(
+                push!(local_iter_records, Dict(
                     "stage" => stage.name, "iteration" => iter, "candidate" => ci,
                     "status" => get(metrics, "status", "unknown"),
                     "score" => score,
-                    "threshold_reached" => local_wait_result["threshold_reached"],
-                    "iteration_truncated" => local_wait_result["iteration_truncated"],
-                    "completed_count" => local_wait_result["done"],
-                    "failed_count" => local_wait_result["failed"],
-                    "pending_count" => local_wait_result["pending_count"],
+                    "threshold_reached" => false,
+                    "iteration_truncated" => false,
+                    "completed_count" => 0,
+                    "failed_count" => 0,
+                    "pending_count" => 0,
                 ))
+            end
+            # Account only after every local candidate has a terminal marker.
+            # This makes local threshold/truncation fields match the
+            # collected/Slurm normalized result rather than an early snapshot.
+            local_wait_result = normalized_iteration_result(local_candidate_dirs;
+                min_completion_fraction=cfg.objective.min_completion_fraction)
+            for record in local_iter_records
+                record["threshold_reached"] = local_wait_result["threshold_reached"]
+                record["iteration_truncated"] = local_wait_result["iteration_truncated"]
+                record["completed_count"] = local_wait_result["done"]
+                record["failed_count"] = local_wait_result["failed"]
+                record["skipped_count"] = local_wait_result["skipped"]
+                record["pending_count"] = local_wait_result["pending_count"]
+                append_jsonl(joinpath(stage_root, "iter_metrics.jsonl"), record)
             end
         end
         isempty(ranked) && error("No completed candidates available for stage $(stage.name) iteration $(iter). Increase max wait or completion fraction.")

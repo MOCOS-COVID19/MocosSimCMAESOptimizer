@@ -48,6 +48,22 @@ end
     @test result["statuses"][1]["failure_class"] == "marker_conflict"
 end
 
+@testset "normalized local accounting uses configured threshold" begin
+    root = mktempdir()
+    dirs = [joinpath(root, "cand_$(lpad(i, 2, '0'))") for i in 1:10]
+    mkpath.(dirs)
+    for d in dirs[1:9]
+        touch(joinpath(d, "done.ok"))
+    end
+    touch(joinpath(dirs[10], "skipped.ok"))
+    result = O.normalized_iteration_result(dirs; min_completion_fraction=0.9)
+    @test result["done"] == 9
+    @test result["skipped"] == 1
+    @test result["threshold_reached"] == true
+    @test result["iteration_truncated"] == true
+    @test O.load_json(joinpath(dirs[10], "status.json"))["status"] == "skipped"
+end
+
 @testset "resume requires committed artifacts" begin
     root = mktempdir()
     stage = joinpath(root, "stage")
