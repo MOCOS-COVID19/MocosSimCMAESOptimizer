@@ -1,10 +1,83 @@
 using Test
 using JSON
+using HDF5
+using SHA
 
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
 using MocosSimCMAESOptimizer
 
 const O = MocosSimCMAESOptimizer
+
+function write_model_fixture(path::String; population_rows=4, covimod_dim=3,
+                             contact_dim=covimod_dim, event_rows=2, missing_key=nothing)
+    h5open(path, "w") do f
+        missing_key == :population || write(f, "individuals_df", ones(Float64, population_rows, 2))
+        if missing_key != :covimod
+            write(f, "age_thresholds", collect(0.0:1.0:covimod_dim - 1))
+            write(f, "contact_mat", ones(Float64, contact_dim, contact_dim))
+            write(f, "uses_genders", false)
+        end
+        missing_key == :events || write(f, "events", ones(Int, event_rows))
+    end
+end
+
+function model_schema_fixture(; missing_key=nothing, bad_gt=false,
+                              stage_months=2, interval_times=[30, 60],
+                              interval_values=[0.2, 0.3], population_rows=4,
+                              covimod_dim=3, contact_dim=covimod_dim)
+    root = mktempdir()
+    cfgdir = joinpath(root, "config")
+    mkpath(cfgdir)
+    write_model_fixture(joinpath(cfgdir, "population.jld2");
+                        population_rows=population_rows, missing_key=missing_key)
+    write_model_fixture(joinpath(cfgdir, "covimod.jld2");
+                        covimod_dim=covimod_dim, contact_dim=contact_dim,
+                        missing_key=missing_key)
+    write_model_fixture(joinpath(cfgdir, "events.jld2");
+                        event_rows=2, missing_key=missing_key)
+    seed = Dict{String,Any}(
+        "population_path" => "population.jld2",
+        "transmission_probabilities" => Dict(
+            "age_coupling_data_path" => "covimod.jld2",
+            "constant" => 0.1, "household" => 0.1, "school" => 0.2,
+        ),
+        "initial_conditions" => Dict(
+            "immunization" => Dict("immunity_events" => "events.jld2"),
+        ),
+        "infection_modulation" => Dict("function" => "IntervalsModulations",
+            "params" => Dict("interval_times" => interval_times,
+                             "interval_values" => interval_values)),
+    )
+    seed_path = joinpath(cfgdir, "seed.json")
+    open(seed_path, "w") do io JSON.print(io, seed) end
+    gt = joinpath(cfgdir, "gt")
+    mkpath(gt)
+    if bad_gt
+        write(joinpath(gt, "daily.csv"), "date,observed\n1,1\n1,2\n")
+    else
+        write(joinpath(gt, "daily.csv"), "day,value\n1,1\n2,2\n")
+    end
+    julia = joinpath(cfgdir, "julia")
+    launcher = joinpath(cfgdir, "advanced_cli.jl")
+    write(julia, "#!/bin/sh\n"); chmod(julia, 0o755)
+    write(launcher, "# fixture\n")
+    mkpath(joinpath(cfgdir, "launcher"))
+    cfg = Dict{String,Any}(
+        "seed_config" => "seed.json", "output_dir" => "out",
+        "monthly_days" => 30,
+        "stages" => [Dict("name"=>"short", "fit_months"=>stage_months,
+                          "max_iterations"=>1, "population_size"=>1, "sigma"=>0.1)],
+        "scalar_bounds" => Dict("transmission_probabilities.school" => [0.0, 1.0]),
+        "temporal_bounds" => Dict("infection_modulation.params.interval_values" => [0.0, 1.0]),
+        "objective" => Dict("weights"=>Dict("daily_detections"=>1.0)),
+        "age_population_weights" => Dict("all"=>1.0),
+        "gt_dir" => "gt", "julia_bin" => "julia",
+        "project_dir" => "launcher", "advanced_cli" => "advanced_cli.jl",
+    )
+    path = joinpath(cfgdir, "config.json")
+    open(path, "w") do io JSON.print(io, cfg) end
+    return root, path, [joinpath(cfgdir, x) for x in ("population.jld2", "covimod.jld2", "events.jld2")]
+end
 
 @testset "configuration preflight is fail closed and path anchored" begin
     root = mktempdir()
@@ -16,13 +89,14 @@ const O = MocosSimCMAESOptimizer
             "population_path" => "population.jld2",
             "transmission_probabilities" => Dict(
                 "age_coupling_data_path" => "covimod.jld2",
+                "constant" => 0.1,
             ),
             "immunity_events_path" => "events.jld2",
         ))
     end
-    for name in ("population.jld2", "covimod.jld2", "events.jld2")
-        write(joinpath(cfgdir, name), "fixture")
-    end
+    write_model_fixture(joinpath(cfgdir, "population.jld2"))
+    write_model_fixture(joinpath(cfgdir, "covimod.jld2"))
+    write_model_fixture(joinpath(cfgdir, "events.jld2"))
     gt = joinpath(cfgdir, "gt")
     mkpath(gt)
     write(joinpath(gt, "daily_detections.csv"), "day,value\n1,1\n2,2\n")
@@ -39,7 +113,7 @@ const O = MocosSimCMAESOptimizer
         "monthly_days" => 30, "temporal_parameterization" => "monthly",
         "stages" => [Dict("name"=>"short", "fit_months"=>1,
                           "max_iterations"=>1, "population_size"=>1, "sigma"=>0.1)],
-        "scalar_bounds" => Dict("x" => [0.0, 1.0]),
+        "scalar_bounds" => Dict("transmission_probabilities.constant" => [0.0, 1.0]),
         "temporal_bounds" => Dict{String,Any}(),
         "objective" => Dict("weights"=>Dict("daily_detections"=>1.0),
                             "top_k"=>1, "min_completion_fraction"=>0.5,
@@ -66,6 +140,39 @@ const O = MocosSimCMAESOptimizer
     @test err isa ArgumentError
     @test occursin("stages[1].population_size", sprint(showerror, err))
     @test !isdir(joinpath(cfgdir, "out"))
+end
+
+@testset "model and ground-truth schemas are validated before launch" begin
+    root, path, sources = model_schema_fixture()
+    hashes = [bytes2hex(open(sha256, p)) for p in sources]
+    manifest = O.preflight_config(path; readiness=true)
+    @test manifest["valid"]
+    @test manifest["model_inputs"]["population"]["required_keys"] == ["individuals_df"]
+    @test manifest["model_inputs"]["covimod"]["contact_matrix_shape"] == [3, 3]
+    @test manifest["model_inputs"]["immunity_events"]["event_count"] == 2
+    @test manifest["ground_truth"]["daily.csv"]["day_policy"] == "positive_unique_strictly_increasing"
+    @test [bytes2hex(open(sha256, p)) for p in sources] == hashes
+    @test !isdir(joinpath(dirname(path), "out"))
+
+    _, missing_path, _ = model_schema_fixture(missing_key=:covimod)
+    err = try O.preflight_config(missing_path) catch e; e end
+    @test err isa ArgumentError
+    @test occursin("covimod", lowercase(sprint(showerror, err)))
+
+    _, dimension_path, _ = model_schema_fixture(covimod_dim=4, contact_dim=3)
+    err = try O.preflight_config(dimension_path) catch e; e end
+    @test err isa ArgumentError
+    @test occursin("dimension", lowercase(sprint(showerror, err)))
+
+    _, temporal_path, _ = model_schema_fixture(interval_values=[0.2])
+    err = try O.preflight_config(temporal_path) catch e; e end
+    @test err isa ArgumentError
+    @test occursin("interval", lowercase(sprint(showerror, err)))
+
+    _, gt_path, _ = model_schema_fixture(bad_gt=true)
+    err = try O.preflight_config(gt_path) catch e; e end
+    @test err isa ArgumentError
+    @test occursin("header", lowercase(sprint(showerror, err)))
 end
 
 @testset "adapter failures are explicit and roots are isolated" begin
