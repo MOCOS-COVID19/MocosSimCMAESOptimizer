@@ -20,7 +20,8 @@ export main, run_optimizer, run_long_horizon, run_nuts_from_archive,
        run_nuts_from_stage, posterior_reusable_state, safe_save_json,
        survivor_archive_update, archive_quality_gate, load_transfer_survivor_archive,
        persist_archive_transfer_manifest, preflight_config, create_candidate_root,
-       adapter_failure
+       adapter_failure, candidate_terminal_status, wait_for_iteration_outputs,
+       stage_resume_info
 
 struct ExternalSimConfig
     gt_dir::String
@@ -1324,6 +1325,63 @@ function enforce_posterior_reusable_state(
                             "terminal_evidence" => nothing)
 end
 
+"""
+    candidate_terminal_status(candidate_dir)
+
+Return one conservative terminal classification for a candidate directory.
+Conflicting markers are terminal failures, never successful work.  This is
+shared by local and collected execution so ranking cannot infer completion
+from directory existence or from a finite-looking artifact alone.
+"""
+function candidate_terminal_status(candidate_dir::String)
+    done = isfile(joinpath(candidate_dir, "done.ok"))
+    failed = isfile(joinpath(candidate_dir, "failed.ok"))
+    skipped = isfile(joinpath(candidate_dir, "skipped.ok"))
+    markers = count(identity, (done, failed, skipped))
+    if markers > 1
+        return Dict{String,Any}("status" => "failed",
+            "failure_class" => "marker_conflict", "terminal" => true,
+            "markers" => Dict("done" => done, "failed" => failed, "skipped" => skipped))
+    elseif failed
+        return Dict{String,Any}("status" => "failed",
+            "failure_class" => "adapter_failure", "terminal" => true)
+    elseif skipped
+        return Dict{String,Any}("status" => "skipped",
+            "failure_class" => "iteration_truncated", "terminal" => true)
+    elseif done
+        return Dict{String,Any}("status" => "completed",
+            "failure_class" => nothing, "terminal" => true)
+    end
+    return Dict{String,Any}("status" => "pending",
+        "failure_class" => "pending", "terminal" => false)
+end
+
+function _write_terminal_marker!(candidate_dir::String, status::String)
+    status in ("completed", "failed", "skipped") || throw(ArgumentError("invalid terminal status"))
+    mkpath(candidate_dir)
+    marker = joinpath(candidate_dir, status == "completed" ? "done.ok" :
+        status == "failed" ? "failed.ok" : "skipped.ok")
+    isfile(marker) || touch(marker)
+    return marker
+end
+
+function _materialize_terminal_artifact!(candidate_dir::String,
+    status::AbstractDict)
+    # Never replace a scorer's richer metrics payload.  Missing terminal
+    # evidence is filled with a deterministic status/Inf record instead.
+    status_path = joinpath(candidate_dir, "status.json")
+    isfile(status_path) || safe_save_json(status_path, status; label="candidate_status")
+    metrics_path = joinpath(candidate_dir, "metrics.json")
+    if !isfile(metrics_path) && status["status"] != "pending"
+        safe_save_json(metrics_path, Dict{String,Any}(
+            "score" => Inf, "status" => status["status"],
+            "failure_class" => get(status, "failure_class", nothing),
+            "ranking_eligible" => false,
+        ); label="candidate_metrics")
+    end
+    return status
+end
+
 function stage_resume_info(stage_root::String)
     iter_infos = Vector{Tuple{Int,String,Bool}}()
     isdir(stage_root) || return nothing
@@ -1335,12 +1393,17 @@ function stage_resume_info(stage_root::String)
         m === nothing && continue
         iter_idx = parse(Int, m.captures[1])
         top_candidates_file = joinpath(iter_dir, "top_candidates.json")
-        has_any_candidate_dirs = any(startswith(name, "cand_") for name in readdir(iter_dir))
-        completed = isfile(top_candidates_file) || has_any_candidate_dirs
+        # Candidate directories and configs are recoverable work, not proof of
+        # a committed iteration.  A committed iteration has all cross-file
+        # state needed to resume without replaying CMA updates.
+        committed = isfile(top_candidates_file) &&
+            isfile(joinpath(stage_root, "stage_state.json")) &&
+            isfile(joinpath(stage_root, "full_reusable_state.json")) &&
+            isfile(joinpath(stage_root, "iter_metrics.jsonl"))
+        completed = committed
         isfile(cand) && push!(iter_infos, (iter_idx, cand, completed))
     end
     isempty(iter_infos) && return nothing
-    completed_iters = [info for info in iter_infos if info[3]]
     function max_iter_info(items)
         best = items[1]
         for item in items[2:end]
@@ -1350,13 +1413,17 @@ function stage_resume_info(stage_root::String)
         end
         return best
     end
-    chosen = isempty(completed_iters) ? max_iter_info(iter_infos) : max_iter_info(completed_iters)
+    completed_iters = [info for info in iter_infos if info[3]]
+    # Always inspect the newest iteration.  A newer partial iteration must
+    # not be hidden by an older committed one during resume.
+    chosen = max_iter_info(iter_infos)
     return Dict(
         "last_iter" => chosen[1],
         "last_iter_file" => chosen[2],
         "iteration_completed" => chosen[3],
         "found_iterations" => sort([info[1] for info in iter_infos]),
         "completed_iterations" => sort([info[1] for info in completed_iters]),
+        "resume_iteration" => chosen[3] ? chosen[1] + 1 : chosen[1],
     )
 end
 
@@ -2975,35 +3042,40 @@ function slurm_array_is_running(jobid::String)
     end
 end
 
-function wait_for_iteration_outputs(list_file::String; poll::Float64=10.0, min_completion_fraction::Float64=1.0, finish_iter_delay::Int=30)
-    cand_dirs = [strip(x) for x in readlines(list_file) if !isempty(strip(x))]
+function wait_for_iteration_outputs(list_file::String; poll::Float64=10.0,
+    min_completion_fraction::Float64=0.9, finish_iter_delay::Int=30,
+    max_wait::Float64=Inf)
+    cand_dirs = [String(strip(x)) for x in readlines(list_file) if !isempty(strip(x))]
     target_done = max(1, ceil(Int, length(cand_dirs) * clamp(min_completion_fraction, 0.0, 1.0)))
     threshold_reached_at = nothing
+    started_at = time()
     while true
         done_count = 0
         failed_count = 0
+        skipped_count = 0
         pending = String[]
+        statuses = Any[]
         for d in cand_dirs
-            done_ok = isfile(joinpath(d, "done.ok"))
-            failed_ok = isfile(joinpath(d, "failed.ok"))
-            skipped_ok = isfile(joinpath(d, "skipped.ok"))
-            if done_ok
+            status = candidate_terminal_status(d)
+            status["status"] != "pending" && _materialize_terminal_artifact!(d, status)
+            push!(statuses, merge(status, Dict("candidate_dir" => d)))
+            if status["status"] == "completed"
                 done_count += 1
-            elseif failed_ok
+            elseif status["status"] == "failed"
                 failed_count += 1
-            elseif skipped_ok
-                failed_count += 1
+            elseif status["status"] == "skipped"
+                skipped_count += 1
             else
                 push!(pending, d)
             end
         end
 
-        if done_count + failed_count == length(cand_dirs)
+        if isempty(pending)
             return Dict(
                 "done" => done_count,
                 "failed" => failed_count,
-                "pending" => pending,
-                "pending_count" => length(pending),
+                "skipped" => skipped_count, "pending" => String[],
+                "pending_count" => 0, "statuses" => statuses,
                 "threshold_reached" => done_count >= target_done,
                 "iteration_truncated" => false,
             )
@@ -3013,48 +3085,39 @@ function wait_for_iteration_outputs(list_file::String; poll::Float64=10.0, min_c
             if threshold_reached_at === nothing
                 threshold_reached_at = time()
             end
-            if done_count + failed_count == length(cand_dirs)
-                return Dict(
-                    "done" => done_count,
-                    "failed" => failed_count,
-                    "pending" => pending,
-                    "pending_count" => length(pending),
-                    "threshold_reached" => true,
-                    "iteration_truncated" => false,
-                )
-            end
             if (time() - threshold_reached_at) >= finish_iter_delay
                 for d in pending
-                    skipped_ok = joinpath(d, "skipped.ok")
-                    isfile(skipped_ok) || touch(skipped_ok)
+                    _write_terminal_marker!(d, "skipped")
                 end
-                return Dict(
-                    "done" => done_count,
-                    "failed" => failed_count,
-                    "pending" => pending,
-                    "pending_count" => length(pending),
-                    "threshold_reached" => true,
-                    "iteration_truncated" => !isempty(pending),
-                )
+                return wait_for_iteration_outputs(list_file; poll=poll,
+                    min_completion_fraction=min_completion_fraction,
+                    finish_iter_delay=finish_iter_delay, max_wait=0.0)
             end
+        end
+
+        if (time() - started_at) >= max_wait
+            for d in pending
+                _write_terminal_marker!(d, "skipped")
+            end
+            final = wait_for_iteration_outputs(list_file; poll=poll,
+                min_completion_fraction=min_completion_fraction,
+                finish_iter_delay=finish_iter_delay, max_wait=0.0)
+            final["iteration_truncated"] = true
+            return final
         end
 
         if threshold_reached_at !== nothing && finish_iter_delay <= 0
             for d in pending
-                skipped_ok = joinpath(d, "skipped.ok")
-                isfile(skipped_ok) || touch(skipped_ok)
+                _write_terminal_marker!(d, "skipped")
             end
-            return Dict(
-                "done" => done_count,
-                "failed" => failed_count,
-                "pending" => pending,
-                "pending_count" => length(pending),
-                "threshold_reached" => true,
-                "iteration_truncated" => !isempty(pending),
-            )
+            final = wait_for_iteration_outputs(list_file; poll=poll,
+                min_completion_fraction=min_completion_fraction,
+                finish_iter_delay=finish_iter_delay, max_wait=0.0)
+            final["iteration_truncated"] = true
+            return final
         end
 
-        sleep(poll)
+        sleep(max(poll, 0.0))
     end
 end
 
@@ -3980,7 +4043,16 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
     for (stage_index, stage) in enumerate(cfg.stages)
         stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
         resume_info = stage_resume_info(stage_root)
-        resume_from = resume_info === nothing ? 0 : Int(resume_info["last_iter"])
+        resume_from = if resume_info === nothing
+            0
+        elseif Bool(get(resume_info, "iteration_completed", false))
+            Int(resume_info["last_iter"])
+        else
+            # An existing candidate directory is recoverable work, not a
+            # committed iteration. Re-enter that iteration rather than
+            # silently advancing past nonterminal candidates.
+            max(Int(get(resume_info, "resume_iteration", 1)) - 1, 0)
+        end
         if resume_info !== nothing
             @info "Resuming stage from artifacts" stage=stage.name resume_from=resume_from
         end
