@@ -174,3 +174,103 @@ end
         @test payload["effective_metric_manifest"]["weekly_control"]["weight"] == 0.0
     end
 end
+
+@testset "runtime GT loader isolates malformed optional files" begin
+    mktempdir() do root
+        gt_dir = joinpath(root, "gt")
+        mkpath(gt_dir)
+        for (name, values) in (
+            ("daily_age_total_detections.csv", [1.0, 2.0]),
+            ("daily_hospitalizations.csv", [1.0, 2.0]),
+            ("daily_age_total_deaths.csv", [1.0, 2.0]),
+            ("sax-scholars-infections-normalized.csv", [1.0, 2.0]),
+        )
+            open(joinpath(gt_dir, name), "w") do io
+                println(io, "day,value")
+                for (day, value) in enumerate(values)
+                    println(io, "$day,$value")
+                end
+            end
+        end
+        optional = joinpath(gt_dir, "daily_age_00_04_detections.csv")
+        write(optional, "day,value\n1,not-a-number\n")
+
+        gt = O.load_gt_series(gt_dir)
+        @test haskey(gt, "daily_age_00_04_detections")
+        @test isempty(gt["daily_age_00_04_detections"])
+        @test gt["daily_detections"] == [1.0, 2.0]
+    end
+end
+
+@testset "runtime scoring handles optional and required GT parse failures" begin
+    mktempdir() do root
+        gt_dir = joinpath(root, "gt")
+        mkpath(gt_dir)
+        for name in ("daily_age_total_detections.csv", "daily_hospitalizations.csv",
+                     "daily_age_total_deaths.csv",
+                     "sax-scholars-infections-normalized.csv")
+            write(joinpath(gt_dir, name), "day,value\n1,1\n2,2\n")
+        end
+        write(joinpath(gt_dir, "daily_age_00_04_detections.csv"),
+              "day,value\n1,not-a-number\n")
+        daily = joinpath(root, "daily.h5")
+        h5open(daily, "w") do h5
+            grp = create_group(h5, "trajectory_1")
+            for metric in ("daily_detections", "daily_hospitalizations",
+                           "daily_deaths", "daily_age_total_detections")
+                write(grp, metric, [1.0, 2.0])
+            end
+        end
+        objective = O.ObjectiveConfig(
+            Dict{String,Float64}("daily_detections" => 1.0,
+                                 "daily_deaths" => 1.0,
+                                 "weekly_control" => 0.0),
+            1, 1.0, 1, "baseline", 0.0, 0.0)
+        posterior = O.PosteriorConfig(false, "diagonal_gaussian_weekly", 1, 1, 1,
+            0.05, 1.0, 1.0, 1.0, 1.0, 0.0)
+        ext = O.ExternalSimConfig(gt_dir, "julia", root,
+                                  joinpath(root, "unused.jl"), false)
+        cfg = O.OptimizerConfig("seed", root, 30, O.StageConfig[],
+            Dict{String,Tuple{Float64,Float64}}(),
+            Dict{String,Tuple{Float64,Float64}}(),
+            Dict{String,Dict{String,Any}}(), "monthly",
+            Dict{String,Float64}(), Dict{String,Any}(), objective, ext,
+            Dict{String,Vector{String}}(), nothing, posterior)
+
+        score, payload = O.score_from_daily(cfg, daily, 2)
+        @test isfinite(score)
+        @test !haskey(payload, "daily_age_00_04_detections")
+
+        # The adapter seam is exercised with a copier, not advanced_cli or a
+        # real simulation.  Its output is the same deterministic fixture.
+        fake_julia = joinpath(root, "fake_julia.sh")
+        # Use a shell shim with the source path embedded so
+        # score_with_real_sim receives the fixture output path it requests.
+        write(fake_julia, "#!/bin/sh\nout=\"\"\nprev=\"\"\nfor i in \"\$@\"; do\n" *
+            "  if [ \"\$prev\" = \"--output-daily\" ]; then out=\"\$i\"; fi\n" *
+            "  prev=\"\$i\"\ndone\ncp " * daily * " \"\$out\"\n")
+        chmod(fake_julia, 0o755)
+        cfg = O.OptimizerConfig(cfg.seed_config, cfg.output_dir, cfg.monthly_days,
+            cfg.stages, cfg.scalar_bounds, cfg.temporal_bounds,
+            cfg.scalar_preprocessing, cfg.temporal_parameterization,
+            cfg.age_population_weights, cfg.validation, cfg.objective,
+            O.ExternalSimConfig(gt_dir, fake_julia, root,
+                                joinpath(root, "fixture-advanced-cli.jl"), false),
+            cfg.stage_freeze, cfg.initial_state, cfg.posterior)
+        real_score, real_payload = O.score_with_real_sim(
+            cfg, Dict{String,Any}(), 2; workdir=joinpath(root, "real_run"))
+        @test isfinite(real_score)
+        @test !haskey(real_payload, "daily_age_00_04_detections")
+
+        write(joinpath(gt_dir, "daily_age_total_deaths.csv"),
+              "day,value\n1,not-a-number\n")
+        err = try
+            O.score_with_real_sim(cfg, Dict{String,Any}(), 2; workdir=joinpath(root, "run"))
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("daily_age_total_deaths.csv invalid value", sprint(showerror, err))
+        @test !isdir(joinpath(root, "run"))
+    end
+end

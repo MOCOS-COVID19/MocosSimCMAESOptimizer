@@ -1851,8 +1851,21 @@ function load_gt_series(gt_dir::String)
     function load_optional(name)
         path = joinpath(gt_dir, name)
         isfile(path) || return Float64[]
-        return load_csv(name)
+        # Optional files are already represented by the preflight manifest.
+        # Runtime scoring must nevertheless be safe when a caller uses a
+        # config loaded before that manifest was written, or when the file
+        # changes between preflight and scoring.  An invalid optional source
+        # is omitted rather than escaping a parser exception into ranking.
+        try
+            return load_csv(name)
+        catch err
+            @warn "Ignoring malformed optional ground-truth series" path err
+            return Float64[]
+        end
     end
+    # Required files retain fail-closed parser behavior.  Missing files keep
+    # the historical empty-series representation, which the scoring layer
+    # converts to its deterministic Inf/no-data result.
     return Dict(
         "daily_detections" => load_csv("daily_age_total_detections.csv"),
         "daily_hospitalizations" => load_csv("daily_hospitalizations.csv"),
@@ -2705,9 +2718,13 @@ function objective_score_legacy(
 end
 
 function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, days::Int; workdir::String)
+    cfg.external_sim === nothing && throw(ArgumentError("External simulation config not provided"))
+    # Parse required GT before launching the adapter.  This keeps malformed
+    # required inputs fail-closed and prevents a candidate run from masking a
+    # deterministic configuration/data error.
+    gt = load_gt_series(cfg.external_sim.gt_dir)
     sim_ok, daily_path = run_external_sim(cfg, candidate, days; workdir=workdir)
     sim_ok || return Inf, Dict("sim_failed" => true)
-    gt = load_gt_series(cfg.external_sim.gt_dir)
     weekly_control = weekly_control_score(cfg, daily_path, gt, days)
     vector_likelihood = vector_likelihood_payload(daily_path, gt, days; family=cfg.posterior.likelihood)
     # Validation carries structured diagnostics (window, retained indices,
