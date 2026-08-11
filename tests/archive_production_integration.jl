@@ -89,3 +89,34 @@ end
         predecessor_stage="short", expected_fit_months=3,
         expected_manifest_path=manifest_path))
 end
+
+@testset "archive transfer rejects non-predecessor and malformed manifests without throwing" begin
+    root = mktempdir()
+    stage = joinpath(root, "short")
+    mkpath(stage)
+    values = [entry("a", 1.0), entry("b", 1.01)]
+    archive_path = joinpath(stage, "survivor_archive.json")
+    O.safe_save_json(archive_path, values)
+    manifest_path = O.persist_archive_transfer_manifest(stage, values;
+        fit_months=3, stage="short")
+
+    # The authoritative order makes short the only predecessor of medium.
+    @test O.load_transfer_survivor_archive(root, "medium";
+        stage_order=["short", "medium", "long"], expected_fit_months=3) == values
+    @test isempty(O.load_transfer_survivor_archive(root, "long";
+        stage_order=["short", "medium", "long"], expected_fit_months=3))
+
+    manifest = JSON.parsefile(manifest_path)
+    for (field, bad) in [
+        ("archive_count", "not-a-number"),
+        ("horizon", nothing),
+        ("admitted_ids", ["a"]),
+        ("admitted_order", ["a", "b", "extra"]),
+    ]
+        corrupted = copy(manifest)
+        corrupted[field] = bad
+        O.safe_save_json(manifest_path, corrupted)
+        @test isempty(O.load_transfer_survivor_archive(root, "medium";
+            stage_order=["short", "medium", "long"], expected_fit_months=3))
+    end
+end

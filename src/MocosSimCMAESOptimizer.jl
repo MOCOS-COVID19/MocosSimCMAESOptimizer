@@ -933,39 +933,90 @@ function load_transfer_survivor_archive(output_dir::String, current_stage::Strin
                                         predecessor_stage::Union{Nothing,String}=nothing,
                                         expected_fit_months::Union{Nothing,Int}=nothing,
                                         expected_manifest_path::Union{Nothing,String}=nothing,
-                                        expected_archive_id::Union{Nothing,String}=nothing)
-    # Only the immediate, canonical predecessor is trusted.  Searching all
-    # sibling stages can silently mix incompatible horizons and provenance.
-    predecessor_stage === nothing && return Any[]
-    stage_root = joinpath(output_dir, predecessor_stage)
-    path = joinpath(stage_root, "survivor_archive.json")
-    isfile(path) || return Any[]
-    manifest_path = joinpath(stage_root, "archive_transfer_manifest.json")
-    isfile(manifest_path) || return Any[]
-    expected_manifest_path !== nothing &&
-        abspath(expected_manifest_path) != abspath(manifest_path) && return Any[]
-    manifest = try load_json(manifest_path) catch; return Any[] end
-    String(get(manifest, "schema_version", "")) == "archive-transfer-v2" || return Any[]
-    String(get(manifest, "canonical_archive_path", "")) == abspath(path) || return Any[]
-    String(get(manifest, "source_stage", "")) == String(predecessor_stage) || return Any[]
-    expected_fit_months !== nothing && (
-        Int(get(manifest, "source_fit_months", -1)) != expected_fit_months ||
-        Int(get(manifest, "horizon", -1)) != expected_fit_months) && return Any[]
-    values = try load_json(path) catch; Any[] end
-    values isa AbstractVector || return Any[]
-    ids = [string(get(x, "candidate", get(x, "id", ""))) for x in values if x isa AbstractDict]
-    ids == String.(get(manifest, "admitted_order", Any[])) || return Any[]
-    ids == String.(get(manifest, "admitted_ids", Any[])) || return Any[]
-    Int(get(manifest, "archive_count", -1)) == length(values) || return Any[]
-    payload_hash = _archive_payload_hash(values)
-    String(get(manifest, "archive_hash", "")) == payload_hash || return Any[]
-    archive_id = string(get(manifest, "source_stage", ""), ":",
-        get(manifest, "horizon", "unknown"), ":", payload_hash)
-    String(get(manifest, "archive_id", "")) == archive_id || return Any[]
-    expected_archive_id !== nothing && String(expected_archive_id) != archive_id && return Any[]
-    all(_archive_rejection_reason(x; current_stage=predecessor_stage,
-        current_fit_months=expected_fit_months) === nothing for x in values) || return Any[]
-    return deepcopy(values)
+                                        expected_archive_id::Union{Nothing,String}=nothing,
+                                        stage_order=nothing)
+    # This is an untrusted file boundary.  Every conversion and consistency
+    # check is deliberately inside one rejection boundary: malformed JSON
+    # must never escape as a MethodError/ArgumentError/TypeError.
+    try
+        source_stage = if stage_order === nothing
+            predecessor_stage === nothing && return Any[]
+            String(predecessor_stage)
+        else
+            order = collect(stage_order)
+            all(x -> x isa AbstractString, order) || return Any[]
+            names = String.(order)
+            length(unique(names)) == length(names) || return Any[]
+            current_stage in names || return Any[]
+            i = findfirst(==(current_stage), names)
+            i === nothing || i <= 1 ? nothing : names[i - 1]
+        end
+        source_stage === nothing && return Any[]
+        predecessor_stage !== nothing && String(predecessor_stage) != source_stage && return Any[]
+        # Only the immediate, canonical predecessor is trusted.  Searching
+        # sibling stages can silently mix incompatible horizons/provenance.
+        stage_root = joinpath(output_dir, source_stage)
+        path = joinpath(stage_root, "survivor_archive.json")
+        isfile(path) || return Any[]
+        manifest_path = joinpath(stage_root, "archive_transfer_manifest.json")
+        isfile(manifest_path) || return Any[]
+        expected_manifest_path !== nothing &&
+            abspath(expected_manifest_path) != abspath(manifest_path) && return Any[]
+        manifest = load_json(manifest_path)
+        manifest isa AbstractDict || return Any[]
+
+        required = ("schema_version", "canonical_archive_path", "source_stage",
+            "source_fit_months", "horizon", "archive_id", "archive_hash",
+            "admitted_ids", "admitted_order", "archive_count")
+        all(haskey(manifest, key) for key in required) || return Any[]
+        manifest["schema_version"] isa AbstractString || return Any[]
+        manifest["canonical_archive_path"] isa AbstractString || return Any[]
+        manifest["source_stage"] isa AbstractString || return Any[]
+        manifest["archive_id"] isa AbstractString || return Any[]
+        manifest["archive_hash"] isa AbstractString || return Any[]
+        manifest["source_stage"] == source_stage || return Any[]
+        manifest["canonical_archive_path"] == abspath(path) || return Any[]
+        # JSON booleans are not valid integer counts/horizons.
+        isint(x) = x isa Integer && !(x isa Bool)
+        isint(manifest["source_fit_months"]) || return Any[]
+        isint(manifest["horizon"]) || return Any[]
+        isint(manifest["archive_count"]) || return Any[]
+        manifest["source_fit_months"] == manifest["horizon"] || return Any[]
+        expected_fit_months !== nothing &&
+            manifest["source_fit_months"] != expected_fit_months && return Any[]
+        manifest["admitted_ids"] isa AbstractVector || return Any[]
+        manifest["admitted_order"] isa AbstractVector || return Any[]
+        all(x -> x isa AbstractString && !isempty(x), manifest["admitted_ids"]) || return Any[]
+        all(x -> x isa AbstractString && !isempty(x), manifest["admitted_order"]) || return Any[]
+        admitted_ids = String.(manifest["admitted_ids"])
+        admitted_order = String.(manifest["admitted_order"])
+        admitted_ids == admitted_order || return Any[]
+        length(unique(admitted_ids)) == length(admitted_ids) || return Any[]
+
+        values = load_json(path)
+        values isa AbstractVector || return Any[]
+        all(x -> x isa AbstractDict, values) || return Any[]
+        payload_ids = String[]
+        for x in values
+            haskey(x, "candidate") || haskey(x, "id") || return Any[]
+            id = haskey(x, "candidate") ? x["candidate"] : x["id"]
+            id isa AbstractString && !isempty(id) || return Any[]
+            push!(payload_ids, String(id))
+        end
+        payload_ids == admitted_ids || return Any[]
+        manifest["archive_count"] == length(admitted_ids) || return Any[]
+        length(values) == manifest["archive_count"] || return Any[]
+        payload_hash = _archive_payload_hash(values)
+        manifest["archive_hash"] == payload_hash || return Any[]
+        archive_id = string(source_stage, ":", manifest["horizon"], ":", payload_hash)
+        manifest["archive_id"] == archive_id || return Any[]
+        expected_archive_id !== nothing && expected_archive_id != archive_id && return Any[]
+        all(_archive_rejection_reason(x; current_stage=source_stage,
+            current_fit_months=expected_fit_months) === nothing for x in values) || return Any[]
+        return deepcopy(values)
+    catch
+        return Any[]
+    end
 end
 
 function archive_entry_config(archive)
@@ -3951,18 +4002,21 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
                 end
             end
         end
-        canonical_archive_path = joinpath(stage_root, "survivor_archive.json")
-        predecessor_manifest_path = joinpath(stage_root, "archive_transfer_manifest.json")
-        predecessor_archive = load_transfer_survivor_archive(
-            cfg.output_dir, stage.name;
-            predecessor_stage=stage.name,
-            expected_fit_months=stage.fit_months,
-            expected_manifest_path=predecessor_manifest_path,
-        )
-        archive_seed = archive_entry_config(predecessor_archive)
-        # The admitted predecessor archive owns the trusted prefix.  The
-        # scalar best remains reporting-only and cannot become the next seed.
-        archive_seed !== nothing && (current_seed = archive_seed)
+        if stage_index < length(cfg.stages)
+            next_stage = cfg.stages[stage_index + 1]
+            predecessor_manifest_path = joinpath(stage_root, "archive_transfer_manifest.json")
+            predecessor_archive = load_transfer_survivor_archive(
+                joinpath(cfg.output_dir, "real_sims"), next_stage.name;
+                predecessor_stage=stage.name,
+                expected_fit_months=stage.fit_months,
+                expected_manifest_path=predecessor_manifest_path,
+                stage_order=[s.name for s in cfg.stages],
+            )
+            archive_seed = archive_entry_config(predecessor_archive)
+            # The admitted predecessor archive owns the trusted prefix.  The
+            # scalar best remains reporting-only and cannot become the next seed.
+            archive_seed !== nothing && (current_seed = archive_seed)
+        end
         previous_specs = stage_specs(current_seed, specs, cfg, stage)
         update_stage_freeze!(cfg, stage, result["history"], specs)
         push!(stage_outputs, Dict(
