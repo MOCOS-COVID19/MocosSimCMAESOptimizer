@@ -186,3 +186,38 @@ end
     @test first_root != second_root
     @test isdir(first_root) && isdir(second_root)
 end
+
+@testset "configuration scrutiny gaps are closed" begin
+    root, path, _ = model_schema_fixture(stage_months=2, interval_times=[30, 60])
+    cfg = O.load_json(path)
+    push!(cfg["stages"], Dict("name"=>"long", "fit_months"=>3,
+                              "max_iterations"=>1, "population_size"=>1, "sigma"=>0.1))
+    open(path, "w") do io JSON.print(io, cfg) end
+    err = try O.preflight_config(path) catch e; e end
+    @test err isa ArgumentError
+    @test occursin("requested horizon 90", sprint(showerror, err))
+
+    # Runtime config must retain normalized nested paths without rewriting the
+    # source seed file.
+    root2, path2, _ = model_schema_fixture()
+    runtime = O.load_config(path2)
+    @test hasproperty(runtime, :runtime_seed)
+    @test runtime.runtime_seed["population_path"] ==
+          joinpath(dirname(runtime.seed_config), "population.jld2")
+    @test runtime.runtime_seed["transmission_probabilities"]["age_coupling_data_path"] ==
+          joinpath(dirname(runtime.seed_config), "covimod.jld2")
+
+    # Day and value columns are identified by name, not their physical order.
+    gt = joinpath(dirname(path2), "gt")
+    write(joinpath(gt, "daily_age_total_detections.csv"),
+          "value,day,extra\n5,1,y\n10,2,x\n")
+    loaded = O.load_gt_series(gt)
+    @test loaded["daily_age_total_detections"][1:2] == [5.0, 10.0]
+
+    # Optional status is based on actual files and validation, not a fixed
+    # all-absent declaration.
+    manifest = O.preflight_config(path2; readiness=true)["ground_truth"]
+    @test manifest["optional_fields"]["daily_age_total_detections"]["present"]
+    @test manifest["optional_fields"]["daily_age_total_detections"]["status"] == "valid"
+    @test !manifest["optional_fields"]["household_infections"]["present"]
+end

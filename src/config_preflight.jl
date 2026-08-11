@@ -27,46 +27,96 @@ function _walk_seed_paths!(out::Dict{String,String}, node, prefix::String, base:
     end
 end
 
+function _normalize_seed_paths!(node, base::String)
+    node isa AbstractDict || return node
+    for (key, value) in node
+        name = String(key)
+        if value isa AbstractString &&
+           (endswith(lowercase(name), "_path") || occursin("population", lowercase(name)) ||
+            occursin("covimod", lowercase(name)) || occursin("immunity", lowercase(name)))
+            node[key] = isabspath(String(value)) ? normpath(String(value)) :
+                normpath(joinpath(base, String(value)))
+        elseif value isa AbstractDict
+            _normalize_seed_paths!(value, base)
+        end
+    end
+    return node
+end
+
+function _read_named_gt_csv(path::String)
+    lines = collect(eachline(path))
+    isempty(lines) && throw(ArgumentError("ground_truth.$(basename(path)) has no header"))
+    header = lowercase.(strip.(split(lines[1], ',')))
+    day_idx = findfirst(==("day"), header)
+    value_idx = findfirst(x -> x in ("value", "observed", "observations"), header)
+    (day_idx !== nothing && value_idx !== nothing) ||
+        throw(ArgumentError("ground_truth.$(basename(path)) has invalid day/value header"))
+    rows = Tuple{Int,Float64}[]
+    for (line_number, line) in zip(2:length(lines), lines[2:end])
+        parts = split(line, ',')
+        max(day_idx, value_idx) <= length(parts) ||
+            throw(ArgumentError("ground_truth.$(basename(path)) malformed row $line_number"))
+        day = try parse(Int, strip(parts[day_idx])) catch
+            throw(ArgumentError("ground_truth.$(basename(path)) invalid day at row $line_number"))
+        end
+        value = try parse(Float64, strip(parts[value_idx])) catch
+            throw(ArgumentError("ground_truth.$(basename(path)) invalid value at row $line_number"))
+        end
+        isfinite(value) || throw(ArgumentError("ground_truth.$(basename(path)) non-finite value at row $line_number"))
+        push!(rows, (day, value))
+    end
+    isempty(rows) && throw(ArgumentError("ground_truth.$(basename(path)) has no parseable observations"))
+    days = first.(rows)
+    length(unique(days)) == length(days) || throw(ArgumentError("ground_truth.$(basename(path)) has duplicate day labels"))
+    all(>(0), days) || throw(ArgumentError("ground_truth.$(basename(path)) has nonpositive day labels"))
+    issorted(days) || throw(ArgumentError("ground_truth.$(basename(path)) day labels must be strictly increasing"))
+    return rows
+end
+
 function _validate_gt_dir(gt_dir::String)
     csvs = Dict{String,Any}()
     for file in readdir(gt_dir)
         endswith(lowercase(file), ".csv") || continue
         path = joinpath(gt_dir, file)
-        rows = Tuple{Int,Float64}[]
-        open(path) do io
-            lines = collect(eachline(io))
-            isempty(lines) && throw(ArgumentError("ground_truth.$file has no header"))
-            header = lowercase.(strip.(split(lines[1], ',')))
-            length(header) >= 2 && ("day" in header) && any(x -> x in ("value", "observed", "observations"), header) ||
-                throw(ArgumentError("ground_truth.$file has invalid day/value header"))
-            for (line_number, line) in zip(2:length(lines), lines[2:end])
-                parts = split(line, ',')
-                length(parts) >= 2 || throw(ArgumentError("ground_truth.$file malformed row $line_number"))
-                day = try parse(Int, strip(parts[1])) catch
-                    throw(ArgumentError("ground_truth.$file invalid day at row $line_number"))
-                end
-                value = try parse(Float64, strip(parts[2])) catch
-                    throw(ArgumentError("ground_truth.$file invalid value at row $line_number"))
-                end
-                isfinite(value) || throw(ArgumentError("ground_truth.$file non-finite value at row $line_number"))
-                push!(rows, (day, value))
-            end
-        end
+        rows = _read_named_gt_csv(path)
         days = first.(rows)
-        length(unique(days)) == length(days) || throw(ArgumentError("ground_truth.$file has duplicate day labels"))
-        all(>(0), days) || throw(ArgumentError("ground_truth.$file has nonpositive day labels"))
-        issorted(days) || throw(ArgumentError("ground_truth.$file day labels must be strictly increasing"))
-        isempty(rows) && throw(ArgumentError("ground_truth.$file has no parseable observations"))
         csvs[file] = Dict("path"=>path, "observations"=>length(rows),
                           "days"=>days, "valid"=>true,
                           "day_policy"=>"positive_unique_strictly_increasing")
     end
     isempty(csvs) && throw(ArgumentError("ground_truth has no CSV files"))
-    known_optional = ["daily_student_detections", "household_infections",
-                      "household_infection_rate"]
-    merge!(csvs, Dict{String,Any}(
-        "optional_fields" => Dict(name => Dict("present" => false, "status" => "absent")
-                                  for name in known_optional)))
+    optional_files = Dict(
+        "daily_student_detections" => "sax-scholars-infections-normalized.csv",
+        "daily_age_total_detections" => "daily_age_total_detections.csv",
+        "daily_age_00_04_detections" => "daily_age_00_04_detections.csv",
+        "daily_age_05_14_detections" => "daily_age_05_14_detections.csv",
+        "daily_age_15_34_detections" => "daily_age_15_34_detections.csv",
+        "daily_age_35_59_detections" => "daily_age_35_59_detections.csv",
+        "daily_age_60_79_detections" => "daily_age_60_79_detections.csv",
+        "daily_age_80_plus_detections" => "daily_age_80_plus_detections.csv",
+        "daily_age_total_deaths" => "daily_age_total_deaths.csv",
+        "daily_age_00_04_deaths" => "daily_age_00_04_deaths.csv",
+        "daily_age_05_14_deaths" => "daily_age_05_14_deaths.csv",
+        "daily_age_15_34_deaths" => "daily_age_15_34_deaths.csv",
+        "daily_age_35_59_deaths" => "daily_age_35_59_deaths.csv",
+        "daily_age_60_79_deaths" => "daily_age_60_79_deaths.csv",
+        "daily_age_80_plus_deaths" => "daily_age_80_plus_deaths.csv",
+        "household_infections" => "household_infections.csv",
+        "household_infection_rate" => "household_infection_rate.csv",
+    )
+    optional = Dict{String,Any}()
+    for (name, file) in optional_files
+        path = joinpath(gt_dir, file)
+        if isfile(path)
+            rows = _read_named_gt_csv(path)
+            optional[name] = Dict("present"=>true, "status"=>"valid",
+                                  "path"=>path, "observations"=>length(rows))
+        else
+            optional[name] = Dict("present"=>false, "status"=>"absent",
+                                  "path"=>path)
+        end
+    end
+    csvs["optional_fields"] = optional
     return csvs
 end
 
@@ -158,7 +208,6 @@ function _validate_seed_model_inputs(seed::AbstractDict, seed_path::String,
         value isa Number && isfinite(Float64(value)) ||
             throw(ArgumentError("seed.$name must be a finite numeric scalar"))
     end
-    required_days = stage_months * monthly_days
     for (name, pair) in temporal_bounds
         path = String(name)
         values = _seed_nested(seed, path)
@@ -174,8 +223,6 @@ function _validate_seed_model_inputs(seed::AbstractDict, seed_path::String,
             throw(ArgumentError("seed.$path must contain finite numeric values"))
         all(diff(Float64.(times)) .> 0) ||
             throw(ArgumentError("seed.$times_path must be strictly increasing"))
-        maximum(Float64.(times)) >= required_days ||
-            throw(ArgumentError("seed.$times_path does not cover requested horizon $required_days days"))
     end
     return model
 end
@@ -221,6 +268,7 @@ function preflight_config(path::String; readiness::Bool=false)
         dimensions[name] = Dict("fit_months"=>Int(stage["fit_months"]),
                                 "population_size"=>Int(stage["population_size"]))
     end
+    required_horizon_months = maximum(Int(stage["fit_months"]) for stage in stages)
     function bounds(section, label)
         section isa AbstractDict || throw(ArgumentError("$label must be an object"))
         result = Dict{String,Any}()
@@ -257,6 +305,13 @@ function preflight_config(path::String; readiness::Bool=false)
     end
     model_inputs = _validate_seed_model_inputs(seed, seed_path, first(stages)["fit_months"],
                                                monthly_days, scalar_bounds, temporal_bounds)
+    for (name, _) in temporal_bounds
+        times_path = replace(String(name), r"\.interval_values$" => ".interval_times")
+        times = _seed_nested(seed, times_path)
+        maximum(Float64.(times)) >= required_horizon_months * monthly_days ||
+            throw(ArgumentError("seed.$times_path does not cover requested horizon " *
+                                string(required_horizon_months * monthly_days) * " days"))
+    end
     if haskey(raw, "gt_dir")
         gt_dir = _preflight_path(base, raw["gt_dir"], "gt_dir")
         isdir(gt_dir) || throw(ArgumentError("gt_dir must be a directory"))

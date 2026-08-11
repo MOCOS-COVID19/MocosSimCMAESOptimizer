@@ -78,7 +78,20 @@ struct OptimizerConfig
     stage_freeze::Dict{String,Vector{String}}
     initial_state::Union{Nothing,Dict{String,Any}}
     posterior::PosteriorConfig
+    runtime_seed::Dict{String,Any}
 end
+
+# Backwards-compatible constructor for fixture/config callers that do not
+# carry the normalized runtime seed explicitly.
+OptimizerConfig(seed_config, output_dir, monthly_days, stages, scalar_bounds,
+                temporal_bounds, scalar_preprocessing, temporal_parameterization,
+                age_population_weights, validation, objective, external_sim,
+                stage_freeze, initial_state, posterior) =
+    OptimizerConfig(seed_config, output_dir, monthly_days, stages, scalar_bounds,
+                    temporal_bounds, scalar_preprocessing, temporal_parameterization,
+                    age_population_weights, validation, objective, external_sim,
+                    stage_freeze, initial_state, posterior,
+                    Dict{String,Any}())
 
 const DEFAULT_AGE_POPULATION_WEIGHTS = Dict{String,Float64}(
     "00_04" => 0.043326963479,
@@ -1446,7 +1459,9 @@ function load_config(path::String)
     temporal_parameterization = String(get(raw, "temporal_parameterization", "monthly"))
     temporal_parameterization in ("weekly", "monthly") ||
         error("Unsupported temporal_parameterization: $(temporal_parameterization)")
-    return OptimizerConfig(raw["seed_config"], raw["output_dir"], Int(raw["monthly_days"]), stages, scalar_bounds, temporal_bounds, scalar_preprocessing, temporal_parameterization, age_population_weights, validation, objective, external_sim, stage_freeze, initial_state, posterior)
+    runtime_seed = load_json(raw["seed_config"])
+    _normalize_seed_paths!(runtime_seed, dirname(raw["seed_config"]))
+    return OptimizerConfig(raw["seed_config"], raw["output_dir"], Int(raw["monthly_days"]), stages, scalar_bounds, temporal_bounds, scalar_preprocessing, temporal_parameterization, age_population_weights, validation, objective, external_sim, stage_freeze, initial_state, posterior, runtime_seed)
 end
 
 function scalar_preprocessing_entry(cfg::OptimizerConfig, spec::ParamSpec)
@@ -1819,33 +1834,17 @@ end
 function load_gt_series(gt_dir::String)
     function load_csv(name)
         path = joinpath(gt_dir, name)
-        rows = Vector{Tuple{Int,Union{Missing,Float64}}}()
-        open(path, "r") do io
-            first = true
-            for line in eachline(io)
-                first && (first = false; continue)
-                parts = split(line, ",")
-                length(parts) >= 2 || continue
-                day = try
-                    parse(Int, strip(parts[1]))
-                catch
-                    continue
-                end
-                value = try
-                    parse(Float64, strip(parts[2]))
-                catch
-                    missing
-                end
-                push!(rows, (day, value))
-            end
-        end
+        isfile(path) || return Union{Missing,Float64}[]
+        parsed = _read_named_gt_csv(path)
+        rows = Tuple{Int,Union{Missing,Float64}}[(day, value) for (day, value) in parsed]
         isempty(rows) && return Float64[]
         sort!(rows, by = first)
-        min_day = rows[1][1]
         max_day = rows[end][1]
-        values = Union{Missing,Float64}[missing for _ in min_day:max_day]
+        # Preserve the declared day identity.  Do not rebase a series whose
+        # first observation starts after day one.
+        values = Union{Missing,Float64}[missing for _ in 1:max_day]
         for (day, value) in rows
-            values[day - min_day + 1] = value
+            values[day] = value
         end
         return values
     end
@@ -3400,7 +3399,9 @@ function run_long_horizon(cfg_path::String; days::Int=730, output_dir::Union{Not
     root = output_dir === nothing ? joinpath(cfg.output_dir, "stable_long_run") : output_dir
     mkpath(root)
     seed_path = seed_config === nothing ? cfg.seed_config : seed_config
-    seed = load_json(seed_path)
+    seed = seed_config === nothing && !isempty(cfg.runtime_seed) ?
+        deepcopy(cfg.runtime_seed) : load_json(seed_path)
+    seed_config === nothing && _normalize_seed_paths!(seed, dirname(seed_path))
     stage_name = long_horizon_stage_name(days, cfg.monthly_days)
     stage = StageConfig(stage_name, ceil(Int, days / max(cfg.monthly_days, 1)), 1, 1, 0.0)
     specset = load_param_specs(seed, cfg, stage)
@@ -3948,7 +3949,7 @@ end
 function run_optimizer(config_path::String; use_slurm::Bool=false)
     cfg = load_config(config_path)
     CURRENT_OPTIMIZER_CONFIG[] = cfg
-    seed = load_json(cfg.seed_config)
+    seed = isempty(cfg.runtime_seed) ? load_json(cfg.seed_config) : deepcopy(cfg.runtime_seed)
     specs = build_specs(seed, cfg)
     rng = MersenneTwister(42)
 
