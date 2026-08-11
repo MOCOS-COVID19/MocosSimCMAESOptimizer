@@ -392,13 +392,28 @@ function build_state_from_reusable(
 )
     old_names = [String(x) for x in reusable["param_names"]]
     old_mean = Float64.(reusable["mean"])
+    length(old_names) == length(old_mean) ||
+        throw(ArgumentError("reusable state name/mean dimensions disagree"))
+    isempty(old_names) && throw(ArgumentError("reusable state has no parameter names"))
+    length(unique(old_names)) == length(old_names) ||
+        throw(ArgumentError("reusable state has duplicate parameter names"))
+    all(occursin(r"^.+\[[1-9][0-9]*\]$", name) for name in old_names) ||
+        throw(ArgumentError("reusable state contains noncanonical parameter names"))
+    all(isfinite, old_mean) || throw(ArgumentError("reusable state mean is non-finite"))
     old_cov = matrix_from_json(reusable["covariance"], length(old_mean))
+    all(isfinite, old_cov) &&
+        isapprox(old_cov, old_cov'; atol=1e-10) ||
+        throw(ArgumentError("reusable state covariance must be finite and symmetric"))
+    minimum(eigvals(Symmetric(old_cov))) >= -1e-8 ||
+        throw(ArgumentError("reusable state covariance must be positive semidefinite"))
     old_sigma = if haskey(reusable, "sigma")
         raw_sigma = reusable["sigma"]
         raw_sigma isa AbstractVector ? Float64.(raw_sigma) : fill(Float64(raw_sigma), length(old_mean))
     else
         fill(0.3, length(old_mean))
     end
+    length(old_sigma) == length(old_mean) && all(isfinite, old_sigma) && all(>(0), old_sigma) ||
+        throw(ArgumentError("reusable state sigma dimensions or values are invalid"))
 
     new_names = ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
     new_mean = initial_vector(seed, specs_stage)
@@ -407,6 +422,10 @@ function build_state_from_reusable(
     new_sigma = fill(sigma_floor, dim)
     old_p_c = haskey(reusable, "p_c") ? Float64.(reusable["p_c"]) : zeros(length(old_names))
     old_p_sigma = haskey(reusable, "p_sigma") ? Float64.(reusable["p_sigma"]) : zeros(length(old_names))
+    length(old_p_c) == length(old_names) && all(isfinite, old_p_c) ||
+        throw(ArgumentError("reusable state p_c dimensions or values are invalid"))
+    length(old_p_sigma) == length(old_names) && all(isfinite, old_p_sigma) ||
+        throw(ArgumentError("reusable state p_sigma dimensions or values are invalid"))
     new_p_c = zeros(dim)
     new_p_sigma = zeros(dim)
     mapped = falses(dim)
@@ -1322,11 +1341,19 @@ end
 function vector_to_config(seed::Dict{String,Any}, specs::Vector{ParamSpec}, x::Vector{Float64}, active_months::Int)
     cfg = deepcopy(seed)
     optcfg = CURRENT_OPTIMIZER_CONFIG[]
+    active_months >= 0 || throw(ArgumentError("active_months must be nonnegative"))
+    monthly_days = optcfg === nothing ? 30 : optcfg.monthly_days
+    set_nested!(cfg, "stop_simulation_time", active_months * monthly_days)
+    # A zero-month conversion is an explicit empty-horizon policy: preserve
+    # every seed coordinate and emit only the effective stop time.
+    active_months == 0 && return cfg
     idx = 1
     for spec in specs
         if spec.kind == :scalar
-            val = optcfg === nothing ? x[idx] : decode_scalar_value(optcfg, seed, spec, x[idx])
-            set_nested!(cfg, spec.name, val)
+            if idx <= length(x)
+                val = optcfg === nothing ? x[idx] : decode_scalar_value(optcfg, seed, spec, x[idx])
+                set_nested!(cfg, spec.name, val)
+            end
             idx += 1
         else
             current = map(float, get_nested(cfg, spec.name))
@@ -1342,11 +1369,17 @@ function vector_to_config(seed::Dict{String,Any}, specs::Vector{ParamSpec}, x::V
                     isempty(interval_times) && break
                     month = clamp(monthly_bucket(interval_times[min(i, length(interval_times))],
                         optcfg.monthly_days), 1, active)
+                    # Entries beyond the requested horizon are inactive seed
+                    # suffixes.  Do not map them to the last active bucket.
+                    monthly_bucket(interval_times[min(i, length(interval_times))],
+                        optcfg.monthly_days) > active && continue
                     idx_x = idx + month - 1
                     idx_x <= length(x) || continue
                     current[i] = x[idx_x]
                 end
-                idx += active
+                # The vector layout still reserves the full specification
+                # width, including inactive coordinates.
+                idx += spec.length
             else
                 for i in 1:active
                     idx <= length(x) && (current[i] = x[idx])
@@ -1359,9 +1392,6 @@ function vector_to_config(seed::Dict{String,Any}, specs::Vector{ParamSpec}, x::V
             set_nested!(cfg, spec.name, current)
         end
     end
-    # Align simulation horizon with active months (e.g., 90d for first stage, 120d next, etc.)
-    monthly_days = optcfg === nothing ? 30 : optcfg.monthly_days
-    set_nested!(cfg, "stop_simulation_time", max(active_months, 0) * monthly_days)
     return cfg
 end
 

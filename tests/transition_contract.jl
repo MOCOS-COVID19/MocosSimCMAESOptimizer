@@ -20,6 +20,16 @@ const O = MocosSimCMAESOptimizer
     @test state.mean[3] == 0.4
     @test length(state.mean) == 5
     @test O.validate_cma_state(state, 5)["valid"]
+    malformed = Dict{String,Any}(
+        "param_names" => ["curve.interval_values[1]", "curve.interval_values[1]"],
+        "mean" => [0.2, 0.4],
+        "sigma" => [0.1, 0.1],
+        "covariance" => [[1.0, 2.0], [0.0, 1.0]],
+        "p_c" => [0.0, 0.0], "p_sigma" => [0.0, 0.0])
+    malformed_seed = Dict{String,Any}("a" => 0.2,
+        "curve" => Dict{String,Any}("interval_values" => [0.3, 0.4]))
+    @test_throws ArgumentError O.build_state_from_reusable(
+        malformed_seed, specs_old, malformed; rng=MersenneTwister(1))
 
     seed = Dict{String,Any}("curve" => Dict{String,Any}(
         "interval_values" => [0.2, 0.4, 0.8],
@@ -36,6 +46,22 @@ const O = MocosSimCMAESOptimizer
     candidate = O.vector_to_config(seed, spec, [0.1, 0.2, 0.3], 2)
     @test candidate["curve"]["interval_values"] == [0.1, 0.1, 0.2]
     @test candidate["stop_simulation_time"] == 60
+    # An inactive monthly suffix is trusted seed data, not an additional
+    # active coordinate.  It must not be rewritten from the last active
+    # bucket when the requested horizon is shorter than the seed.
+    suffix_seed = Dict{String,Any}("curve" => Dict{String,Any}(
+        "interval_values" => [0.2, 0.4, 0.8],
+        "interval_times" => [1, 30, 31]))
+    suffix = O.vector_to_config(suffix_seed, spec, [0.1, 0.9, 0.7], 1)
+    @test suffix["curve"]["interval_values"] == [0.1, 0.1, 0.8]
+    @test suffix["stop_simulation_time"] == 30
+    @test suffix_seed["curve"]["interval_values"] == [0.2, 0.4, 0.8]
+    @test_throws ArgumentError O.vector_to_config(suffix_seed, spec, [0.1, 0.2, 0.3], -1)
+    empty_times = Dict{String,Any}("curve" => Dict{String,Any}(
+        "interval_values" => [0.2, 0.4, 0.8], "interval_times" => []))
+    empty_result = O.vector_to_config(empty_times, spec, [0.1, 0.2, 0.3], 1)
+    @test empty_result["curve"]["interval_values"] == [0.2, 0.4, 0.8]
+    @test empty_result["stop_simulation_time"] == 30
     @test O.monthly_bucket(30, 30) == 1
     @test O.monthly_bucket(31, 30) == 2
     @test_throws ArgumentError O.validate_interval_times([1, 1])
