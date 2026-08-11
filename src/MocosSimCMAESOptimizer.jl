@@ -22,7 +22,7 @@ export main, run_optimizer, run_long_horizon, run_nuts_from_archive,
        persist_archive_transfer_manifest, preflight_config, create_candidate_root,
        adapter_failure, candidate_terminal_status, wait_for_iteration_outputs,
        stage_resume_info, materialize_terminal_candidate!, normalized_iteration_result,
-       atomic_save_json
+       atomic_save_json, validate_committed_artifacts
 
 struct ExternalSimConfig
     gt_dir::String
@@ -617,6 +617,126 @@ function load_stage_state(stage_root::String)
     path = joinpath(stage_root, "stage_state.json")
     isfile(path) || return nothing
     return load_json(path)
+end
+
+"""Validate and join the durable artifacts of one committed iteration."""
+function validate_committed_artifacts(stage_root::String)
+    required = ["stage_state.json", "iter_metrics.jsonl",
+        "top_candidates.json", "survivor_archive.json", "full_reusable_state.json"]
+    paths = Dict(name => joinpath(stage_root, name) for name in required)
+    contradictions = String[]
+    for (name, path) in paths
+        isfile(path) || push!(contradictions, "missing artifact: $name")
+    end
+    isempty(contradictions) || return Dict("valid" => false,
+        "contradictions" => contradictions, "stage_root" => abspath(stage_root),
+        "artifact_hashes" => Dict{String,Any}())
+    stage_state = try load_json(paths["stage_state.json"]) catch
+        push!(contradictions, "malformed stage_state.json"); Dict{String,Any}() end
+    top = try load_json(paths["top_candidates.json"]) catch
+        push!(contradictions, "malformed top_candidates.json"); Any[] end
+    archive = try load_json(paths["survivor_archive.json"]) catch
+        push!(contradictions, "malformed survivor_archive.json"); Any[] end
+    reusable = try load_json(paths["full_reusable_state.json"]) catch
+        push!(contradictions, "malformed full_reusable_state.json"); Dict{String,Any}() end
+    metrics = Any[]
+    try
+        for line in eachline(paths["iter_metrics.jsonl"])
+            isempty(strip(line)) || push!(metrics, JSON.parse(line))
+        end
+    catch
+        push!(contradictions, "malformed iter_metrics.jsonl")
+    end
+    top isa AbstractVector || push!(contradictions, "top_candidates is not an array")
+    archive isa AbstractVector || push!(contradictions, "survivor_archive is not an array")
+    stage = String(get(stage_state, "stage", ""))
+    iteration = Int(get(stage_state, "iteration", 0))
+    names = get(stage_state, "param_names", Any[])
+    commit_path = joinpath(stage_root, "iter_$(iteration)", "iteration_commit.json")
+    committed = false
+    if isfile(commit_path)
+        commit = try load_json(commit_path) catch; Dict{String,Any}() end
+        committed = get(commit, "status", "") == "committed" &&
+            String(get(commit, "stage", "")) == stage &&
+            Int(get(commit, "iteration", -1)) == iteration
+    end
+    committed || push!(contradictions, "missing or mismatched committed iteration manifest")
+    identities = Tuple{String,Int,Int}[]
+    status_by_id = Dict{Tuple{String,Int,Int},String}()
+    score_by_id = Dict{Tuple{String,Int,Int},Float64}()
+    for row in metrics
+        row isa AbstractDict || (push!(contradictions, "non-object iter_metrics row"); continue)
+        identity = (String(get(row, "stage", "")), Int(get(row, "iteration", 0)),
+            Int(get(row, "candidate", 0)))
+        identity in identities && push!(contradictions, "duplicate iter_metrics identity: $identity")
+        push!(identities, identity)
+        status_by_id[identity] = String(get(row, "status", ""))
+        score_by_id[identity] = Float64(get(row, "score", Inf))
+        identity[1] == stage || push!(contradictions, "iter_metrics stage mismatch: $identity")
+        identity[2] == iteration || push!(contradictions, "iter_metrics iteration mismatch: $identity")
+    end
+    function check_entry(entry, label)
+        entry isa AbstractDict || (push!(contradictions, "$label is not an object"); return nothing)
+        identity = (String(get(entry, "stage", "")), Int(get(entry, "iteration", 0)),
+            Int(get(entry, "candidate", 0)))
+        identity in identities || push!(contradictions, "$label orphan identity: $identity")
+        identity[1] == stage || push!(contradictions, "$label stage mismatch: $identity")
+        identity[2] == iteration || push!(contradictions, "$label iteration mismatch: $identity")
+        get(entry, "parameter_names", names) == names ||
+            push!(contradictions, "$label parameter_names mismatch")
+        haskey(status_by_id, identity) && String(get(entry, "status", "")) != status_by_id[identity] &&
+            push!(contradictions, "$label status mismatch: $identity")
+        haskey(score_by_id, identity) && Float64(get(entry, "score", Inf)) != score_by_id[identity] &&
+            push!(contradictions, "$label score mismatch: $identity")
+        identity
+    end
+    top_ids = Tuple{String,Int,Int}[]
+    for entry in top
+        id = check_entry(entry, "top_candidates")
+        id === nothing || push!(top_ids, id)
+    end
+    archive_ids = Tuple{String,Int,Int}[]
+    for entry in archive
+        id = check_entry(entry, "survivor_archive")
+        id === nothing || push!(archive_ids, id)
+    end
+    best_id = get(stage_state, "best_candidate_id", nothing)
+    best_id !== nothing && !any(get(e, "candidate", 0) == best_id for e in top) &&
+        push!(contradictions, "best_candidate_id is absent from top_candidates")
+    haskey(reusable, "stage") && String(reusable["stage"]) != stage &&
+        push!(contradictions, "full_reusable_state stage mismatch")
+    admitted = get(reusable, "archive_ids", Any[])
+    admitted isa AbstractVector || push!(contradictions, "reusable state archive_ids is not an array")
+    for id in admitted
+        any(get(e, "candidate", 0) == id for e in archive) ||
+            push!(contradictions, "reusable state references non-admitted archive id: $id")
+    end
+    counts = Dict("completed" => 0, "failed" => 0, "skipped" => 0, "pending" => 0)
+    for row in metrics
+        status = String(get(row, "status", ""))
+        haskey(counts, status) ? (counts[status] += 1) :
+            push!(contradictions, "unknown candidate status: $status")
+    end
+    for status in ("completed", "failed", "skipped", "pending")
+        field = "$(status)_count"
+        haskey(stage_state, field) && Int(stage_state[field]) != counts[status] &&
+            push!(contradictions, "stage_state $field mismatch")
+    end
+    if best_id !== nothing && haskey(score_by_id, (stage, iteration, Int(best_id))) &&
+       haskey(stage_state, "best_score") &&
+       Float64(stage_state["best_score"]) != score_by_id[(stage, iteration, Int(best_id))]
+        push!(contradictions, "stage_state best_score mismatch")
+    end
+    haskey(reusable, "param_names") && reusable["param_names"] != names &&
+        push!(contradictions, "full_reusable_state parameter_names mismatch")
+    hashes = Dict{String,Any}(name => bytes2hex(SHA.sha256(read(path)))
+                              for (name, path) in paths)
+    return Dict("valid" => isempty(contradictions), "contradictions" => contradictions,
+        "stage_root" => abspath(stage_root), "stage" => stage, "iteration" => iteration,
+        "committed" => committed, "status_counts" => counts,
+        "jsonl_record_count" => length(metrics), "candidate_ids" => identities,
+        "top_candidate_ids" => top_ids, "archive_candidate_ids" => archive_ids,
+        "artifact_hashes" => hashes)
 end
 
 function latest_iteration_top_candidates(stage_root::String)
