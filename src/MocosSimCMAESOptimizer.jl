@@ -1592,6 +1592,40 @@ function rmae_series(a::Vector{Float64}, b::Vector{Float64})
     return mae_series(a, b) / denom
 end
 
+"""
+Return the finite, index-preserving pairs used by every score family.
+Missing and non-finite values remove the same original day from both series;
+neither input is independently compressed.  The returned day numbers are
+one-based indices in the original trajectories.
+"""
+function paired_observations(gt, sim, days::Int)
+    n = min(max(days, 0), length(gt), length(sim))
+    out_gt = Float64[]
+    out_sim = Float64[]
+    indices = Int[]
+    for day in 1:n
+        gv = gt[day]
+        sv = sim[day]
+        if gv === missing || !(sv isa Real) || !isfinite(Float64(sv))
+            continue
+        end
+        g = try Float64(gv) catch; continue end
+        isfinite(g) || continue
+        push!(out_gt, g)
+        push!(out_sim, Float64(sv))
+        push!(indices, day)
+    end
+    return out_gt, out_sim, indices
+end
+
+function score_payload_empty()
+    return Dict{String,Any}(
+        "periods" => Vector{Vector{Int}}(),
+        "retained_indices" => Int[],
+        "retained_count" => 0,
+    )
+end
+
 function rolling_sum(series::Vector{Float64}, window::Int)
     length(series) == 0 && return Float64[]
     w = max(window, 1)
@@ -1700,22 +1734,9 @@ function per_trajectory_rmae(daily_path::String, metric::String, gt_series::Abst
     trajs = read_daily_metric(daily_path, metric)
     trajs === nothing && return Inf
     vals = Float64[]
-    g = drop_missing(gt_series[1:min(end, days)])
-    g = metric == "daily_student_detections" ? rolling_mean(g, 7) : rolling_sum(g, 7)
     for traj in trajs
-        s = Float64.(traj[1:min(end, days)])
-        if metric == "daily_student_detections"
-            gt_daily = gt_series[1:min(end, days)]
-            sim_daily = traj[1:min(end, days)]
-            gg, ss = student_sparse_aligned_vectors(gt_daily, Float64.(sim_daily), days)
-            if isempty(gg)
-                continue
-            end
-            push!(vals, rmae_series(ss, gg))
-        else
-            s = rolling_sum(s, 7)
-            push!(vals, rmae_series(s, g))
-        end
+        gg, ss, _ = paired_observations(gt_series, traj, days)
+        isempty(gg) || push!(vals, rmae_series(ss, gg))
     end
     isempty(vals) && return Inf
     return sum(vals) / length(vals)
@@ -1725,12 +1746,12 @@ function per_trajectory_cumulative_error(daily_path::String, metric::String, gt_
     trajs = read_daily_metric(daily_path, metric)
     trajs === nothing && return Inf
     vals = Float64[]
-    g = drop_missing(gt_series[1:min(end, days)])
-    g = cumulative_series(g)
     for traj in trajs
-        s = Float64.(traj[1:min(end, days)])
-        s = cumulative_series(s)
-        push!(vals, abs(last(s) - last(g)) / max(abs(last(g)), 1.0))
+        gg, ss, _ = paired_observations(gt_series, traj, days)
+        isempty(gg) && continue
+        gc = cumulative_series(gg)
+        sc = cumulative_series(ss)
+        push!(vals, abs(last(sc) - last(gc)) / max(abs(last(gc)), 1.0))
     end
     isempty(vals) && return Inf
     return sum(vals) / length(vals)
@@ -1752,10 +1773,12 @@ function per_trajectory_blocked_cumulative_error(
         trajectory_errors = Float64[]
         for start_day in 1:block_days:n
             end_day = min(start_day + block_days - 1, n, length(traj))
-            valid = [day for day in start_day:end_day if gt_series[day] !== missing]
+            end_day < start_day && continue
+            observed_values, simulated_values, valid = paired_observations(
+                gt_series[start_day:end_day], traj[start_day:end_day], end_day - start_day + 1)
             isempty(valid) && continue
-            observed = sum(Float64(gt_series[day]) for day in valid)
-            simulated = sum(Float64(traj[day]) for day in valid)
+            observed = sum(observed_values)
+            simulated = sum(simulated_values)
             push!(trajectory_errors, abs(simulated - observed) / max(abs(observed), 1.0))
         end
         isempty(trajectory_errors) || push!(block_errors, mean(trajectory_errors))
@@ -1764,7 +1787,7 @@ function per_trajectory_blocked_cumulative_error(
     return mean(block_errors)
 end
 
-function validation_score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
+function validation_score_from_daily_legacy(cfg::OptimizerConfig, daily_path::String, days::Int)
     enabled = Bool(get(cfg.validation, "enabled", true))
     enabled || return Dict{String,Any}("enabled" => false)
     holdout_days = max(Int(get(cfg.validation, "holdout_days", 28)), 1)
@@ -1834,7 +1857,7 @@ function trajectory_metric_values(daily_path::String, metric::String, gt_series:
     return vals
 end
 
-function weekly_error_distributions(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int)
+function weekly_error_distributions_legacy(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int)
     trajs = read_daily_metric(daily_path, metric)
     trajs === nothing && return Dict{String,Any}(
         "absolute_error" => Float64[],
@@ -1933,6 +1956,70 @@ function weekly_error_distributions(daily_path::String, metric::String, gt_serie
         "observations" => observations,
         "predictions" => predictions,
     )
+end
+
+"""
+Index-preserving weekly implementation.  This later method intentionally
+supersedes the historical implementation above so every caller, including
+collection/Slurm reconstruction, shares one paired-day policy.
+"""
+function weekly_error_distributions(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int)
+    trajs = read_daily_metric(daily_path, metric)
+    empty_payload = Dict{String,Any}(
+        "absolute_error" => Float64[], "normalized_absolute_error" => Float64[],
+        "mae" => Float64[], "rmae" => Float64[],
+        "periods" => Vector{Vector{Int}}(), "retained_indices" => Vector{Vector{Int}}(),
+        "observations" => Float64[], "predictions" => Float64[])
+    trajs === nothing && return empty_payload
+    n = min(max(days, 0), length(gt_series))
+    result = deepcopy(empty_payload)
+    for start_day in 1:7:n
+        end_day = min(start_day + 6, n)
+        per_traj = Tuple{Float64,Float64,Float64,Vector{Int}}[]
+        for traj in trajs
+            start_day > length(traj) && continue
+            g, s, idx = paired_observations(gt_series[start_day:end_day],
+                                             traj[start_day:min(end_day, length(traj))],
+                                             end_day - start_day + 1)
+            isempty(idx) && continue
+            original = [start_day + i - 1 for i in idx]
+            if metric == "daily_student_detections"
+                observed = sum(g) / 7.0
+                predicted = sum(s) / length(s)
+            else
+                observed = sum(g)
+                predicted = sum(s)
+            end
+            err = abs(predicted - observed)
+            push!(per_traj, (err, err / max(abs(observed), 1.0), observed, original))
+        end
+        isempty(per_traj) && continue
+        push!(result["absolute_error"], mean(first.(per_traj)))
+        push!(result["normalized_absolute_error"], mean(getindex.(per_traj, 2)))
+        push!(result["mae"], mean(first.(per_traj)))
+        push!(result["rmae"], mean(getindex.(per_traj, 2)))
+        push!(result["periods"], [start_day, end_day])
+        retained = unique(sort(vcat([x[4] for x in per_traj]...)))
+        push!(result["retained_indices"], retained)
+        push!(result["observations"], mean(getindex.(per_traj, 3)))
+        push!(result["predictions"], mean([
+            metric == "daily_student_detections" ?
+                sum(paired_observations(gt_series[start_day:end_day],
+                    (start_day > length(traj) ? Float64[] : traj[start_day:min(end_day, length(traj))]),
+                    end_day - start_day + 1)[2]) /
+                length(paired_observations(gt_series[start_day:end_day],
+                    (start_day > length(traj) ? Float64[] : traj[start_day:min(end_day, length(traj))]),
+                    end_day - start_day + 1)[2]) :
+                sum(paired_observations(gt_series[start_day:end_day],
+                    (start_day > length(traj) ? Float64[] : traj[start_day:min(end_day, length(traj))]),
+                    end_day - start_day + 1)[2])
+            for traj in trajs if !isempty(paired_observations(
+                gt_series[start_day:end_day],
+                (start_day > length(traj) ? Float64[] : traj[start_day:min(end_day, length(traj))]),
+                end_day - start_day + 1)[3])
+        ]))
+    end
+    return result
 end
 
 const WEEKLY_CONTROL_METRICS = [
@@ -2083,7 +2170,7 @@ function weekly_control_bucket_errors(
     return errors
 end
 
-function cumulative_metric_values(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int)
+function cumulative_metric_values_legacy(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int)
     trajs = read_daily_metric(daily_path, metric)
     trajs === nothing && return Float64[]
     g = drop_missing(gt_series[1:min(end, days)])
@@ -2110,6 +2197,23 @@ function cumulative_error_distribution(daily_path::String, metric::String, gt_se
         push!(vals, abs(last(s) - last(g)) / denom)
     end
     return vals
+end
+
+function cumulative_metric_values(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int)
+    trajs = read_daily_metric(daily_path, metric)
+    trajs === nothing && return Float64[]
+    vals = Float64[]
+    for traj in trajs
+        g, s, _ = paired_observations(gt_series, traj, days)
+        isempty(g) && continue
+        gc, sc = cumulative_series(g), cumulative_series(s)
+        push!(vals, abs(last(sc) - last(gc)) / max(abs(last(gc)), 1.0))
+    end
+    return vals
+end
+
+function cumulative_error_distribution_legacy(daily_path::String, metric::String, gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int)
+    return cumulative_metric_values_legacy(daily_path, metric, gt_series, days)
 end
 
 function household_readout(daily_path::String, days::Int)
@@ -2248,7 +2352,7 @@ const OBJECTIVE_METRIC_DEFAULTS = Dict(
     "daily_student_detections_cumulative" => 0.0,
 )
 
-function objective_score(
+function objective_score_legacy(
     cfg::OptimizerConfig,
     metrics::AbstractDict,
     weekly_control::Float64,
@@ -2324,6 +2428,99 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int, c
     metrics["validation_mean_error"] = Float64(get(validation, "mean_error", Inf))
     metrics["validation_window"] = validation
     return objective_score(cfg, metrics, weekly_control, jump_penalty, extrema_penalty), metrics
+end
+
+function objective_score(
+    cfg::OptimizerConfig,
+    metrics::AbstractDict,
+    weekly_control::Float64,
+    jump_penalty::Float64,
+    extrema_penalty::Float64,
+)
+    weights = cfg.objective.weights
+    total = 0.0
+    manifest = Dict{String,Any}()
+    for (metric, default_weight) in OBJECTIVE_METRIC_DEFAULTS
+        weight = Float64(get(weights, metric, default_weight))
+        value_present = haskey(metrics, metric)
+        value = value_present ? try Float64(metrics[metric]) catch; Inf end : Inf
+        # A metric absent from the reference manifest is optional.  When its
+        # source exists, score construction records Inf for missing candidate
+        # output, which is the required-metric failure path.
+        required = value_present && weight > 0.0
+        manifest[metric] = Dict("enabled" => required, "required" => required,
+                                "weight" => weight, "source_present" => value_present,
+                                "all_missing_policy" => "Inf")
+        if required && (!value_present || !isfinite(value))
+            return Inf
+        end
+        value_present || continue
+        weight == 0.0 && continue
+        total += weight * value
+    end
+    wc_weight = Float64(get(weights, "weekly_control", 1.0))
+    manifest["weekly_control"] = Dict("enabled" => wc_weight > 0,
+        "required" => wc_weight > 0, "weight" => wc_weight,
+        "source_present" => isfinite(weekly_control), "all_missing_policy" => "Inf")
+    wc_weight > 0 && !isfinite(weekly_control) && return Inf
+    total += wc_weight * weekly_control
+    if !isfinite(jump_penalty) || !isfinite(extrema_penalty)
+        return Inf
+    end
+    for (metric, raw_value) in metrics
+        metric in keys(OBJECTIVE_METRIC_DEFAULTS) && continue
+        metric in ("weekly_control_score", "temporal_jump_penalty",
+                   "infection_extrema_penalty", "vector_log_likelihood",
+                   "validation_mean_error", "validation_window") && continue
+        haskey(weights, metric) || continue
+        weight = Float64(weights[metric])
+        value = try Float64(raw_value) catch; Inf end
+        weight > 0 && !isfinite(value) && return Inf
+        weight == 0 && continue
+        total += weight * value
+    end
+    total += cfg.objective.temporal_jump_weight * jump_penalty +
+             cfg.objective.infection_extrema_weight * extrema_penalty
+    isfinite(total) ? total : Inf
+end
+
+function validation_score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
+    enabled = Bool(get(cfg.validation, "enabled", true))
+    enabled || return Dict{String,Any}("enabled" => false, "mean_error" => 0.0,
+                                       "retained_indices" => Int[], "count" => 0)
+    holdout_days = max(Int(get(cfg.validation, "holdout_days", 28)), 1)
+    requested_start = max(1, days - holdout_days + 1)
+    gt = load_gt_series(cfg.external_sim === nothing ? joinpath(MANAGER_ROOT, "gt") : cfg.external_sim.gt_dir)
+    metric_scores = Dict{String,Float64}()
+    retained = Int[]
+    for metric in ("daily_detections", "daily_deaths", "daily_age_05_14_detections")
+        haskey(gt, metric) || continue
+        trajs = read_daily_metric(daily_path, metric)
+        trajs === nothing && continue
+        scores = Float64[]
+        for traj in trajs
+            requested_start > min(days, length(gt[metric]), length(traj)) && continue
+            g, s, idx = paired_observations(
+                gt[metric][requested_start:min(days, length(gt[metric]))],
+                traj[requested_start:min(days, length(traj))],
+                min(days, length(gt[metric]), length(traj)) - requested_start + 1)
+            isempty(idx) && continue
+            push!(scores, rmae_series(s, g))
+            append!(retained, requested_start .+ idx .- 1)
+        end
+        isempty(scores) || (metric_scores[metric] = mean(scores))
+    end
+    retained = unique(sort(retained))
+    actual_start = isempty(retained) ? requested_start : first(retained)
+    actual_end = isempty(retained) ? 0 : last(retained)
+    return Dict{String,Any}(
+        "enabled" => true, "start_day" => actual_start, "end_day" => actual_end,
+        "requested_start_day" => requested_start, "holdout_days" => holdout_days,
+        "seeds" => get(cfg.validation, "seeds", [42, 43, 44]),
+        "metrics" => metric_scores, "retained_indices" => retained,
+        "count" => length(retained),
+        "mean_error" => isempty(metric_scores) ? Inf : mean(collect(values(metric_scores))),
+    )
 end
 
 function top_k_entries(entries, k::Int)
