@@ -39,10 +39,42 @@ function write_committed_fixture(root)
                   for name in committed)
     O.safe_save_json(commit, Dict("status"=>"committed", "stage"=>"stage_short",
         "iteration"=>1, "candidate_ids"=>[1, 2, 3], "cma_update_count"=>1,
+        "schema_version"=>"fixture-v1",
         "artifact_hashes"=>hashes, "artifact_key_set"=>committed,
         "artifact_hash_manifest"=>bytes2hex(SHA.sha256(JSON.json(hashes))),
         "artifact_integrity_digest"=>bytes2hex(SHA.sha256(JSON.json(hashes)))))
     return stage_root, true
+end
+
+@testset "committed artifact schema cannot downgrade" begin
+    root = mktempdir()
+    stage_root, _ = write_committed_fixture(root)
+    commit_path = joinpath(stage_root, "iter_1", "iteration_commit.json")
+    commit = O.load_json(commit_path)
+
+    # A fixture contract is explicit, while omission is never inferred.
+    @test O.validate_committed_artifacts(stage_root)["valid"]
+    delete!(commit, "schema_version")
+    O.safe_save_json(commit_path, commit)
+    missing_schema = O.validate_committed_artifacts(stage_root)
+    @test !missing_schema["valid"]
+    @test any(c -> occursin("schema", lowercase(c)), missing_schema["contradictions"])
+
+    # A fixture discriminator must not be accepted for a production-shaped
+    # manifest with a missing production artifact.
+    commit["schema_version"] = "fixture-v1"
+    commit["artifact_key_set"] = vcat(commit["artifact_key_set"], "survivor_archive_summary.json")
+    commit["artifact_hashes"]["survivor_archive_summary.json"] = "missing"
+    O.safe_save_json(commit_path, commit)
+    downgraded = O.validate_committed_artifacts(stage_root)
+    @test !downgraded["valid"]
+    @test any(c -> occursin("production", lowercase(c)) || occursin("artifact", lowercase(c)),
+              downgraded["contradictions"])
+
+    commit["schema_version"] = "unknown-v99"
+    O.safe_save_json(commit_path, commit)
+    unknown = O.validate_committed_artifacts(stage_root)
+    @test !unknown["valid"]
 end
 
 function snapshot(paths)

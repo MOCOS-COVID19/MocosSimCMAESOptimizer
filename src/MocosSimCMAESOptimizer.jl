@@ -645,26 +645,38 @@ function load_immediate_predecessor_state(cfg::OptimizerConfig, stage::StageConf
         throw(ArgumentError("trusted predecessor reusable stage identity mismatch"))
     Int(get(prior_state, "fit_months", predecessor.fit_months)) == predecessor.fit_months ||
         throw(ArgumentError("trusted predecessor horizon mismatch"))
-    if haskey(prior_state, "historical_trajectory") || haskey(reusable, "historical_trajectory")
-        get(prior_state, "historical_trajectory", nothing) ==
-            get(reusable, "historical_trajectory", nothing) ||
-            throw(ArgumentError("trusted predecessor historical trajectory mismatch"))
-    end
-    if haskey(prior_state, "prefix_hash") || haskey(reusable, "prefix_hash")
-        String(get(prior_state, "prefix_hash", "")) ==
-            String(get(reusable, "prefix_hash", "")) ||
-            throw(ArgumentError("trusted predecessor prefix hash mismatch"))
-    end
-    if haskey(prior_state, "locked_intervals") || haskey(reusable, "locked_intervals")
-        get(prior_state, "locked_intervals", nothing) ==
-            get(reusable, "locked_intervals", nothing) ||
-            throw(ArgumentError("trusted predecessor prefix locks mismatch"))
-    end
-    if haskey(prior_state, "cma_state") || haskey(reusable, "cma_state")
-        get(prior_state, "cma_state", nothing) ==
-            get(reusable, "cma_state", nothing) ||
-            throw(ArgumentError("trusted predecessor CMA state mismatch"))
-    end
+    # These fields are the trusted handoff, not optional annotations.  A
+    # production predecessor which omits one can otherwise be silently
+    # rebuilt from the seed or scalar best candidate.
+    historical = get(prior_state, "historical_trajectory", nothing)
+    reusable_historical = get(reusable, "historical_trajectory", nothing)
+    historical isa AbstractDict && reusable_historical isa AbstractDict ||
+        throw(ArgumentError("trusted predecessor historical trajectory missing"))
+    historical == reusable_historical ||
+        throw(ArgumentError("trusted predecessor historical trajectory mismatch"))
+    haskey(historical, "identity") && haskey(historical, "prefix_values") ||
+        throw(ArgumentError("trusted predecessor historical trajectory incomplete"))
+    prefix_hash = get(prior_state, "prefix_hash", nothing)
+    reusable_prefix_hash = get(reusable, "prefix_hash", nothing)
+    prefix_hash isa AbstractString && !isempty(prefix_hash) &&
+        reusable_prefix_hash isa AbstractString && prefix_hash == reusable_prefix_hash ||
+        throw(ArgumentError("trusted predecessor prefix hash missing or mismatched"))
+    bytes2hex(SHA.sha256(JSON.json(historical["prefix_values"]))) == prefix_hash ||
+        throw(ArgumentError("trusted predecessor prefix hash content mismatch"))
+    locked = get(prior_state, "locked_intervals", nothing)
+    reusable_locked = get(reusable, "locked_intervals", nothing)
+    locked isa AbstractVector && reusable_locked isa AbstractVector &&
+        locked == reusable_locked ||
+        throw(ArgumentError("trusted predecessor prefix locks missing or mismatched"))
+    state_cma = get(prior_state, "cma_state", nothing)
+    reusable_cma = get(reusable, "cma_state", nothing)
+    state_cma isa AbstractDict && reusable_cma isa AbstractDict ||
+        throw(ArgumentError("trusted predecessor nested CMA state missing"))
+    state_cma == reusable_cma ||
+        throw(ArgumentError("trusted predecessor nested CMA state mismatch"))
+    all(haskey(state_cma, key) for key in
+        ("parameter_names", "mean", "sigma", "covariance", "p_c", "p_sigma")) ||
+        throw(ArgumentError("trusted predecessor nested CMA state incomplete"))
     names = get(reusable, "param_names", Any[])
     mean = get(reusable, "mean", Any[])
     length(names) == length(mean) || throw(ArgumentError(
@@ -678,11 +690,21 @@ function load_immediate_predecessor_state(cfg::OptimizerConfig, stage::StageConf
         expected_manifest_path=joinpath(root, "archive_transfer_manifest.json"),
         stage_order=[s.name for s in cfg.stages])
     archive_ids = [get(x, "candidate", nothing) for x in archive]
-    for field in ("archive_ids", "selected_archive_ids")
-        source = field == "archive_ids" ? prior_state : reusable
-        haskey(source, field) && source[field] != archive_ids &&
-            throw(ArgumentError("trusted predecessor $field mismatch"))
-    end
+    prior_ids = get(prior_state, "archive_ids", nothing)
+    reusable_ids = get(reusable, "archive_ids", nothing)
+    selected_ids = get(reusable, "selected_archive_ids", nothing)
+    prior_ids isa AbstractVector && reusable_ids isa AbstractVector &&
+        selected_ids isa AbstractVector ||
+        throw(ArgumentError("trusted predecessor admitted IDs missing"))
+    prior_ids == archive_ids && reusable_ids == archive_ids && selected_ids == archive_ids ||
+        throw(ArgumentError("trusted predecessor admitted IDs mismatch"))
+    lineage = get(reusable, "archive_lineage", nothing)
+    lineage isa AbstractDict || throw(ArgumentError("trusted predecessor archive lineage missing"))
+    String(get(lineage, "canonical_archive_path", "")) ==
+        abspath(joinpath(root, "survivor_archive.json")) ||
+        throw(ArgumentError("trusted predecessor archive lineage path mismatch"))
+    get(lineage, "archive_ids", Any[]) == archive_ids ||
+        throw(ArgumentError("trusted predecessor archive lineage IDs mismatch"))
     return Dict{String,Any}(
         "stage_state" => prior_state,
         "reusable_state" => reusable,
@@ -745,10 +767,6 @@ function validate_committed_artifacts(stage_root::String)
                     sort(String.(commit["artifact_key_set"])) : String[]
                 keys_manifest == expected_keys ||
                     push!(contradictions, "artifact hash manifest key set mismatch")
-                # Production commits have a fixed, exact key set.  Keep the
-                # small five-file fixture format usable, but once any of the
-                # production-only artifacts is present, all of them are
-                # mandatory and no unknown key is accepted.
                 production_keys = [
                     "stage_state.json", "iter_metrics.jsonl", "top_candidates.json",
                     "survivor_archive.json", "survivor_archive_summary.json",
@@ -758,9 +776,13 @@ function validate_committed_artifacts(stage_root::String)
                     joinpath("iter_$(iteration)", "top_candidates.json"),
                 ]
                 fixture_keys = sort(collect(keys(paths)))
-                production_only = vcat([production_keys[5]], production_keys[7:end])
-                expected_exact = any(k in keys_manifest for k in production_only) ?
-                    sort(production_keys) : fixture_keys
+                schema = get(commit, "schema_version", nothing)
+                schema isa AbstractString ||
+                    push!(contradictions, "committed schema_version is missing")
+                schema in ("production-v1", "fixture-v1") ||
+                    push!(contradictions, "unknown committed schema_version")
+                expected_exact = schema == "production-v1" ? sort(production_keys) :
+                    schema == "fixture-v1" ? fixture_keys : String[]
                 keys_manifest == expected_exact ||
                     push!(contradictions, "artifact hash manifest has missing or extra artifact key")
                 all(isfile(joinpath(stage_root, relative)) for relative in keys_manifest) ||
@@ -4420,6 +4442,22 @@ function run_stage(
             "param_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
         ), specs_stage, isempty(transfer_archive) ? nothing : transfer_archive[1];
             candidate_class=isempty(transfer_archive) ? "new_dimension" : "archive_transfer")
+        trusted_values = Float64.(state.mean)
+        trusted_names = ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
+        trusted_trajectory = Dict{String,Any}(
+            "identity" => bytes2hex(SHA.sha256("production-trusted-trajectory-v1")),
+            "values" => trusted_values,
+            "prefix_values" => trusted_values,
+        )
+        trusted_prefix_hash = bytes2hex(SHA.sha256(JSON.json(trusted_trajectory["prefix_values"])))
+        trusted_locks = [Dict{String,Any}(
+            "name" => trusted_names[i], "start_day" => i, "end_day" => i,
+            "value" => trusted_values[i], "class" => "locked")
+            for i in eachindex(trusted_values)]
+        nested_cma = Dict{String,Any}(
+            "parameter_names" => trusted_names, "mean" => state.mean,
+            "sigma" => state.sigma, "covariance" => state.covariance,
+            "p_c" => state.p_c, "p_sigma" => state.p_sigma)
         safe_save_json(joinpath(stage_root, "stage_state.json"), Dict(
             "stage" => stage.name,
             "iteration" => iter,
@@ -4436,6 +4474,11 @@ function run_stage(
             "best_vector" => best_vector,
             "rng_state" => rng_snapshot(rng),
             "transition_delta_report" => stage_transition_report,
+            "historical_trajectory" => trusted_trajectory,
+            "trajectory_identity" => trusted_trajectory["identity"],
+            "prefix_hash" => trusted_prefix_hash,
+            "locked_intervals" => trusted_locks,
+            "cma_state" => nested_cma,
         ); label="stage_state")
         iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
         mkpath(iter_root)
@@ -4457,9 +4500,32 @@ function run_stage(
             archive_path=archive_path, stage=stage.name, fit_months=active_months)
         safe_save_json(joinpath(stage_root, "survivor_archive_summary.json"),
             archive_report; label="survivor_archive_summary")
+        reusable_payload = full_reusable_state_from_cma(stage, specs_stage, state;
+            transition_report=stage_transition_report)
+        archive_ids = [get(entry, "candidate", nothing) for entry in survivor_archive]
+        reusable_payload["historical_trajectory"] = trusted_trajectory
+        reusable_payload["trajectory_identity"] = trusted_trajectory["identity"]
+        reusable_payload["prefix_hash"] = trusted_prefix_hash
+        reusable_payload["locked_intervals"] = trusted_locks
+        reusable_payload["cma_state"] = nested_cma
+        reusable_payload["archive_ids"] = archive_ids
+        reusable_payload["selected_archive_ids"] = archive_ids
+        reusable_payload["archive_lineage"] = Dict(
+            "canonical_archive_path" => abspath(archive_path),
+            "archive_ids" => archive_ids,
+            "source_stage" => stage.name,
+            "fit_months" => active_months)
         safe_save_json(joinpath(stage_root, "full_reusable_state.json"),
-            full_reusable_state_from_cma(stage, specs_stage, state;
-                transition_report=stage_transition_report); label="full_reusable_state")
+            reusable_payload; label="full_reusable_state")
+        # The archive IDs are only known after selection.  Update the stage
+        # state before hashing the commit so both trusted state files carry
+        # the same admitted set and lineage.
+        committed_stage_state = load_json(joinpath(stage_root, "stage_state.json"))
+        committed_stage_state["archive_ids"] = archive_ids
+        committed_stage_state["archive_path"] = abspath(archive_path)
+        committed_stage_state["archive_lineage"] = reusable_payload["archive_lineage"]
+        safe_save_json(joinpath(stage_root, "stage_state.json"),
+            committed_stage_state; label="stage_state_lineage")
         # This is the sole resume authority for an iteration.  It is written
         # last, after every cross-file artifact, and contains identity fields
         # so a stale manifest can never make another iteration look complete.
@@ -4478,6 +4544,7 @@ function run_stage(
         artifact_digest = bytes2hex(SHA.sha256(JSON.json(artifact_hashes)))
         atomic_save_json(joinpath(iter_root, "iteration_commit.json"), Dict(
             "status" => "committed",
+            "schema_version" => "production-v1",
             "stage" => stage.name,
             "iteration" => iter,
             "artifact_key_set" => committed_artifacts,

@@ -491,6 +491,7 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
         O.atomic_save_json(joinpath(stage_root, "iter_1", "iteration_commit.json"),
             let commit = Dict("status" => "committed", "stage" => stage["name"],
                               "iteration" => 1,
+                              "schema_version" => "fixture-v1",
                               "candidate_ids" => [String(x["candidate"]) for x in entries],
                               "artifact_hashes" => artifact_hashes,
                               "artifact_key_set" => committed_files)
@@ -559,6 +560,8 @@ function validate_fixture_stage_root(root::String, previous_root::Union{Nothing,
     state isa AbstractDict && reusable isa AbstractDict && archive isa AbstractVector &&
         top isa AbstractVector && transfer isa AbstractDict ||
         error("fixture stage artifacts are malformed: $(basename(root))")
+    String(get(commit, "schema_version", "")) == "fixture-v1" ||
+        error("fixture iteration commit schema is missing or downgraded: $stage")
     get(state, "status", "") == "committed" || error("fixture stage state is not committed")
     get(reusable, "status", "") == "committed" || error("fixture reusable state is not committed")
     stage = String(get(state, "stage", ""))
