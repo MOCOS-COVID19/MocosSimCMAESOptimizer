@@ -631,7 +631,7 @@ function load_immediate_predecessor_state(cfg::OptimizerConfig, stage::StageConf
     index == 1 && return nothing
     predecessor = cfg.stages[index - 1]
     root = joinpath(cfg.output_dir, "real_sims", predecessor.name)
-    check = validate_committed_artifacts(root)
+    check = validate_committed_artifacts(root, "production-v1")
     check["valid"] || throw(ArgumentError(
         "trusted predecessor artifacts failed validation: " *
         join(String.(check["contradictions"]), "; ")))
@@ -714,7 +714,7 @@ function load_immediate_predecessor_state(cfg::OptimizerConfig, stage::StageConf
 end
 
 """Validate and join the durable artifacts of one committed iteration."""
-function validate_committed_artifacts(stage_root::String)
+function validate_committed_artifacts(stage_root::String, expected_schema::AbstractString)
     required = ["stage_state.json", "iter_metrics.jsonl",
         "top_candidates.json", "survivor_archive.json", "full_reusable_state.json"]
     paths = Dict(name => joinpath(stage_root, name) for name in required)
@@ -777,10 +777,14 @@ function validate_committed_artifacts(stage_root::String)
                 ]
                 fixture_keys = sort(collect(keys(paths)))
                 schema = get(commit, "schema_version", nothing)
+                expected_schema in ("production-v1", "fixture-v1") ||
+                    push!(contradictions, "unknown expected committed schema context")
                 schema isa AbstractString ||
                     push!(contradictions, "committed schema_version is missing")
                 schema in ("production-v1", "fixture-v1") ||
                     push!(contradictions, "unknown committed schema_version")
+                schema == expected_schema ||
+                    push!(contradictions, "committed schema_version does not match expected context")
                 expected_exact = schema == "production-v1" ? sort(production_keys) :
                     schema == "fixture-v1" ? fixture_keys : String[]
                 keys_manifest == expected_exact ||
@@ -889,6 +893,12 @@ function validate_committed_artifacts(stage_root::String)
         "jsonl_record_count" => length(metrics), "candidate_ids" => identities,
         "top_candidate_ids" => top_ids, "archive_candidate_ids" => archive_ids,
         "artifact_hashes" => hashes)
+end
+
+# Keep the context requirement explicit while allowing callers that prefer a
+# named argument to state the same contract.
+function validate_committed_artifacts(stage_root::String; expected_schema::AbstractString)
+    validate_committed_artifacts(stage_root, expected_schema)
 end
 
 function latest_iteration_top_candidates(stage_root::String)
@@ -3881,7 +3891,7 @@ function run_stage(
     stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
     resume_state = load_stage_state(stage_root)
     if resume_state !== nothing
-        committed_check = validate_committed_artifacts(stage_root)
+        committed_check = validate_committed_artifacts(stage_root, "production-v1")
         committed_check["valid"] ||
             throw(ArgumentError("committed stage artifacts failed validation: " *
                                 join(String.(committed_check["contradictions"]), "; ")))
@@ -4595,7 +4605,7 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
         stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
         if stage_index > 1
             predecessor_root = joinpath(cfg.output_dir, "real_sims", cfg.stages[stage_index - 1].name)
-            predecessor_check = validate_committed_artifacts(predecessor_root)
+            predecessor_check = validate_committed_artifacts(predecessor_root, "production-v1")
             predecessor_check["valid"] ||
                 throw(ArgumentError("predecessor stage artifacts failed validation: " *
                                     join(String.(predecessor_check["contradictions"]), "; ")))

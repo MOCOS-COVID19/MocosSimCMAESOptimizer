@@ -53,10 +53,10 @@ end
     commit = O.load_json(commit_path)
 
     # A fixture contract is explicit, while omission is never inferred.
-    @test O.validate_committed_artifacts(stage_root)["valid"]
+    @test O.validate_committed_artifacts(stage_root, "fixture-v1")["valid"]
     delete!(commit, "schema_version")
     O.safe_save_json(commit_path, commit)
-    missing_schema = O.validate_committed_artifacts(stage_root)
+    missing_schema = O.validate_committed_artifacts(stage_root, "fixture-v1")
     @test !missing_schema["valid"]
     @test any(c -> occursin("schema", lowercase(c)), missing_schema["contradictions"])
 
@@ -66,15 +66,72 @@ end
     commit["artifact_key_set"] = vcat(commit["artifact_key_set"], "survivor_archive_summary.json")
     commit["artifact_hashes"]["survivor_archive_summary.json"] = "missing"
     O.safe_save_json(commit_path, commit)
-    downgraded = O.validate_committed_artifacts(stage_root)
+    downgraded = O.validate_committed_artifacts(stage_root, "fixture-v1")
     @test !downgraded["valid"]
     @test any(c -> occursin("production", lowercase(c)) || occursin("artifact", lowercase(c)),
               downgraded["contradictions"])
 
     commit["schema_version"] = "unknown-v99"
     O.safe_save_json(commit_path, commit)
-    unknown = O.validate_committed_artifacts(stage_root)
+    unknown = O.validate_committed_artifacts(stage_root, "fixture-v1")
     @test !unknown["valid"]
+end
+
+@testset "production loader rejects recomputed fixture downgrade" begin
+    root = mktempdir()
+    stage_root, _ = write_committed_fixture(root)
+    commit_path = joinpath(stage_root, "iter_1", "iteration_commit.json")
+    commit = O.load_json(commit_path)
+    production_keys = [
+        "stage_state.json", "iter_metrics.jsonl", "top_candidates.json",
+        "survivor_archive.json", "survivor_archive_summary.json",
+        "full_reusable_state.json", "archive_transfer_manifest.json",
+        "iter_1/candidate_list.txt", "iter_1/cma_sampling_state.json",
+        "iter_1/top_candidates.json",
+    ]
+    for relative in production_keys
+        path = joinpath(stage_root, relative)
+        mkpath(dirname(path))
+        isfile(path) || write(path, "{}")
+    end
+    hashes = Dict{String,Any}(
+        relative => bytes2hex(SHA.sha256(read(joinpath(stage_root, relative))))
+        for relative in production_keys
+    )
+    commit["schema_version"] = "production-v1"
+    commit["artifact_key_set"] = production_keys
+    commit["artifact_hashes"] = hashes
+    commit["artifact_hash_manifest"] = bytes2hex(SHA.sha256(JSON.json(hashes)))
+    commit["artifact_integrity_digest"] = commit["artifact_hash_manifest"]
+    O.safe_save_json(commit_path, commit)
+    @test O.validate_committed_artifacts(stage_root, "production-v1")["valid"]
+
+    # Forge a fixture-shaped downgrade, including fresh hashes and digests.
+    for relative in setdiff(production_keys, [
+        "stage_state.json", "iter_metrics.jsonl", "top_candidates.json",
+        "survivor_archive.json", "full_reusable_state.json",
+    ])
+        rm(joinpath(stage_root, relative))
+    end
+    fixture_keys = [
+        "stage_state.json", "iter_metrics.jsonl", "top_candidates.json",
+        "survivor_archive.json", "full_reusable_state.json",
+    ]
+    fixture_hashes = Dict{String,Any}(
+        relative => bytes2hex(SHA.sha256(read(joinpath(stage_root, relative))))
+        for relative in fixture_keys
+    )
+    commit["schema_version"] = "fixture-v1"
+    commit["artifact_key_set"] = fixture_keys
+    commit["artifact_hashes"] = fixture_hashes
+    commit["artifact_hash_manifest"] = bytes2hex(SHA.sha256(JSON.json(fixture_hashes)))
+    commit["artifact_integrity_digest"] = commit["artifact_hash_manifest"]
+    O.safe_save_json(commit_path, commit)
+    @test O.validate_committed_artifacts(stage_root, "fixture-v1")["valid"]
+    forged = O.validate_committed_artifacts(stage_root, "production-v1")
+    @test !forged["valid"]
+    @test any(occursin("context", lowercase(c)) || occursin("schema", lowercase(c))
+              for c in forged["contradictions"])
 end
 
 function snapshot(paths)
@@ -85,7 +142,7 @@ end
     root = mktempdir()
     stage_root, first_write = write_committed_fixture(root)
     @test first_write
-    first = O.validate_committed_artifacts(stage_root)
+    first = O.validate_committed_artifacts(stage_root, "fixture-v1")
     @test first["valid"]
     @test isempty(first["contradictions"])
     files = sort(filter(isfile, [joinpath(stage_root, n) for n in
@@ -98,7 +155,7 @@ end
     @test !second_write
     after = snapshot(files)
     @test before == after
-    second = O.validate_committed_artifacts(stage_root)
+    second = O.validate_committed_artifacts(stage_root, "fixture-v1")
     @test second["candidate_ids"] == first["candidate_ids"]
     @test second["artifact_hashes"] == first["artifact_hashes"]
     @test second["jsonl_record_count"] == 3
@@ -111,7 +168,7 @@ end
     rows = O.load_json(path)
     rows[1]["status"] = "failed"
     O.safe_save_json(path, rows)
-    report = O.validate_committed_artifacts(stage_root)
+    report = O.validate_committed_artifacts(stage_root, "fixture-v1")
     @test !report["valid"]
     @test any(occursin("status", c) || occursin("contradiction", c)
               for c in report["contradictions"])
@@ -132,14 +189,14 @@ end
     commit["artifact_key_set"] = committed
     commit["artifact_hash_manifest"] = bytes2hex(SHA.sha256(JSON.json(hashes)))
     O.safe_save_json(commit_path, commit)
-    @test O.validate_committed_artifacts(stage_root)["valid"]
+    @test O.validate_committed_artifacts(stage_root, "fixture-v1")["valid"]
 
     commit = O.load_json(commit_path)
     commit["artifact_hashes"]["unexpected.json"] = bytes2hex(SHA.sha256(UInt8[]))
     commit["artifact_key_set"] = vcat(commit["artifact_key_set"], ["unexpected.json"])
     write(joinpath(stage_root, "unexpected.json"), "{}")
     O.safe_save_json(commit_path, commit)
-    extra = O.validate_committed_artifacts(stage_root)
+    extra = O.validate_committed_artifacts(stage_root, "fixture-v1")
     @test !extra["valid"]
     @test any(occursin("unexpected", c) || occursin("artifact key", c)
               for c in extra["contradictions"])
@@ -151,7 +208,7 @@ end
         bytes2hex(SHA.sha256(JSON.json(commit["artifact_hashes"])))
     commit["artifact_integrity_digest"] = commit["artifact_hash_manifest"]
     O.safe_save_json(commit_path, commit)
-    missing = O.validate_committed_artifacts(stage_root)
+    missing = O.validate_committed_artifacts(stage_root, "fixture-v1")
     @test !missing["valid"]
     @test any(occursin("missing or extra", c) || occursin("required key", c)
               for c in missing["contradictions"])
@@ -166,7 +223,7 @@ end
     open(joinpath(stage_root, "survivor_archive.json"), "a") do io
         print(io, "\n")
     end
-    tampered = O.validate_committed_artifacts(stage_root)
+    tampered = O.validate_committed_artifacts(stage_root, "fixture-v1")
     @test !tampered["valid"]
     @test any(occursin("hash", lowercase(c)) for c in tampered["contradictions"])
 end
