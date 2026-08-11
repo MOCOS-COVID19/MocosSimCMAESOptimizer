@@ -73,18 +73,15 @@ function _read_named_gt_csv(path::String)
     return rows
 end
 
+function _gt_validation_error(err)
+    message = replace(sprint(showerror, err), r"^ArgumentError:\s*" => "")
+    code = occursin("header", lowercase(message)) ? "invalid_header" :
+           occursin("row", lowercase(message)) || occursin("parse", lowercase(message)) ||
+           occursin("value", lowercase(message)) ? "invalid_value" : "invalid_schema"
+    return Dict{String,Any}("code"=>code, "message"=>message)
+end
+
 function _validate_gt_dir(gt_dir::String)
-    csvs = Dict{String,Any}()
-    for file in readdir(gt_dir)
-        endswith(lowercase(file), ".csv") || continue
-        path = joinpath(gt_dir, file)
-        rows = _read_named_gt_csv(path)
-        days = first.(rows)
-        csvs[file] = Dict("path"=>path, "observations"=>length(rows),
-                          "days"=>days, "valid"=>true,
-                          "day_policy"=>"positive_unique_strictly_increasing")
-    end
-    isempty(csvs) && throw(ArgumentError("ground_truth has no CSV files"))
     optional_files = Dict(
         "daily_student_detections" => "sax-scholars-infections-normalized.csv",
         "daily_age_total_detections" => "daily_age_total_detections.csv",
@@ -104,16 +101,41 @@ function _validate_gt_dir(gt_dir::String)
         "household_infections" => "household_infections.csv",
         "household_infection_rate" => "household_infection_rate.csv",
     )
+    optional_by_file = Dict(file => name for (name, file) in optional_files)
+    csvs = Dict{String,Any}()
+    for file in readdir(gt_dir)
+        endswith(lowercase(file), ".csv") || continue
+        path = joinpath(gt_dir, file)
+        # Optional inputs are represented in optional_fields below.  Their
+        # presence must not turn a malformed optional metric into a required
+        # preflight failure.
+        haskey(optional_by_file, file) && continue
+        rows = _read_named_gt_csv(path)
+        days = first.(rows)
+        csvs[file] = Dict("path"=>path, "observations"=>length(rows),
+                          "days"=>days, "valid"=>true,
+                          "day_policy"=>"positive_unique_strictly_increasing",
+                          "sha256"=>_path_hash(path))
+    end
+    isempty(csvs) && isempty(filter(isfile, (joinpath(gt_dir, f) for f in values(optional_files)))) &&
+        throw(ArgumentError("ground_truth has no CSV files"))
     optional = Dict{String,Any}()
     for (name, file) in optional_files
         path = joinpath(gt_dir, file)
         if isfile(path)
-            rows = _read_named_gt_csv(path)
-            optional[name] = Dict("present"=>true, "status"=>"valid",
-                                  "path"=>path, "observations"=>length(rows))
+            try
+                rows = _read_named_gt_csv(path)
+                optional[name] = Dict("present"=>true, "status"=>"valid",
+                                      "validation_status"=>"valid", "path"=>path,
+                                      "observations"=>length(rows), "sha256"=>_path_hash(path))
+            catch err
+                optional[name] = Dict("present"=>true, "status"=>"invalid",
+                                      "validation_status"=>"invalid", "path"=>path,
+                                      "sha256"=>_path_hash(path), "error"=>_gt_validation_error(err))
+            end
         else
             optional[name] = Dict("present"=>false, "status"=>"absent",
-                                  "path"=>path)
+                                  "validation_status"=>"absent", "path"=>path)
         end
     end
     csvs["optional_fields"] = optional

@@ -221,3 +221,28 @@ end
     @test manifest["optional_fields"]["daily_age_total_detections"]["status"] == "valid"
     @test !manifest["optional_fields"]["household_infections"]["present"]
 end
+
+@testset "malformed optional ground truth is reported without aborting preflight" begin
+    root, path, sources = model_schema_fixture()
+    gt = joinpath(dirname(path), "gt")
+    optional_path = joinpath(gt, "daily_age_00_04_detections.csv")
+    write(optional_path, "observed,day\nnot-a-number,1\n")
+    optional_hash = bytes2hex(open(sha256, optional_path))
+
+    manifest = O.preflight_config(path; readiness=true)
+    entry = manifest["ground_truth"]["optional_fields"]["daily_age_00_04_detections"]
+    @test manifest["valid"]
+    @test entry["present"] === true
+    @test entry["validation_status"] == "invalid"
+    @test entry["status"] == "invalid"
+    @test entry["error"]["code"] == "invalid_value"
+    @test entry["error"]["message"] ==
+          "ground_truth.daily_age_00_04_detections.csv invalid value at row 2"
+    @test entry["sha256"] == optional_hash
+
+    required_path = joinpath(gt, "required_malformed.csv")
+    write(required_path, "day,value\n1,not-a-number\n")
+    err = try O.preflight_config(path; readiness=true) catch e; e end
+    @test err isa ArgumentError
+    @test occursin("required_malformed.csv invalid value", sprint(showerror, err))
+end
