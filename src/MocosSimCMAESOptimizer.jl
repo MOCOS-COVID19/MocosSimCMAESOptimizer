@@ -146,8 +146,9 @@ function determine_search_policy(cfg::OptimizerConfig, stage::StageConfig)
     end
 end
 
-function full_reusable_state_from_cma(stage::StageConfig, specs_stage::Vector{ParamSpec}, state::CMAState)
-    return Dict(
+function full_reusable_state_from_cma(stage::StageConfig, specs_stage::Vector{ParamSpec}, state::CMAState;
+                                      transition_report=nothing)
+    result = Dict(
         "stage" => stage.name,
         "fit_months" => stage.fit_months,
         "param_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
@@ -158,6 +159,8 @@ function full_reusable_state_from_cma(stage::StageConfig, specs_stage::Vector{Pa
         "p_c" => state.p_c,
         "p_sigma" => state.p_sigma,
     )
+    transition_report === nothing || (result["transition_delta_report"] = transition_report)
+    return result
 end
 
 function stage_transition_state(
@@ -241,7 +244,8 @@ end
 """Report effective named-coordinate deltas for a transition."""
 function transition_delta_report(previous::AbstractDict, current::AbstractDict;
     coordinate_space::String="effective", version::String="v1",
-    limit::Float64=0.15, candidate_class::String="archive_transfer")
+    limit::Float64=0.15, candidate_class::String="archive_transfer",
+    coordinate_classes=nothing, policy::String="reject")
     old_names = String.(get(previous, "param_names", String[]))
     new_names = String.(get(current, "param_names", String[]))
     old_values = Float64.(get(previous, "values", get(previous, "mean", Float64[])))
@@ -253,10 +257,21 @@ function transition_delta_report(previous::AbstractDict, current::AbstractDict;
         old = has_old ? old_values[old_map[name]] : nothing
         new = i <= length(new_values) ? new_values[i] : NaN
         delta = has_old ? new - old : 0.0
-        klass = has_old ? "archive_transfer" : "new_dimension"
+        klass = coordinate_classes !== nothing && i <= length(coordinate_classes) ?
+            String(coordinate_classes[i]) :
+            (has_old ? (abs(delta) <= 1e-12 ? "locked" : "archive_transfer") : "new_dimension")
+        outcome = if !has_old || abs(delta) <= limit
+            "accepted"
+        elseif policy == "clip"
+            "clipped"
+        elseif policy == "exception"
+            "exception"
+        else
+            "rejected"
+        end
         push!(rows, Dict("name" => name, "raw_value" => new, "effective_value" => new,
             "prior_value" => old, "delta" => delta, "class" => klass,
-            "limit" => limit, "policy_outcome" => (!has_old || abs(delta) <= limit) ? "accepted" : "over_limit",
+            "limit" => limit, "policy_outcome" => outcome,
             "provenance" => candidate_class))
     end
     deltas = [abs(Float64(r["delta"])) for r in rows if r["class"] == "archive_transfer"]
@@ -264,7 +279,7 @@ function transition_delta_report(previous::AbstractDict, current::AbstractDict;
         "candidate_class" => candidate_class, "coordinates" => rows,
         "max_abs_delta" => isempty(deltas) ? 0.0 : maximum(deltas),
         "norm" => isempty(deltas) ? 0.0 : norm(deltas), "limit" => limit,
-        "policy_outcome" => any(x > limit for x in deltas) ? "over_limit" : "accepted")
+        "policy_outcome" => any(x > limit for x in deltas) ? policy : "accepted")
 end
 
 """Validate all dimensions and numerical invariants before CMA sampling."""
@@ -371,6 +386,7 @@ function build_state_from_reusable(
     covariance_inflation::Float64=1.75,
     sigma_multiplier::Float64=1.25,
     new_dimension_variance::Float64=2.0,
+    rng::AbstractRNG,
 )
     old_names = [String(x) for x in reusable["param_names"]]
     old_mean = Float64.(reusable["mean"])
@@ -427,7 +443,7 @@ function build_state_from_reusable(
                 if mapped[pos]
                     jitter_scale = temporal_mean_jitter * (0.5 + frac)
                     new_mean[pos] = clamp(
-                        new_mean[pos] + jitter_scale * (2rand() - 1),
+                        new_mean[pos] + jitter_scale * (2rand(rng) - 1),
                         spec.lower,
                         spec.upper,
                     )
@@ -451,7 +467,8 @@ function build_state_from_reusable(
     )
 end
 
-function temporal_unlock_from_top_candidates!(state::CMAState, specs_stage::Vector{ParamSpec}, top_candidates)
+function temporal_unlock_from_top_candidates!(state::CMAState, specs_stage::Vector{ParamSpec}, top_candidates;
+                                              rng::AbstractRNG)
     top_candidates === nothing && return state
     top_candidates isa AbstractVector || return state
     isempty(top_candidates) && return state
@@ -487,7 +504,7 @@ function temporal_unlock_from_top_candidates!(state::CMAState, specs_stage::Vect
                 unlock = clamp(spread / max(spec.upper - spec.lower, 1e-6), 0.0, 1.0)
                 jitter_scale = 0.05 + 0.20 * unlock + 0.08 * frac
                 state.mean[pos] = clamp(
-                    state.mean[pos] + jitter_scale * (2rand() - 1),
+                    state.mean[pos] + jitter_scale * (2rand(rng) - 1),
                     spec.lower,
                     spec.upper,
                 )
@@ -500,7 +517,8 @@ function temporal_unlock_from_top_candidates!(state::CMAState, specs_stage::Vect
     return state
 end
 
-function temporal_unlock_from_bucket_errors!(state::CMAState, specs_stage::Vector{ParamSpec}, top_candidates)
+function temporal_unlock_from_bucket_errors!(state::CMAState, specs_stage::Vector{ParamSpec}, top_candidates;
+                                             rng::AbstractRNG)
     top_candidates === nothing && return state
     top_candidates isa AbstractVector || return state
     isempty(top_candidates) && return state
@@ -527,7 +545,7 @@ function temporal_unlock_from_bucket_errors!(state::CMAState, specs_stage::Vecto
                     unlock = clamp(errors[bi] / max_err, 0.0, 1.0)
                     jitter_scale = 0.04 + 0.22 * unlock + 0.06 * frac
                     state.mean[pos] = clamp(
-                        state.mean[pos] + jitter_scale * (2rand() - 1),
+                        state.mean[pos] + jitter_scale * (2rand(rng) - 1),
                         spec.lower,
                         spec.upper,
                     )
@@ -696,18 +714,70 @@ function archive_vector_for_stage(entry::AbstractDict, specs_stage::Vector{Param
     return vector
 end
 
-function load_transfer_survivor_archive(output_dir::String, current_stage::String)
-    archive = Any[]
-    isdir(output_dir) || return archive
-    for entry in readdir(output_dir)
-        entry == current_stage && continue
-        path = joinpath(output_dir, entry, "survivor_archive.json")
-        isfile(path) || continue
-        values = try load_json(path) catch; Any[] end
-        values isa AbstractVector || continue
-        append!(archive, values)
+function load_transfer_survivor_archive(output_dir::String, current_stage::String;
+                                        predecessor_stage::Union{Nothing,String}=nothing)
+    # Only the immediate, canonical predecessor is trusted.  Searching all
+    # sibling stages can silently mix incompatible horizons and provenance.
+    predecessor_stage === nothing && return Any[]
+    path = joinpath(output_dir, predecessor_stage, "survivor_archive.json")
+    isfile(path) || return Any[]
+    values = try load_json(path) catch; Any[] end
+    values isa AbstractVector || return Any[]
+    return deepcopy(values)
+end
+
+function archive_entry_config(archive)
+    archive isa AbstractVector || return nothing
+    for entry in archive
+        entry isa AbstractDict || continue
+        cfg = get(entry, "config", nothing)
+        cfg isa AbstractDict || continue
+        return deepcopy(cfg)
     end
-    return survivor_archive_update(Any[], archive)
+    return nothing
+end
+
+function effective_transition_report(seed::AbstractDict, cfg::AbstractDict,
+                                    specs_stage::Vector{ParamSpec},
+                                    source_entry=nothing;
+                                    candidate_class::String="new_dimension",
+                                    limit::Float64=0.15)
+    names = ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
+    values = if haskey(cfg, "values")
+        Float64.(cfg["values"])
+    else
+        collected = Float64[]
+        for spec in specs_stage
+            raw = try get_nested(cfg, spec.name) catch; Any[] end
+            raw isa AbstractVector || (raw = [raw])
+            for value in raw
+                value isa Number && push!(collected, Float64(value))
+            end
+        end
+        collected
+    end
+    prior = if source_entry isa AbstractDict
+        Dict{String,Any}(
+            "param_names" => get(source_entry, "parameter_names", String[]),
+            "values" => get(source_entry, "evaluated_vector", Float64[]),
+        )
+    else
+        Dict{String,Any}("param_names" => names, "values" => initial_vector(seed, specs_stage))
+    end
+    current = Dict{String,Any}("param_names" => names, "values" => values)
+    source_names = String.(get(prior, "param_names", String[]))
+    classes = if candidate_class == "archive_transfer"
+        old_values = Float64.(get(prior, "values", Float64[]))
+        old_map = Dict(name => i for (i, name) in enumerate(source_names))
+        [haskey(old_map, name) && old_map[name] <= length(old_values) &&
+             i <= length(values) && abs(values[i] - old_values[old_map[name]]) <= 1e-12 ?
+             "locked" : (name in source_names ? "archive_transfer" : "new_dimension")
+         for (i, name) in enumerate(names)]
+    else
+        [candidate_class for _ in names]
+    end
+    return transition_delta_report(prior, current;
+        candidate_class=candidate_class, coordinate_classes=classes, limit=limit)
 end
 
 function stage_resume_info(stage_root::String)
@@ -2435,6 +2505,7 @@ function append_cma_candidate_record(
     metrics::AbstractDict,
     metrics_path::String,
     parameter_names::Vector{String},
+    transition_report::Union{Nothing,AbstractDict}=nothing,
 )
     metric_values = haskey(metrics, "metrics") && metrics["metrics"] isa AbstractDict ?
         metrics["metrics"] :
@@ -2453,6 +2524,7 @@ function append_cma_candidate_record(
         "score" => score,
         "vector_log_likelihood" => get(metric_values, "vector_log_likelihood", -Float64(score)),
         "metrics_path" => metrics_path,
+        "transition_delta_report" => transition_report,
         "simulation_distribution" => Dict(
             "mean" => state.mean,
             "sigma" => state.sigma,
@@ -2496,12 +2568,20 @@ function run_stage(
     use_slurm::Bool=false,
     resume_from::Int=0,
     previous_specs::Union{Nothing,Vector{ParamSpec}}=nothing,
+    predecessor_archive=Any[],
 )
     active_months = stage.fit_months
     days = active_months * cfg.monthly_days
     policy = determine_search_policy(cfg, stage)
     specs_stage = stage_specs(seed, specs, cfg, stage)
     dim = sum(spec.length for spec in specs_stage)
+    stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
+    resume_state = load_stage_state(stage_root)
+    if resume_state !== nothing && haskey(resume_state, "rng_state")
+        # Restore before reusable-state construction or unlock logic can
+        # consume a different stream position.
+        copy!(rng, restore_rng(resume_state["rng_state"]))
+    end
     received_prior = state !== nothing
     if state === nothing
         x0 = initial_vector(seed, specs_stage)
@@ -2517,10 +2597,10 @@ function run_stage(
                 covariance_inflation=cfg.posterior.transfer_covariance_inflation,
                 sigma_multiplier=cfg.posterior.transfer_sigma_multiplier,
                 new_dimension_variance=cfg.posterior.new_dimension_variance,
+                rng=rng,
             )
-            stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
             top_candidates = latest_iteration_top_candidates(stage_root)
-            state = temporal_unlock_from_bucket_errors!(state, specs_stage, top_candidates)
+            state = temporal_unlock_from_bucket_errors!(state, specs_stage, top_candidates; rng=rng)
         else
             seeded = initial_state_from_config(cfg, dim, x0)
             state = seeded === nothing ? CMAState(copy(x0), stage.sigma, Matrix{Float64}(I, dim, dim)) : seeded
@@ -2543,7 +2623,6 @@ function run_stage(
         copy(state.p_sigma),
     )
 
-    stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
     safe_save_json(joinpath(stage_root, "experiment_manifest.json"), Dict(
         "schema_version" => "experiment-v1",
         "experiment_type" => "cma_stage",
@@ -2568,10 +2647,6 @@ function run_stage(
             "min_parameter_distance" => SURVIVOR_MIN_DISTANCE,
         ),
     ); label="experiment_manifest")
-    resume_state = load_stage_state(stage_root)
-    if resume_state !== nothing && haskey(resume_state, "rng_state")
-        rng = restore_rng(resume_state["rng_state"])
-    end
     history = Any[]
     iter_log = Any[]
     top_candidates = Dict{String,Dict{String,Any}}()
@@ -2582,9 +2657,7 @@ function run_stage(
     archive_path = joinpath(stage_root, "survivor_archive.json")
     survivor_archive = isfile(archive_path) ? load_json(archive_path) : Any[]
     survivor_archive isa AbstractVector || (survivor_archive = Any[])
-    transfer_archive = received_prior ?
-        load_transfer_survivor_archive(cfg.output_dir, stage.name) :
-        Any[]
+    transfer_archive = received_prior ? deepcopy(predecessor_archive) : Any[]
     if resume_state !== nothing && haskey(resume_state, "best_vector")
         sigma_raw = get(resume_state, "sigma", state.sigma)
         sigma_resume = sigma_raw isa AbstractVector ?
@@ -2675,6 +2748,10 @@ function run_stage(
                 cand_cfg = vector_to_config(seed, specs_stage, x, active_months)
                 inject_frozen!(cand_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
                 inject_temporal_prefix_locks!(cand_cfg, seed, previous_specs)
+                transfer_entry = ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
+                candidate_class = transfer_entry === nothing ? "immigrant/escape" : "archive_transfer"
+                transition_report = effective_transition_report(seed, cand_cfg, specs_stage, transfer_entry;
+                    candidate_class=candidate_class)
                 skipped = isfile(joinpath(cand_dir, "skipped.ok"))
                 metrics = if skipped
                     metrics_payload = Dict("score" => Inf, "simulated" => "real_skipped", "status" => "skipped")
@@ -2763,7 +2840,8 @@ function run_stage(
                     append_cma_candidate_record(
                         iter_root, stage, iter, ci, cand, x, zs[ci], clip_info,
                         state, score, metrics, joinpath(cand_dir, "metrics.json"),
-                        ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
+                        ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
+                        transition_report
                     )
                 end
                 append_jsonl(joinpath(stage_root, "iter_metrics.jsonl"), Dict(
@@ -2806,6 +2884,7 @@ function run_stage(
                     "parameter_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
                     "config" => deepcopy(cand_cfg),
                     "metrics" => metrics,
+                    "transition_delta_report" => transition_report,
                 )
                 top_candidates[key] = candidate_entry
                 push!(iteration_top_candidates, candidate_entry)
@@ -2826,6 +2905,10 @@ function run_stage(
                 candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
                 inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
                 inject_temporal_prefix_locks!(candidate_cfg, seed, previous_specs)
+                transfer_entry = ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
+                candidate_class = transfer_entry === nothing ? "immigrant/escape" : "archive_transfer"
+                transition_report = effective_transition_report(seed, candidate_cfg, specs_stage, transfer_entry;
+                    candidate_class=candidate_class)
                 metrics = score_candidate(candidate_cfg, cfg, days; workdir=joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"))
                 safe_save_json(joinpath(joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"), "metrics.json"), metrics; label="candidate_metrics")
                 score = metrics["score"]
@@ -2833,7 +2916,8 @@ function run_stage(
                     append_cma_candidate_record(
                         iter_root, stage, iter, ci, cand, x, zs[ci], clip_info,
                         state, score, metrics, joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)", "metrics.json"),
-                        ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
+                        ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
+                        transition_report
                     )
                 end
                 push!(history, Dict(
@@ -2857,6 +2941,7 @@ function run_stage(
                     "evaluated_vector" => copy(x),
                     "parameter_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
                     "metrics" => metrics,
+                    "transition_delta_report" => transition_report,
                 )
                 top_candidates[key] = candidate_entry
                 push!(iteration_top_candidates, candidate_entry)
@@ -2882,6 +2967,11 @@ function run_stage(
             "sigma" => state.sigma,
             "covariance_trace" => tr(state.covariance),
         ))
+        stage_transition_report = effective_transition_report(seed, Dict(
+            "values" => state.mean,
+            "param_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
+        ), specs_stage, isempty(transfer_archive) ? nothing : transfer_archive[1];
+            candidate_class=isempty(transfer_archive) ? "new_dimension" : "archive_transfer")
         safe_save_json(joinpath(stage_root, "stage_state.json"), Dict(
             "stage" => stage.name,
             "search_policy" => policy.name,
@@ -2895,13 +2985,16 @@ function run_stage(
             "cma_diagnostics" => cma_diagnostics(state),
             "best_vector" => best_vector,
             "rng_state" => rng_snapshot(rng),
+            "transition_delta_report" => stage_transition_report,
         ); label="stage_state")
         iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
         mkpath(iter_root)
         safe_save_json(joinpath(iter_root, "top_candidates.json"), safe_iteration_top_k(iteration_top_candidates, cfg.objective.top_k); label="iteration_top_candidates")
         survivor_archive = survivor_archive_update(survivor_archive, iteration_top_candidates)
         safe_save_json(archive_path, survivor_archive; label="survivor_archive")
-        safe_save_json(joinpath(stage_root, "full_reusable_state.json"), full_reusable_state_from_cma(stage, specs_stage, state); label="full_reusable_state")
+        safe_save_json(joinpath(stage_root, "full_reusable_state.json"),
+            full_reusable_state_from_cma(stage, specs_stage, state;
+                transition_report=stage_transition_report); label="full_reusable_state")
         @info "Finished iteration" stage=stage.name iteration=iter best_score=best_score sigma=state.sigma top_candidates_written=length(iteration_top_candidates)
     end
 
@@ -2936,6 +3029,7 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
     state = nothing
     previous_specs = nothing
     current_seed = deepcopy(seed)
+    predecessor_archive = Any[]
 
     for stage in cfg.stages
         stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
@@ -2954,6 +3048,7 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             use_slurm=use_slurm,
             resume_from=resume_from,
             previous_specs=previous_specs,
+            predecessor_archive=predecessor_archive,
         )
         posterior_path = nothing
         if cfg.posterior.enabled
@@ -2976,6 +3071,7 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
                     covariance_inflation=cfg.posterior.transfer_covariance_inflation,
                     sigma_multiplier=cfg.posterior.transfer_sigma_multiplier,
                     new_dimension_variance=cfg.posterior.new_dimension_variance,
+                    rng=rng,
                 )
                 safe_save_json(
                     joinpath(stage_root, "posterior_reusable_state.json"),
@@ -2984,7 +3080,13 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
                 )
             end
         end
-        current_seed = result["best_candidate"]
+        canonical_archive_path = joinpath(stage_root, "survivor_archive.json")
+        predecessor_archive = isfile(canonical_archive_path) ? load_json(canonical_archive_path) : Any[]
+        predecessor_archive isa AbstractVector || (predecessor_archive = Any[])
+        archive_seed = archive_entry_config(predecessor_archive)
+        # The admitted predecessor archive owns the trusted prefix.  The
+        # scalar best remains reporting-only and cannot become the next seed.
+        archive_seed !== nothing && (current_seed = archive_seed)
         previous_specs = stage_specs(current_seed, specs, cfg, stage)
         update_stage_freeze!(cfg, stage, result["history"], specs)
         push!(stage_outputs, Dict(

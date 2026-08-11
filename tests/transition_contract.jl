@@ -45,4 +45,35 @@ const O = MocosSimCMAESOptimizer
     expected = rand(rng, 4)
     restored = O.restore_rng(snapshot)
     @test rand(restored, 4) == expected
+
+    # Transition integration must be explicit about provenance and RNG ownership.
+    previous = Dict{String,Any}(
+        "param_names" => ["curve[1]", "curve[2]"],
+        "values" => [0.9, 0.4],
+    )
+    current = Dict{String,Any}(
+        "param_names" => ["curve[1]", "curve[2]", "curve[3]"],
+        "values" => [0.2, 0.4, 0.9],
+    )
+    report = O.transition_delta_report(previous, current; limit=0.1)
+    @test report["policy_outcome"] == "reject"
+    @test report["coordinates"][3]["class"] == "new_dimension"
+    @test report["coordinates"][1]["provenance"] == "archive_transfer"
+
+    reusable = Dict{String,Any}(
+        "param_names" => ["curve[1]", "curve[2]"],
+        "mean" => [0.2, 0.4],
+        "sigma" => [0.1, 0.1],
+        "covariance" => Matrix{Float64}(I, 2, 2),
+        "p_c" => [0.0, 0.0],
+        "p_sigma" => [0.0, 0.0],
+    )
+    seed2 = Dict{String,Any}("curve" => Dict{String,Any}(
+        "interval_values" => [0.1, 0.1, 0.1],
+        "interval_times" => [1, 31, 61],
+    ))
+    specs2 = [O.ParamSpec("curve.interval_values", :temporal, 3, 0.0, 1.0)]
+    a = O.build_state_from_reusable(seed2, specs2, reusable; rng=MersenneTwister(8))
+    b = O.build_state_from_reusable(seed2, specs2, reusable; rng=MersenneTwister(8))
+    @test a.mean == b.mean
 end
