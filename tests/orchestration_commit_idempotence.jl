@@ -33,8 +33,15 @@ function write_committed_fixture(root)
         Dict("stage"=>"stage_short", "iteration"=>1, "archive_ids"=>[1, 2],
              "param_names"=>names, "mean"=>[0.1, 0.2],
              "covariance"=>[[1.0, 0.0], [0.0, 1.0]], "cma_update_count"=>1))
+    committed = ["stage_state.json", "iter_metrics.jsonl", "top_candidates.json",
+        "survivor_archive.json", "full_reusable_state.json"]
+    hashes = Dict(name => bytes2hex(SHA.sha256(read(joinpath(stage_root, name))))
+                  for name in committed)
     O.safe_save_json(commit, Dict("status"=>"committed", "stage"=>"stage_short",
-        "iteration"=>1, "candidate_ids"=>[1, 2, 3], "cma_update_count"=>1))
+        "iteration"=>1, "candidate_ids"=>[1, 2, 3], "cma_update_count"=>1,
+        "artifact_hashes"=>hashes, "artifact_key_set"=>committed,
+        "artifact_hash_manifest"=>bytes2hex(SHA.sha256(JSON.json(hashes))),
+        "artifact_integrity_digest"=>bytes2hex(SHA.sha256(JSON.json(hashes)))))
     return stage_root, true
 end
 
@@ -98,16 +105,30 @@ end
     commit = O.load_json(commit_path)
     commit["artifact_hashes"]["unexpected.json"] = bytes2hex(SHA.sha256(UInt8[]))
     commit["artifact_key_set"] = vcat(commit["artifact_key_set"], ["unexpected.json"])
+    write(joinpath(stage_root, "unexpected.json"), "{}")
     O.safe_save_json(commit_path, commit)
     extra = O.validate_committed_artifacts(stage_root)
     @test !extra["valid"]
     @test any(occursin("unexpected", c) || occursin("artifact key", c)
               for c in extra["contradictions"])
+    rm(joinpath(stage_root, "unexpected.json"))
+    commit = O.load_json(commit_path)
+    delete!(commit["artifact_hashes"], "top_candidates.json")
+    commit["artifact_key_set"] = filter(!=("top_candidates.json"), commit["artifact_key_set"])
+    commit["artifact_hash_manifest"] =
+        bytes2hex(SHA.sha256(JSON.json(commit["artifact_hashes"])))
+    commit["artifact_integrity_digest"] = commit["artifact_hash_manifest"]
+    O.safe_save_json(commit_path, commit)
+    missing = O.validate_committed_artifacts(stage_root)
+    @test !missing["valid"]
+    @test any(occursin("missing or extra", c) || occursin("required key", c)
+              for c in missing["contradictions"])
     # Restore the committed manifest before testing content tampering.
     commit = O.load_json(commit_path)
-    delete!(commit["artifact_hashes"], "unexpected.json")
+    commit["artifact_hashes"] = hashes
     commit["artifact_key_set"] = committed
     commit["artifact_hash_manifest"] = bytes2hex(SHA.sha256(JSON.json(commit["artifact_hashes"])))
+    commit["artifact_integrity_digest"] = commit["artifact_hash_manifest"]
     O.safe_save_json(commit_path, commit)
 
     open(joinpath(stage_root, "survivor_archive.json"), "a") do io

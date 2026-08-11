@@ -22,7 +22,7 @@ export main, run_optimizer, run_long_horizon, run_nuts_from_archive,
        persist_archive_transfer_manifest, preflight_config, create_candidate_root,
        adapter_failure, candidate_terminal_status, wait_for_iteration_outputs,
        stage_resume_info, materialize_terminal_candidate!, normalized_iteration_result,
-       atomic_save_json, validate_committed_artifacts
+       atomic_save_json, validate_committed_artifacts, load_immediate_predecessor_state
 
 struct ExternalSimConfig
     gt_dir::String
@@ -619,6 +619,78 @@ function load_stage_state(stage_root::String)
     return load_json(path)
 end
 
+"""Load the only trusted source for a fresh-process stage extension.
+
+The in-process `run_optimizer` path already carries `state` and the archive
+forward.  A new Julia process has neither, so it must reconstruct both from
+the immediately preceding committed stage, never from the initial seed.
+"""
+function load_immediate_predecessor_state(cfg::OptimizerConfig, stage::StageConfig)
+    index = findfirst(s -> s.name == stage.name, cfg.stages)
+    index === nothing && throw(ArgumentError("stage is not present in configured stage plan"))
+    index == 1 && return nothing
+    predecessor = cfg.stages[index - 1]
+    root = joinpath(cfg.output_dir, "real_sims", predecessor.name)
+    check = validate_committed_artifacts(root)
+    check["valid"] || throw(ArgumentError(
+        "trusted predecessor artifacts failed validation: " *
+        join(String.(check["contradictions"]), "; ")))
+    state_path = joinpath(root, "stage_state.json")
+    reusable_path = joinpath(root, "full_reusable_state.json")
+    prior_state = load_json(state_path)
+    reusable = load_json(reusable_path)
+    String(get(prior_state, "stage", "")) == predecessor.name ||
+        throw(ArgumentError("trusted predecessor stage identity mismatch"))
+    String(get(reusable, "stage", predecessor.name)) == predecessor.name ||
+        throw(ArgumentError("trusted predecessor reusable stage identity mismatch"))
+    Int(get(prior_state, "fit_months", predecessor.fit_months)) == predecessor.fit_months ||
+        throw(ArgumentError("trusted predecessor horizon mismatch"))
+    if haskey(prior_state, "historical_trajectory") || haskey(reusable, "historical_trajectory")
+        get(prior_state, "historical_trajectory", nothing) ==
+            get(reusable, "historical_trajectory", nothing) ||
+            throw(ArgumentError("trusted predecessor historical trajectory mismatch"))
+    end
+    if haskey(prior_state, "prefix_hash") || haskey(reusable, "prefix_hash")
+        String(get(prior_state, "prefix_hash", "")) ==
+            String(get(reusable, "prefix_hash", "")) ||
+            throw(ArgumentError("trusted predecessor prefix hash mismatch"))
+    end
+    if haskey(prior_state, "locked_intervals") || haskey(reusable, "locked_intervals")
+        get(prior_state, "locked_intervals", nothing) ==
+            get(reusable, "locked_intervals", nothing) ||
+            throw(ArgumentError("trusted predecessor prefix locks mismatch"))
+    end
+    if haskey(prior_state, "cma_state") || haskey(reusable, "cma_state")
+        get(prior_state, "cma_state", nothing) ==
+            get(reusable, "cma_state", nothing) ||
+            throw(ArgumentError("trusted predecessor CMA state mismatch"))
+    end
+    names = get(reusable, "param_names", Any[])
+    mean = get(reusable, "mean", Any[])
+    length(names) == length(mean) || throw(ArgumentError(
+        "trusted predecessor reusable state dimensions disagree"))
+    # The canonical manifest is authoritative for transfer ordering and
+    # archive contents.  Do not accept a sibling archive or a re-selection.
+    archive = load_transfer_survivor_archive(
+        joinpath(cfg.output_dir, "real_sims"), stage.name;
+        predecessor_stage=predecessor.name,
+        expected_fit_months=predecessor.fit_months,
+        expected_manifest_path=joinpath(root, "archive_transfer_manifest.json"),
+        stage_order=[s.name for s in cfg.stages])
+    archive_ids = [get(x, "candidate", nothing) for x in archive]
+    for field in ("archive_ids", "selected_archive_ids")
+        source = field == "archive_ids" ? prior_state : reusable
+        haskey(source, field) && source[field] != archive_ids &&
+            throw(ArgumentError("trusted predecessor $field mismatch"))
+    end
+    return Dict{String,Any}(
+        "stage_state" => prior_state,
+        "reusable_state" => reusable,
+        "archive" => archive,
+        "root" => root,
+    )
+end
+
 """Validate and join the durable artifacts of one committed iteration."""
 function validate_committed_artifacts(stage_root::String)
     required = ["stage_state.json", "iter_metrics.jsonl",
@@ -673,9 +745,24 @@ function validate_committed_artifacts(stage_root::String)
                     sort(String.(commit["artifact_key_set"])) : String[]
                 keys_manifest == expected_keys ||
                     push!(contradictions, "artifact hash manifest key set mismatch")
-                sort(intersect(keys_manifest, sort(collect(keys(paths))))) ==
-                    sort(collect(keys(paths))) ||
-                    push!(contradictions, "artifact hash manifest missing required key")
+                # Production commits have a fixed, exact key set.  Keep the
+                # small five-file fixture format usable, but once any of the
+                # production-only artifacts is present, all of them are
+                # mandatory and no unknown key is accepted.
+                production_keys = [
+                    "stage_state.json", "iter_metrics.jsonl", "top_candidates.json",
+                    "survivor_archive.json", "survivor_archive_summary.json",
+                    "full_reusable_state.json", "archive_transfer_manifest.json",
+                    joinpath("iter_$(iteration)", "candidate_list.txt"),
+                    joinpath("iter_$(iteration)", "cma_sampling_state.json"),
+                    joinpath("iter_$(iteration)", "top_candidates.json"),
+                ]
+                fixture_keys = sort(collect(keys(paths)))
+                production_only = vcat([production_keys[5]], production_keys[7:end])
+                expected_exact = any(k in keys_manifest for k in production_only) ?
+                    sort(production_keys) : fixture_keys
+                keys_manifest == expected_exact ||
+                    push!(contradictions, "artifact hash manifest has missing or extra artifact key")
                 all(isfile(joinpath(stage_root, relative)) for relative in keys_manifest) ||
                     push!(contradictions, "artifact hash manifest contains unknown artifact key")
                 if haskey(commit, "artifact_hash_manifest")
@@ -3783,6 +3870,39 @@ function run_stage(
         copy!(rng, restore_rng(resume_state["rng_state"]))
     end
     received_prior = state !== nothing
+    trusted_predecessor = nothing
+    if !received_prior
+        trusted_predecessor = load_immediate_predecessor_state(cfg, stage)
+        if trusted_predecessor !== nothing
+            # This branch is deliberately before initial-state construction:
+            # a predecessor existing on disk makes the initial seed invalid as
+            # an extension source in a fresh process.
+            predecessor_archive = trusted_predecessor["archive"]
+            trusted_seed = archive_entry_config(predecessor_archive)
+            trusted_seed === nothing && throw(ArgumentError(
+                "trusted predecessor archive has no reusable candidate configuration"))
+            seed = trusted_seed
+            reusable = trusted_predecessor["reusable_state"]
+            state = build_state_from_reusable(
+                seed,
+                specs_stage,
+                reusable;
+                sigma_floor=max(0.08, 0.75 * stage.sigma),
+                temporal_unlock_multiplier=policy.temporal_unlock_multiplier,
+                covariance_inflation=cfg.posterior.transfer_covariance_inflation,
+                sigma_multiplier=cfg.posterior.transfer_sigma_multiplier,
+                new_dimension_variance=cfg.posterior.new_dimension_variance,
+                rng=rng,
+            )
+            predecessor_state = trusted_predecessor["stage_state"]
+            index = findfirst(s -> s.name == stage.name, cfg.stages)
+            previous_specs === nothing && (previous_specs =
+                stage_specs(seed, specs, cfg, cfg.stages[index - 1]))
+            top_candidates = latest_iteration_top_candidates(trusted_predecessor["root"])
+            state = temporal_unlock_from_bucket_errors!(state, specs_stage, top_candidates; rng=rng)
+            received_prior = true
+        end
+    end
     if state === nothing
         x0 = initial_vector(seed, specs_stage)
         reusable_path = joinpath(cfg.output_dir, "full_reusable_state.json")
@@ -3805,7 +3925,7 @@ function run_stage(
             seeded = initial_state_from_config(cfg, dim, x0)
             state = seeded === nothing ? CMAState(copy(x0), stage.sigma, Matrix{Float64}(I, dim, dim)) : seeded
         end
-    else
+    elseif trusted_predecessor === nothing
         state = stage_transition_state(
             state,
             stage,
