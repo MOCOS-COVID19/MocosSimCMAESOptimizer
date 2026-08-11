@@ -142,6 +142,32 @@ const JULIA = get(ENV, "JULIA", "/Users/marcinbodych/Workspace/saxocov/julia-1.7
     @test isfile(joinpath(summary["output_root"], "pipeline_summary.json"))
     @test !isdir(joinpath(summary["output_root"], "advanced_cli.jl"))
 
+    # An interrupted root may lose only its derived summary.  Resume must
+    # reconstruct it from the committed, content-validated stage artifacts.
+    summary_bytes = read(joinpath(summary["output_root"], "pipeline_summary.json"))
+    rm(joinpath(summary["output_root"], "pipeline_summary.json"))
+    reconstructed = JSON.parse(read(`$JULIA --project=$REPO $REPO/scripts/run_pipeline.jl $batch_path`, String))
+    @test reconstructed == summary
+    @test isfile(joinpath(summary["output_root"], "pipeline_summary.json"))
+
+    # The canonical survivor archive and transfer manifest are independent
+    # artifacts.  Changing either lineage path must fail closed.
+    manifest_path = joinpath(summary["stages"][2]["stage_root"], "transfer_manifest.json")
+    original_manifest = read(manifest_path)
+    original_text = String(copy(original_manifest))
+    tampered_manifest = JSON.parse(original_text)
+    tampered_manifest["source_archive_path"] = joinpath(summary["output_root"], "wrong-survivor_archive.json")
+    open(manifest_path, "w") do io JSON.print(io, tampered_manifest) end
+    tampered_proc = run(`$JULIA --project=$REPO $REPO/scripts/run_pipeline.jl $batch_path`;
+                        wait=false)
+    wait(tampered_proc)
+    @test !success(tampered_proc)
+    open(manifest_path, "w") do io
+        write(io, original_manifest)
+    end
+    @test JSON.parsefile(manifest_path)["source_archive_path"] ==
+          summary["stages"][1]["archive_path"]
+
     # A committed rerun must be a read-only resume.  Hash every durable
     # artifact, not just the top-level summary, so duplicate stage writes or
     # advancement are observable.

@@ -158,6 +158,8 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
             source_stage = String(plan[index - 1]["name"])
             expected_path = joinpath(output_root, source_stage,
                                      "archive_transfer_manifest.json")
+            expected_archive_path = joinpath(output_root, source_stage,
+                                             "survivor_archive.json")
             evidence = O.load_transfer_survivor_archive(
                 output_root, String(stage["name"]);
                 predecessor_stage=source_stage,
@@ -173,7 +175,7 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
                 expected_fit_months=Int(plan[index - 1]["fit_months"]),
                 expected_manifest_path=expected_path,
                 stage_order=[String(x["name"]) for x in plan])
-            incoming_path = expected_path
+            incoming_path = expected_archive_path
             incoming_manifest = JSON.parsefile(expected_path)
         end
         stage_root = joinpath(output_root, String(stage["name"]))
@@ -316,14 +318,16 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
             )) for entry in incoming_archive]
         O.safe_save_json(joinpath(stage_root, "transfer_candidates.json"),
                          transfer_archive; label="fixture_transfer_candidates")
-        transfer = Dict("source_archive_path" => manifest_path,
+        transfer = Dict("source_archive_path" => archive_path,
             "source_stage" => index == 1 ? nothing : plan[index - 1]["name"],
             "target_stage" => stage["name"],
             "source_horizon_months" => index == 1 ? nothing : plan[index - 1]["fit_months"],
             "source_archive_id" => incoming_manifest === nothing ? nothing : incoming_manifest["archive_id"],
             "admitted_ids" => transfer_ids, "candidate_order" => transfer_ids,
             "protected_transfer_slots" => transfer_ids, "immigrant_slots" => String[],
-            "archive_lineage" => incoming_path,
+            "archive_lineage" => index == 1 ? nothing :
+                joinpath(output_root, String(plan[index - 1]["name"]),
+                         "archive_transfer_manifest.json"),
             "trajectory_identity" => trajectory_identity,
             "prefix_hash" => prefix_hash,
             "locked_intervals" => locked_intervals,
@@ -337,7 +341,8 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
         O.safe_save_json(joinpath(stage_root, "stage_state.json"), Dict(
             "status" => "committed", "stage" => stage["name"], "iteration" => 1,
             "fit_months" => stage["fit_months"], "requested_days" => stage["requested_days"],
-            "effective_days" => stage["effective_days"], "archive_path" => manifest_path,
+            "effective_days" => stage["effective_days"], "archive_path" => archive_path,
+            "archive_manifest_path" => manifest_path,
             "archive_ids" => current_ids, "transfer_archive_ids" => transfer_ids,
             "selection_report_path" => selection_report_path,
             "selection_report_archive_ids" => current_ids,
@@ -385,12 +390,22 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
                          label="fixture_provenance_validation")
         provenance_check["status"] == "consistent" ||
             error("fixture provenance contradiction: $(provenance_check["contradictions"])")
+        committed_files = ["preflight_manifest.json", "stage_state.json",
+            "iter_metrics.jsonl", "top_candidates.json", "survivor_archive.json",
+            "survivor_selection_report.json", "full_reusable_state.json",
+            "transfer_manifest.json", "transfer_candidates.json",
+            "provenance_validation.json", "archive_transfer_manifest.json"]
+        artifact_hashes = Dict{String,Any}(
+            file => bytes2hex(sha256(read(joinpath(stage_root, file))))
+            for file in committed_files)
         O.atomic_save_json(joinpath(stage_root, "iter_1", "iteration_commit.json"),
             Dict("status" => "committed", "stage" => stage["name"],
                  "iteration" => 1,
-                 "candidate_ids" => [String(x["candidate"]) for x in entries]))
+                 "candidate_ids" => [String(x["candidate"]) for x in entries],
+                 "artifact_hashes" => artifact_hashes))
         push!(stages, merge(stage, Dict("stage_root" => stage_root,
-            "archive_path" => manifest_path, "archive_ids" => current_ids,
+            "archive_path" => archive_path, "archive_manifest_path" => manifest_path,
+            "archive_ids" => current_ids,
             "transfer_archive_ids" => transfer_ids,
             "current_archive_ids" => current_ids,
             "selection_report_path" => selection_report_path,
@@ -417,6 +432,147 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
     return summary
 end
 
+function fixture_artifact_hash(path)
+    return bytes2hex(sha256(read(path)))
+end
+
+function validate_fixture_stage_root(root::String, previous_root::Union{Nothing,String}=nothing)
+    required = ["preflight_manifest.json", "stage_state.json", "iter_metrics.jsonl",
+        "top_candidates.json", "survivor_archive.json", "survivor_selection_report.json",
+        "full_reusable_state.json", "transfer_manifest.json", "transfer_candidates.json",
+        "provenance_validation.json", "archive_transfer_manifest.json",
+        "iter_1/iteration_commit.json"]
+    all(isfile(joinpath(root, f)) for f in required) ||
+        error("fixture stage is missing committed artifacts: $(basename(root))")
+    state = JSON.parsefile(joinpath(root, "stage_state.json"))
+    reusable = JSON.parsefile(joinpath(root, "full_reusable_state.json"))
+    archive = JSON.parsefile(joinpath(root, "survivor_archive.json"))
+    transfer = JSON.parsefile(joinpath(root, "transfer_manifest.json"))
+    selection = JSON.parsefile(joinpath(root, "survivor_selection_report.json"))
+    top = JSON.parsefile(joinpath(root, "top_candidates.json"))
+    metrics = Any[]
+    for line in eachline(joinpath(root, "iter_metrics.jsonl"))
+        isempty(strip(line)) || push!(metrics, JSON.parse(line))
+    end
+    commit = JSON.parsefile(joinpath(root, "iter_1", "iteration_commit.json"))
+    state isa AbstractDict && reusable isa AbstractDict && archive isa AbstractVector &&
+        top isa AbstractVector && transfer isa AbstractDict ||
+        error("fixture stage artifacts are malformed: $(basename(root))")
+    get(state, "status", "") == "committed" || error("fixture stage state is not committed")
+    get(reusable, "status", "") == "committed" || error("fixture reusable state is not committed")
+    stage = String(get(state, "stage", ""))
+    !isempty(stage) && String(get(reusable, "stage", "")) == stage ||
+        error("fixture trusted-state stage identity mismatch: $stage")
+    String(get(state, "archive_path", "")) == abspath(joinpath(root, "survivor_archive.json")) ||
+        error("fixture stage archive path is not canonical: $stage")
+    String(get(reusable, "trajectory_identity", "")) == String(get(state, "trajectory_identity", "")) ||
+        error("fixture trajectory identity mismatch: $stage")
+    String(get(reusable, "prefix_hash", "")) == String(get(state, "prefix_hash", "")) ||
+        error("fixture trusted prefix hash mismatch: $stage")
+    haskey(reusable, "cma_state") || error("fixture reusable state lacks CMA state: $stage")
+    cma = reusable["cma_state"]
+    for field in ("parameter_names", "mean", "sigma", "covariance", "p_c", "p_sigma")
+        haskey(cma, field) || error("fixture CMA state lacks $field: $stage")
+    end
+    archive_ids = [String(get(x, "candidate", "")) for x in archive]
+    get(state, "archive_ids", Any[]) == archive_ids ||
+        error("fixture state/archive IDs disagree: $stage")
+    get(reusable, "selected_archive_ids", Any[]) == archive_ids ||
+        error("fixture reusable/archive IDs disagree: $stage")
+    length(top) == length(metrics) ||
+        error("fixture top candidates/metrics length mismatch: $stage")
+    for row in metrics
+        row isa AbstractDict && get(row, "status", "") in ("completed", "failed", "skipped") ||
+            error("fixture metrics contain nonterminal candidate: $stage")
+        all(haskey(row, field) for field in
+            ("score_evidence", "output_paths", "horizon", "source_config_identity",
+             "source_seed_identity", "adapter_mode", "metric_version", "failure_class")) ||
+            error("fixture candidate provenance is incomplete: $stage")
+    end
+    commit["status"] == "committed" && String(commit["stage"]) == stage ||
+        error("fixture commit identity mismatch: $stage")
+    hashes = get(commit, "artifact_hashes", nothing)
+    hashes isa AbstractDict || error("fixture commit has no artifact hashes: $stage")
+    for (file, expected) in hashes
+        path = joinpath(root, String(file))
+        isfile(path) && fixture_artifact_hash(path) == String(expected) ||
+            error("fixture artifact content hash mismatch: $stage/$file")
+    end
+    if previous_root !== nothing
+        previous_archive = abspath(joinpath(previous_root, "survivor_archive.json"))
+        String(get(transfer, "source_archive_path", "")) == previous_archive ||
+            error("fixture transfer does not name canonical predecessor archive: $stage")
+        String(get(transfer, "archive_lineage", "")) ==
+            abspath(joinpath(previous_root, "archive_transfer_manifest.json")) ||
+            error("fixture transfer manifest lineage mismatch: $stage")
+        get(transfer, "admitted_ids", Any[]) == get(transfer, "candidate_order", Any[]) ||
+            error("fixture transfer ordering mismatch: $stage")
+        evidence = O.load_transfer_survivor_archive(dirname(root), stage;
+            predecessor_stage=basename(previous_root),
+            expected_fit_months=Int(JSON.parsefile(joinpath(previous_root,
+                "stage_state.json"))["fit_months"]),
+            expected_manifest_path=joinpath(previous_root, "archive_transfer_manifest.json"),
+            stage_order=sort!(String.(basename.(filter(isdir, readdir(dirname(root), join=true))))),
+            return_evidence=true)
+        evidence isa AbstractVector ||
+            error("fixture transfer archive validation failed: $stage")
+    else
+        get(transfer, "source_stage", nothing) === nothing ||
+            error("fixture first stage unexpectedly has a predecessor")
+    end
+    return (state=state, reusable=reusable, archive=archive, transfer=transfer,
+            selection=selection, commit=commit)
+end
+
+function reconstruct_fixture_summary(output_root::String)
+    dirs = sort([joinpath(output_root, name) for name in readdir(output_root)
+                 if isdir(joinpath(output_root, name))])
+    isempty(dirs) && error("fixture output root has no committed stages")
+    stages = Any[]
+    previous = nothing
+    for root in dirs
+        checked = validate_fixture_stage_root(root, previous)
+        state, archive, transfer, selection = checked.state, checked.archive,
+            checked.transfer, checked.selection
+        fit = Int(state["fit_months"])
+        push!(stages, Dict{String,Any}(
+            "name" => String(state["stage"]), "fit_months" => fit,
+            "requested_days" => Int(state["requested_days"]),
+            "effective_months" => fit, "effective_days" => Int(state["effective_days"]),
+            "remaining_months" => 0, "stage_root" => root,
+            "archive_path" => abspath(joinpath(root, "survivor_archive.json")),
+            "archive_manifest_path" => abspath(joinpath(root, "archive_transfer_manifest.json")),
+            "archive_ids" => [String(get(x, "candidate", "")) for x in archive],
+            "transfer_archive_ids" => get(state, "transfer_archive_ids", Any[]),
+            "current_archive_ids" => [String(get(x, "candidate", "")) for x in archive],
+            "selection_report_path" => joinpath(root, "survivor_selection_report.json"),
+            "provenance_validation_path" => joinpath(root, "provenance_validation.json"),
+            "source_archive_path" => get(state, "source_archive_path", nothing),
+            "source_archive_id" => get(state, "source_archive_id", nothing),
+            "trajectory_identity" => state["trajectory_identity"],
+            "prefix_hash" => state["prefix_hash"],
+            "gate" => JSON.parsefile(joinpath(root, "stage_extension_gate.json")),
+            "status" => "committed"))
+        previous = root
+    end
+    first_manifest = JSON.parsefile(joinpath(first(dirs), "preflight_manifest.json"))
+    target = maximum(Int(s["fit_months"]) for s in stages)
+    for stage in stages
+        stage["remaining_months"] = target - Int(stage["fit_months"])
+    end
+    summary = Dict{String,Any}("status" => "fixture_complete",
+        "adapter_mode" => "deterministic_fixture", "output_root" => abspath(output_root),
+        "target_months" => target, "monthly_days" => Int(get(first_manifest, "monthly_days", 30)),
+        "stages" => stages,
+        "deferred" => Dict("simulation" => "DEFERRED", "multi_seed" => "DEFERRED",
+            "slurm" => "DEFERRED", "validation_replicates" => "DEFERRED"),
+        "provenance" => Dict("config_path" => first_manifest["config_path"],
+            "threshold" => 0.9, "preflight_before_execution" => true,
+            "metric_version" => "objective-metrics-v1",
+            "selection_reports" => [s["selection_report_path"] for s in stages]))
+    return summary
+end
+
 """Load a previously completed fixture root without replaying its stages.
 
 The fixture adapter has no external work to poll, so a committed summary is
@@ -426,8 +582,11 @@ state.
 """
 function resume_fixture_pipeline(output_root::String)
     summary_path = joinpath(output_root, "pipeline_summary.json")
-    isfile(summary_path) || error(
-        "fixture output root exists without a committed pipeline_summary.json")
+    if !isfile(summary_path)
+        summary = reconstruct_fixture_summary(output_root)
+        O.safe_save_json(summary_path, summary; label="reconstructed_fixture_pipeline_summary")
+        return summary
+    end
     summary = try
         JSON.parsefile(summary_path)
     catch err
@@ -453,6 +612,9 @@ function resume_fixture_pipeline(output_root::String)
             error("fixture stage root escapes output root: $name")
         get(stage, "status", "") == "committed" ||
             error("fixture stage is not committed: $name")
+        previous_root = previous_name === nothing ? nothing :
+            joinpath(output_root, previous_name)
+        validate_fixture_stage_root(root, previous_root)
         required = ("preflight_manifest.json", "stage_state.json",
                     "iter_metrics.jsonl", "top_candidates.json",
                     "survivor_archive.json", "full_reusable_state.json",
