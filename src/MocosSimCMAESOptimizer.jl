@@ -8,6 +8,7 @@ using Dates
 using HDF5
 using Printf
 using Serialization
+using SHA
 
 const MANAGER_ROOT = abspath(joinpath(@__DIR__, ".."))
 const CURRENT_OPTIMIZER_CONFIG = Ref{Any}(nothing)
@@ -848,10 +849,15 @@ function archive_quality_gate(archive; current_stage=nothing, current_fit_months
         _archive_rejection_reason(x; current_stage=current_stage,
             current_fit_months=current_fit_months) === nothing]
     best = isempty(valid) ? Inf : minimum(Float64(x["score"]) for x in valid)
+    external_inputs_ok = quality_band isa AbstractDict &&
+        haskey(quality_band, "threshold") &&
+        current_minimum_size !== nothing &&
+        current_diversity_passed !== nothing
     threshold = quality_band isa AbstractDict ? get(quality_band, "threshold", Inf) : Inf
     threshold = try Float64(threshold) catch; Inf end
-    quality_ok = isfinite(Float64(current_best_score)) && isfinite(threshold) &&
+    quality_ok = external_inputs_ok && isfinite(Float64(current_best_score)) && isfinite(threshold) &&
         isfinite(best) && best <= threshold &&
+        Float64(current_best_score) <= threshold &&
         all(try isfinite(Float64(x["score"])) && Float64(x["score"]) <= threshold
             catch; false end for x in valid)
     count_ok = length(valid) >= minimum_size &&
@@ -859,8 +865,11 @@ function archive_quality_gate(archive; current_stage=nothing, current_fit_months
     diversity_ok = diversity_passed === nothing ? !isempty(valid) : Bool(diversity_passed)
     passed = quality_ok && count_ok && diversity_ok
     reason = passed ? "current_objective_quality_and_archive_eligible" :
-        (!quality_ok ? "quality_band_failed" :
-         (!count_ok ? "insufficient_admitted_count" : "insufficient_diversity"))
+        (!external_inputs_ok ? "missing_external_quality_band" :
+         (!isfinite(Float64(current_best_score)) || Float64(current_best_score) > threshold ?
+          "current_objective_quality_failed" :
+         !quality_ok ? "quality_band_failed" :
+         (!count_ok ? "insufficient_admitted_count" : "insufficient_diversity")))
     return Dict{String,Any}(
         "status" => passed ? "passed" : "blocked", "next_stage_created" => false,
         "current_stage" => current_stage, "current_fit_months" => current_fit_months,
@@ -889,17 +898,28 @@ function archive_vector_for_stage(entry::AbstractDict, specs_stage::Vector{Param
     return vector
 end
 
+function _archive_payload_hash(values)
+    io = IOBuffer()
+    JSON.print(io, values)
+    return bytes2hex(sha256(take!(io)))
+end
+
 function persist_archive_transfer_manifest(stage_root::String, archive;
                                            archive_path::String=joinpath(stage_root, "survivor_archive.json"),
                                            stage::Union{Nothing,String}=nothing,
                                            fit_months::Union{Nothing,Int}=nothing)
     values = archive isa AbstractVector ? collect(archive) : Any[]
     ids = [string(get(x, "candidate", get(x, "id", ""))) for x in values if x isa AbstractDict]
+    payload_hash = _archive_payload_hash(values)
+    source = stage === nothing ? basename(stage_root) : stage
     manifest = Dict{String,Any}(
-        "schema_version" => "archive-transfer-v1",
+        "schema_version" => "archive-transfer-v2",
         "canonical_archive_path" => abspath(archive_path),
-        "source_stage" => stage === nothing ? basename(stage_root) : stage,
+        "source_stage" => source,
         "source_fit_months" => fit_months,
+        "horizon" => fit_months,
+        "archive_id" => string(source, ":", fit_months === nothing ? "unknown" : fit_months, ":", payload_hash),
+        "archive_hash" => payload_hash,
         "admitted_ids" => ids,
         "admitted_order" => ids,
         "archive_count" => length(ids),
@@ -912,7 +932,8 @@ end
 function load_transfer_survivor_archive(output_dir::String, current_stage::String;
                                         predecessor_stage::Union{Nothing,String}=nothing,
                                         expected_fit_months::Union{Nothing,Int}=nothing,
-                                        expected_manifest_path::Union{Nothing,String}=nothing)
+                                        expected_manifest_path::Union{Nothing,String}=nothing,
+                                        expected_archive_id::Union{Nothing,String}=nothing)
     # Only the immediate, canonical predecessor is trusted.  Searching all
     # sibling stages can silently mix incompatible horizons and provenance.
     predecessor_stage === nothing && return Any[]
@@ -924,13 +945,24 @@ function load_transfer_survivor_archive(output_dir::String, current_stage::Strin
     expected_manifest_path !== nothing &&
         abspath(expected_manifest_path) != abspath(manifest_path) && return Any[]
     manifest = try load_json(manifest_path) catch; return Any[] end
+    String(get(manifest, "schema_version", "")) == "archive-transfer-v2" || return Any[]
     String(get(manifest, "canonical_archive_path", "")) == abspath(path) || return Any[]
-    expected_fit_months !== nothing &&
-        Int(get(manifest, "source_fit_months", -1)) != expected_fit_months && return Any[]
+    String(get(manifest, "source_stage", "")) == String(predecessor_stage) || return Any[]
+    expected_fit_months !== nothing && (
+        Int(get(manifest, "source_fit_months", -1)) != expected_fit_months ||
+        Int(get(manifest, "horizon", -1)) != expected_fit_months) && return Any[]
     values = try load_json(path) catch; Any[] end
     values isa AbstractVector || return Any[]
     ids = [string(get(x, "candidate", get(x, "id", ""))) for x in values if x isa AbstractDict]
     ids == String.(get(manifest, "admitted_order", Any[])) || return Any[]
+    ids == String.(get(manifest, "admitted_ids", Any[])) || return Any[]
+    Int(get(manifest, "archive_count", -1)) == length(values) || return Any[]
+    payload_hash = _archive_payload_hash(values)
+    String(get(manifest, "archive_hash", "")) == payload_hash || return Any[]
+    archive_id = string(get(manifest, "source_stage", ""), ":",
+        get(manifest, "horizon", "unknown"), ":", payload_hash)
+    String(get(manifest, "archive_id", "")) == archive_id || return Any[]
+    expected_archive_id !== nothing && String(expected_archive_id) != archive_id && return Any[]
     all(_archive_rejection_reason(x; current_stage=predecessor_stage,
         current_fit_months=expected_fit_months) === nothing for x in values) || return Any[]
     return deepcopy(values)
@@ -3830,14 +3862,13 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             gate = archive_quality_gate(archive_values;
                 current_stage=stage.name, current_fit_months=stage.fit_months,
                 current_best_score=result["best_score"], target_size=40,
-                current_minimum_size=1,
-                current_quality_band=get(archive_summary, "quality_band", nothing),
-                current_diversity_passed=let
-                    n = Int(get(archive_summary, "archive_count", 0))
-                    d = get(archive_summary, "diversity", Dict{String,Any}())
-                    n == 1 || (n > 1 && Float64(get(d, "minimum_distance", 0.0)) >= SURVIVOR_MIN_DISTANCE)
-                end,
-                quality_band_constrained=get(archive_summary, "adaptive_target_status", "") == "constrained")
+                # These are deliberately external inputs.  The archive's
+                # self-derived band/diversity report is descriptive only and
+                # cannot make a poor current-stage objective pass.
+                current_quality_band=get(cfg.validation, "current_quality_band", nothing),
+                current_minimum_size=get(cfg.validation, "current_minimum_archive_size", nothing),
+                current_diversity_passed=get(cfg.validation, "current_diversity_passed", nothing),
+                quality_band_constrained=Bool(get(cfg.validation, "allow_quality_band_reduction", false)))
             safe_save_json(joinpath(stage_root, "stage_extension_gate.json"), gate;
                 label="stage_extension_gate")
             if gate["status"] != "passed"

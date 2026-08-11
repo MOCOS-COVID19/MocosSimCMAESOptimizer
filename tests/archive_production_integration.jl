@@ -47,3 +47,45 @@ end
     @test report["archive_count"] == 0
     @test report["rejected_counts"]["status"] == 1
 end
+
+@testset "quality gate requires independent current-stage inputs" begin
+    archive = [entry("good", 1.0), entry("also-good", 1.01)]
+    missing_band = O.archive_quality_gate(archive; current_stage="short",
+        current_fit_months=3, current_best_score=1.0,
+        current_minimum_size=2, current_diversity_passed=true, target_size=2)
+    @test missing_band["status"] == "blocked"
+    @test missing_band["refusal_reason"] == "missing_external_quality_band"
+
+    poor_current = O.archive_quality_gate(archive; current_stage="short",
+        current_fit_months=3, current_best_score=2.0,
+        current_quality_band=Dict("threshold" => 1.1),
+        current_minimum_size=2, current_diversity_passed=true, target_size=2)
+    @test poor_current["status"] == "blocked"
+    @test poor_current["refusal_reason"] == "current_objective_quality_failed"
+end
+
+@testset "archive manifest identity and all predecessor fields are validated" begin
+    root = mktempdir()
+    stage = joinpath(root, "short")
+    mkpath(stage)
+    values = [entry("a", 1.0), entry("b", 1.01)]
+    archive_path = joinpath(stage, "survivor_archive.json")
+    O.safe_save_json(archive_path, values)
+    manifest_path = O.persist_archive_transfer_manifest(stage, values;
+        fit_months=3, stage="short")
+    manifest = JSON.parsefile(manifest_path)
+    @test haskey(manifest, "archive_id")
+    @test haskey(manifest, "archive_hash")
+    @test manifest["schema_version"] == "archive-transfer-v2"
+    @test manifest["horizon"] == 3
+    @test manifest["archive_count"] == 2
+    @test O.load_transfer_survivor_archive(root, "long";
+        predecessor_stage="short", expected_fit_months=3,
+        expected_manifest_path=manifest_path) == values
+
+    manifest["admitted_order"] = ["b", "a"]
+    O.safe_save_json(manifest_path, manifest)
+    @test isempty(O.load_transfer_survivor_archive(root, "long";
+        predecessor_stage="short", expected_fit_months=3,
+        expected_manifest_path=manifest_path))
+end
