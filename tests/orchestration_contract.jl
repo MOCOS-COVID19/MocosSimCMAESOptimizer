@@ -81,6 +81,39 @@ end
     @test info["resume_iteration"] == 2
 end
 
+@testset "resume requires matching atomic iteration commit" begin
+    root = mktempdir()
+    stage = joinpath(root, "stage_a")
+    iter = joinpath(stage, "iter_1")
+    mkpath(iter)
+    open(joinpath(iter, "candidate_list.txt"), "w") do io end
+    for name in ("top_candidates.json", "stage_state.json",
+                 "full_reusable_state.json", "iter_metrics.jsonl")
+        open(joinpath(name == "stage_state.json" || name == "full_reusable_state.json" ||
+                      name == "iter_metrics.jsonl" ? stage : iter, name), "w") do io
+            print(io, name == "iter_metrics.jsonl" ? "" : "{}")
+        end
+    end
+    O.safe_save_json(joinpath(iter, "iteration_commit.json"),
+        Dict("status" => "committed", "stage" => "wrong_stage", "iteration" => 1))
+    @test O.stage_resume_info(stage)["iteration_completed"] == false
+    O.safe_save_json(joinpath(iter, "iteration_commit.json"),
+        Dict("status" => "committed", "stage" => "stage_a", "iteration" => 1))
+    @test O.stage_resume_info(stage)["iteration_completed"] == true
+end
+
+@testset "transition rejection has terminal artifacts" begin
+    root = mktempdir()
+    status = O.materialize_terminal_candidate!(root, "failed";
+        failure_class="transition_policy_reject",
+        details=Dict("stage" => "short", "iteration" => 2))
+    @test status["status"] == "failed"
+    @test isfile(joinpath(root, "failed.ok"))
+    @test isfile(joinpath(root, "status.json"))
+    @test O.load_json(joinpath(root, "status.json"))["failure_class"] ==
+        "transition_policy_reject"
+end
+
 @testset "fresh candidate roots never collide" begin
     root = mktempdir()
     first = O.create_candidate_root(root, "candidate")

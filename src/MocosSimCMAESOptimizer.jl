@@ -21,7 +21,8 @@ export main, run_optimizer, run_long_horizon, run_nuts_from_archive,
        survivor_archive_update, archive_quality_gate, load_transfer_survivor_archive,
        persist_archive_transfer_manifest, preflight_config, create_candidate_root,
        adapter_failure, candidate_terminal_status, wait_for_iteration_outputs,
-       stage_resume_info
+       stage_resume_info, materialize_terminal_candidate!, normalized_iteration_result,
+       atomic_save_json
 
 struct ExternalSimConfig
     gt_dir::String
@@ -1382,6 +1383,53 @@ function _materialize_terminal_artifact!(candidate_dir::String,
     return status
 end
 
+"""Materialize the canonical terminal status and exactly one marker."""
+function materialize_terminal_candidate!(candidate_dir::String, terminal_status::String;
+    failure_class=nothing, details=Dict{String,Any}())
+    terminal_status in ("completed", "failed", "skipped") ||
+        throw(ArgumentError("invalid terminal status"))
+    status = Dict{String,Any}(
+        "status" => terminal_status,
+        "terminal" => true,
+        "failure_class" => failure_class,
+    )
+    for (key, value) in details
+        status[String(key)] = value
+    end
+    # A rejected transition must never leave a stale success marker behind.
+    for marker in ("done.ok", "failed.ok", "skipped.ok")
+        path = joinpath(candidate_dir, marker)
+        isfile(path) && rm(path)
+    end
+    _write_terminal_marker!(candidate_dir, terminal_status)
+    _materialize_terminal_artifact!(candidate_dir, status)
+    return status
+end
+
+"""Read terminal states without waiting or changing pending candidates."""
+function normalized_iteration_result(candidate_dirs::AbstractVector{<:AbstractString})
+    done_count = 0
+    failed_count = 0
+    skipped_count = 0
+    pending = String[]
+    statuses = Any[]
+    for candidate_dir in candidate_dirs
+        status = candidate_terminal_status(String(candidate_dir))
+        status["status"] != "pending" && _materialize_terminal_artifact!(String(candidate_dir), status)
+        push!(statuses, merge(status, Dict("candidate_dir" => String(candidate_dir))))
+        status["status"] == "completed" && (done_count += 1)
+        status["status"] == "failed" && (failed_count += 1)
+        status["status"] == "skipped" && (skipped_count += 1)
+        status["status"] == "pending" && push!(pending, String(candidate_dir))
+    end
+    return Dict{String,Any}(
+        "done" => done_count, "failed" => failed_count, "skipped" => skipped_count,
+        "pending" => pending, "pending_count" => length(pending),
+        "statuses" => statuses, "threshold_reached" => false,
+        "iteration_truncated" => false,
+    )
+end
+
 function stage_resume_info(stage_root::String)
     iter_infos = Vector{Tuple{Int,String,Bool}}()
     isdir(stage_root) || return nothing
@@ -1396,7 +1444,19 @@ function stage_resume_info(stage_root::String)
         # Candidate directories and configs are recoverable work, not proof of
         # a committed iteration.  A committed iteration has all cross-file
         # state needed to resume without replaying CMA updates.
-        committed = isfile(top_candidates_file) &&
+        manifest_path = joinpath(iter_dir, "iteration_commit.json")
+        manifest_ok = false
+        if isfile(manifest_path)
+            try
+                manifest = load_json(manifest_path)
+                manifest_ok = get(manifest, "status", "") == "committed" &&
+                    String(get(manifest, "stage", "")) == basename(stage_root) &&
+                    Int(get(manifest, "iteration", -1)) == iter_idx
+            catch
+                manifest_ok = false
+            end
+        end
+        committed = manifest_ok && isfile(top_candidates_file) &&
             isfile(joinpath(stage_root, "stage_state.json")) &&
             isfile(joinpath(stage_root, "full_reusable_state.json")) &&
             isfile(joinpath(stage_root, "iter_metrics.jsonl"))
@@ -3363,6 +3423,20 @@ function safe_save_json(path::String, value; label::String=path)
     end
 end
 
+function atomic_save_json(path::String, value; label::String=path)
+    mkpath(dirname(path))
+    tmp = tempname(dirname(path))
+    try
+        save_json(tmp, value)
+        mv(tmp, path; force=true)
+    catch err
+        isfile(tmp) && rm(tmp)
+        @error "Failed to atomically save JSON artifact" label path err
+        rethrow(err)
+    end
+    return path
+end
+
 """Persist terminal posterior rejection evidence and invalidate stale state.
 
 The reusable-state path is replaced with an invalidation record using a
@@ -3678,6 +3752,11 @@ function run_stage(
                     if transition["status"] == "rejected"
                         safe_save_json(joinpath(cand_dir, "transition_rejected.json"),
                             transition["report"]; label="transition_rejected")
+                        materialize_terminal_candidate!(cand_dir, "failed";
+                            failure_class="transition_policy_reject",
+                            details=Dict("stage" => stage.name, "iteration" => iter,
+                                         "candidate" => ci,
+                                         "transition_delta_report" => transition["report"]))
                     else
                         candidate_cfg = transition["config"]
                         save_json(joinpath(cand_dir, "config.json"), candidate_cfg)
@@ -3875,9 +3954,18 @@ function run_stage(
                 end
             end
         else
+            local_candidate_dirs = [
+                joinpath(iter_root, @sprintf("cand_%02d", candidate_id))
+                for candidate_id in 1:length(candidates)
+            ]
+            mkpath.(local_candidate_dirs)
+            open(joinpath(iter_root, "candidate_list.txt"), "w") do io
+                foreach(d -> println(io, d), local_candidate_dirs)
+            end
             for (ci, cand) in enumerate(candidates)
                 iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
                 mkpath(iter_root)
+                cand_dir = local_candidate_dirs[ci]
                 x, clip_info = clip_candidate(cand, specs_stage)
                 candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
                 inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
@@ -3899,13 +3987,26 @@ function run_stage(
                     Dict{String,Any}("score" => Inf, "status" => "failed",
                                      "simulated" => "transition_rejected",
                                      "failure_class" => "transition_policy_reject") :
-                    score_candidate(candidate_cfg, cfg, days; workdir=joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"))
-                safe_save_json(joinpath(joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"), "metrics.json"), metrics; label="candidate_metrics")
+                    score_candidate(candidate_cfg, cfg, days; workdir=cand_dir)
+                if transition["status"] == "rejected"
+                    materialize_terminal_candidate!(cand_dir, "failed";
+                        failure_class="transition_policy_reject",
+                        details=Dict("stage" => stage.name, "iteration" => iter,
+                                     "candidate" => ci,
+                                     "transition_delta_report" => transition_report))
+                else
+                    safe_save_json(joinpath(cand_dir, "metrics.json"), metrics; label="candidate_metrics")
+                    materialize_terminal_candidate!(cand_dir,
+                        get(metrics, "status", "failed") == "completed" ? "completed" : "failed";
+                        failure_class=get(metrics, "status", "completed") == "completed" ?
+                            nothing : get(metrics, "failure_class", "adapter_failure"),
+                        details=Dict("stage" => stage.name, "iteration" => iter, "candidate" => ci))
+                end
                 score = metrics["score"]
                 if get(metrics, "status", "completed") == "completed" && isfinite(Float64(score))
                     append_cma_candidate_record(
                         iter_root, stage, iter, ci, cand, x, zs[ci], clip_info,
-                        state, score, metrics, joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)", "metrics.json"),
+                        state, score, metrics, joinpath(cand_dir, "metrics.json"),
                         ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
                         transition_report
                     )
@@ -3949,6 +4050,19 @@ function run_stage(
                     best_vector = copy(x)
                     best_candidate = deepcopy(candidate_cfg)
                 end
+                local_wait_result = normalized_iteration_result(local_candidate_dirs)
+                # Construct the normalized local result before writing metrics,
+                # matching the accounting schema used by the Slurm path.
+                append_jsonl(joinpath(stage_root, "iter_metrics.jsonl"), Dict(
+                    "stage" => stage.name, "iteration" => iter, "candidate" => ci,
+                    "status" => get(metrics, "status", "unknown"),
+                    "score" => score,
+                    "threshold_reached" => local_wait_result["threshold_reached"],
+                    "iteration_truncated" => local_wait_result["iteration_truncated"],
+                    "completed_count" => local_wait_result["done"],
+                    "failed_count" => local_wait_result["failed"],
+                    "pending_count" => local_wait_result["pending_count"],
+                ))
             end
         end
         isempty(ranked) && error("No completed candidates available for stage $(stage.name) iteration $(iter). Increase max wait or completion fraction.")
@@ -4001,6 +4115,20 @@ function run_stage(
         safe_save_json(joinpath(stage_root, "full_reusable_state.json"),
             full_reusable_state_from_cma(stage, specs_stage, state;
                 transition_report=stage_transition_report); label="full_reusable_state")
+        # This is the sole resume authority for an iteration.  It is written
+        # last, after every cross-file artifact, and contains identity fields
+        # so a stale manifest can never make another iteration look complete.
+        atomic_save_json(joinpath(iter_root, "iteration_commit.json"), Dict(
+            "status" => "committed",
+            "stage" => stage.name,
+            "iteration" => iter,
+            "artifacts" => [
+                "candidate_list.txt", "top_candidates.json",
+                joinpath("..", "stage_state.json"),
+                joinpath("..", "full_reusable_state.json"),
+                joinpath("..", "iter_metrics.jsonl"),
+            ],
+        ); label="iteration_commit")
         @info "Finished iteration" stage=stage.name iteration=iter best_score=best_score sigma=state.sigma top_candidates_written=length(iteration_top_candidates)
     end
 
