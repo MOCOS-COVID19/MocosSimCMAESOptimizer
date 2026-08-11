@@ -17,7 +17,8 @@ const NEW_TEMPORAL_VARIANCE = 0.04
 
 export main, run_optimizer, run_long_horizon, run_nuts_from_archive,
        run_nuts_from_stage, posterior_reusable_state, safe_save_json,
-       survivor_archive_update, archive_quality_gate, load_transfer_survivor_archive
+       survivor_archive_update, archive_quality_gate, load_transfer_survivor_archive,
+       persist_archive_transfer_manifest
 
 struct ExternalSimConfig
     gt_dir::String
@@ -836,24 +837,35 @@ end
 function archive_quality_gate(archive; current_stage=nothing, current_fit_months=nothing,
     current_best_score=Inf, target_size::Int=40, minimum_size::Int=1,
     quality_band=nothing, diversity_passed=nothing,
-    quality_band_constrained::Bool=false, allow_reduced_archive::Bool=true)
+    quality_band_constrained::Bool=false, allow_reduced_archive::Bool=true,
+    current_quality_band=nothing, current_minimum_size=nothing,
+    current_diversity_passed=nothing)
+    quality_band = current_quality_band === nothing ? quality_band : current_quality_band
+    minimum_size = current_minimum_size === nothing ? minimum_size : Int(current_minimum_size)
+    diversity_passed = current_diversity_passed === nothing ? diversity_passed : current_diversity_passed
     values = archive isa AbstractVector ? collect(archive) : Any[]
     valid = [x for x in values if x isa AbstractDict &&
         _archive_rejection_reason(x; current_stage=current_stage,
             current_fit_months=current_fit_months) === nothing]
     best = isempty(valid) ? Inf : minimum(Float64(x["score"]) for x in valid)
-    quality_ok = isfinite(Float64(current_best_score)) && best <= Float64(current_best_score)
+    threshold = quality_band isa AbstractDict ? get(quality_band, "threshold", Inf) : Inf
+    threshold = try Float64(threshold) catch; Inf end
+    quality_ok = isfinite(Float64(current_best_score)) && isfinite(threshold) &&
+        isfinite(best) && best <= threshold &&
+        all(try isfinite(Float64(x["score"])) && Float64(x["score"]) <= threshold
+            catch; false end for x in valid)
     count_ok = length(valid) >= minimum_size &&
         (length(valid) >= target_size || (quality_band_constrained && allow_reduced_archive))
     diversity_ok = diversity_passed === nothing ? !isempty(valid) : Bool(diversity_passed)
     passed = quality_ok && count_ok && diversity_ok
     reason = passed ? "current_objective_quality_and_archive_eligible" :
-        (!quality_ok ? "current_objective_quality_failed" :
+        (!quality_ok ? "quality_band_failed" :
          (!count_ok ? "insufficient_admitted_count" : "insufficient_diversity"))
     return Dict{String,Any}(
         "status" => passed ? "passed" : "blocked", "next_stage_created" => false,
         "current_stage" => current_stage, "current_fit_months" => current_fit_months,
         "current_best_score" => current_best_score, "archive_best_score" => best,
+        "effective_quality_threshold" => threshold,
         "configured_target" => target_size, "minimum_count" => minimum_size,
         "admitted_count" => length(valid), "quality_band" => quality_band,
         "diversity_passed" => diversity_ok, "refusal_reason" => reason,
@@ -877,15 +889,50 @@ function archive_vector_for_stage(entry::AbstractDict, specs_stage::Vector{Param
     return vector
 end
 
+function persist_archive_transfer_manifest(stage_root::String, archive;
+                                           archive_path::String=joinpath(stage_root, "survivor_archive.json"),
+                                           stage::Union{Nothing,String}=nothing,
+                                           fit_months::Union{Nothing,Int}=nothing)
+    values = archive isa AbstractVector ? collect(archive) : Any[]
+    ids = [string(get(x, "candidate", get(x, "id", ""))) for x in values if x isa AbstractDict]
+    manifest = Dict{String,Any}(
+        "schema_version" => "archive-transfer-v1",
+        "canonical_archive_path" => abspath(archive_path),
+        "source_stage" => stage === nothing ? basename(stage_root) : stage,
+        "source_fit_months" => fit_months,
+        "admitted_ids" => ids,
+        "admitted_order" => ids,
+        "archive_count" => length(ids),
+    )
+    path = joinpath(stage_root, "archive_transfer_manifest.json")
+    safe_save_json(path, manifest; label="archive_transfer_manifest")
+    return path
+end
+
 function load_transfer_survivor_archive(output_dir::String, current_stage::String;
-                                        predecessor_stage::Union{Nothing,String}=nothing)
+                                        predecessor_stage::Union{Nothing,String}=nothing,
+                                        expected_fit_months::Union{Nothing,Int}=nothing,
+                                        expected_manifest_path::Union{Nothing,String}=nothing)
     # Only the immediate, canonical predecessor is trusted.  Searching all
     # sibling stages can silently mix incompatible horizons and provenance.
     predecessor_stage === nothing && return Any[]
-    path = joinpath(output_dir, predecessor_stage, "survivor_archive.json")
+    stage_root = joinpath(output_dir, predecessor_stage)
+    path = joinpath(stage_root, "survivor_archive.json")
     isfile(path) || return Any[]
+    manifest_path = joinpath(stage_root, "archive_transfer_manifest.json")
+    isfile(manifest_path) || return Any[]
+    expected_manifest_path !== nothing &&
+        abspath(expected_manifest_path) != abspath(manifest_path) && return Any[]
+    manifest = try load_json(manifest_path) catch; return Any[] end
+    String(get(manifest, "canonical_archive_path", "")) == abspath(path) || return Any[]
+    expected_fit_months !== nothing &&
+        Int(get(manifest, "source_fit_months", -1)) != expected_fit_months && return Any[]
     values = try load_json(path) catch; Any[] end
     values isa AbstractVector || return Any[]
+    ids = [string(get(x, "candidate", get(x, "id", ""))) for x in values if x isa AbstractDict]
+    ids == String.(get(manifest, "admitted_order", Any[])) || return Any[]
+    all(_archive_rejection_reason(x; current_stage=predecessor_stage,
+        current_fit_months=expected_fit_months) === nothing for x in values) || return Any[]
     return deepcopy(values)
 end
 
@@ -3337,13 +3384,18 @@ function run_stage(
             max(policy.random_candidate_fraction, cfg.posterior.immigrant_fraction) :
             policy.random_candidate_fraction
         if immigrant_fraction > 0.0
-            for candidate_id in eachindex(candidates)
-                rand(rng) > immigrant_fraction && continue
-                idx = 1
-                for spec in specs_stage
-                    for _ in 1:spec.length
-                        candidates[candidate_id][idx] = spec.lower + rand(rng) * (spec.upper - spec.lower)
-                        idx += 1
+            # Transfer slots are protected: immigrants may only occupy the
+            # disjoint suffix of the population.
+            immigrant_start = min(length(transfer_archive), length(candidates)) + 1
+            if immigrant_start <= length(candidates)
+                for candidate_id in immigrant_start:length(candidates)
+                    rand(rng) > immigrant_fraction && continue
+                    idx = 1
+                    for spec in specs_stage
+                        for _ in 1:spec.length
+                            candidates[candidate_id][idx] = spec.lower + rand(rng) * (spec.upper - spec.lower)
+                            idx += 1
+                        end
                     end
                 end
             end
@@ -3639,6 +3691,7 @@ function run_stage(
                     "search_policy" => policy.name,
                     "fit_months" => active_months,
                     "score" => score,
+                    "status" => get(metrics, "status", "unknown"),
                     "config" => deepcopy(candidate_cfg),
                     "evaluated_vector" => copy(x),
                     "parameter_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
@@ -3705,6 +3758,8 @@ function run_stage(
         )
         survivor_archive = archive_report["archive"]
         safe_save_json(archive_path, survivor_archive; label="survivor_archive")
+        persist_archive_transfer_manifest(stage_root, survivor_archive;
+            archive_path=archive_path, stage=stage.name, fit_months=active_months)
         safe_save_json(joinpath(stage_root, "survivor_archive_summary.json"),
             archive_report; label="survivor_archive_summary")
         safe_save_json(joinpath(stage_root, "full_reusable_state.json"),
@@ -3775,8 +3830,13 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             gate = archive_quality_gate(archive_values;
                 current_stage=stage.name, current_fit_months=stage.fit_months,
                 current_best_score=result["best_score"], target_size=40,
-                minimum_size=1,
-                quality_band=get(archive_summary, "quality_band", nothing),
+                current_minimum_size=1,
+                current_quality_band=get(archive_summary, "quality_band", nothing),
+                current_diversity_passed=let
+                    n = Int(get(archive_summary, "archive_count", 0))
+                    d = get(archive_summary, "diversity", Dict{String,Any}())
+                    n == 1 || (n > 1 && Float64(get(d, "minimum_distance", 0.0)) >= SURVIVOR_MIN_DISTANCE)
+                end,
                 quality_band_constrained=get(archive_summary, "adaptive_target_status", "") == "constrained")
             safe_save_json(joinpath(stage_root, "stage_extension_gate.json"), gate;
                 label="stage_extension_gate")
@@ -3861,8 +3921,13 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             end
         end
         canonical_archive_path = joinpath(stage_root, "survivor_archive.json")
-        predecessor_archive = isfile(canonical_archive_path) ? load_json(canonical_archive_path) : Any[]
-        predecessor_archive isa AbstractVector || (predecessor_archive = Any[])
+        predecessor_manifest_path = joinpath(stage_root, "archive_transfer_manifest.json")
+        predecessor_archive = load_transfer_survivor_archive(
+            cfg.output_dir, stage.name;
+            predecessor_stage=stage.name,
+            expected_fit_months=stage.fit_months,
+            expected_manifest_path=predecessor_manifest_path,
+        )
         archive_seed = archive_entry_config(predecessor_archive)
         # The admitted predecessor archive owns the trusted prefix.  The
         # scalar best remains reporting-only and cannot become the next seed.
