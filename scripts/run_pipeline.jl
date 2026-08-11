@@ -1,9 +1,11 @@
 #!/usr/bin/env julia
 
 using JSON
+using SHA
 
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
 using MocosSimCMAESOptimizer
+const O = MocosSimCMAESOptimizer
 
 function resolve_path(path::String, base::String)
     return isabspath(path) ? path : normpath(joinpath(base, path))
@@ -40,6 +42,135 @@ function write_phase_config(path, cfg)
     end
 end
 
+function validate_fixture_stage_plan(batch, monthly_days)
+    raw_stages = get(batch, "stages", nothing)
+    raw_stages isa AbstractVector && !isempty(raw_stages) ||
+        error("fixture stage plan must be a non-empty array")
+    target = Int(get(batch, "target_months", 24))
+    target > 0 || error("fixture target_months must be positive")
+    stages = Any[]
+    previous = 0
+    for (i, raw) in enumerate(raw_stages)
+        raw isa AbstractDict || error("stages[$i] must be an object")
+        name = String(get(raw, "name", ""))
+        months = Int(get(raw, "fit_months", 0))
+        !isempty(name) && months > previous ||
+            error("fixture stages[$i] must be strictly increasing and named")
+        months <= target || error("fixture stages[$i] exceeds target_months")
+        push!(stages, Dict{String,Any}(
+            "name" => name, "fit_months" => months,
+            "requested_days" => months * monthly_days,
+            "effective_months" => months,
+            "effective_days" => months * monthly_days,
+            "remaining_months" => target - months,
+        ))
+        previous = months
+    end
+    previous == target || error("fixture stage plan is incomplete_target")
+    return stages, target
+end
+
+function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
+                              preflight::AbstractDict, batch::AbstractDict)
+    monthly_days = Int(get(base_config, "monthly_days", 30))
+    plan, target = validate_fixture_stage_plan(batch, monthly_days)
+    batch_dir = dirname(abspath(batch_path))
+    output_root = resolve_path(String(batch["output_root"]), batch_dir)
+    ispath(output_root) && error("fixture output root already exists: $output_root")
+    mkpath(output_root)
+    stages = Any[]
+    predecessor_archive = Any[]
+    predecessor_path = nothing
+    for (index, stage) in enumerate(plan)
+        stage_root = joinpath(output_root, String(stage["name"]))
+        mkpath(stage_root)
+        manifest = deepcopy(preflight)
+        manifest["stage"] = stage
+        manifest["source_stage"] = index == 1 ? nothing : plan[index - 1]["name"]
+        manifest["output_root_created"] = true
+        manifest["adapter_mode"] = "deterministic_fixture"
+        O.safe_save_json(joinpath(stage_root, "preflight_manifest.json"), manifest;
+                         label="fixture_preflight_manifest")
+        entries = Any[]
+        for slot in 1:3
+            id = "$(stage["name"])-survivor-$slot"
+            push!(entries, Dict{String,Any}(
+                "candidate" => id, "status" => "completed",
+                "stage" => stage["name"], "iteration" => 1,
+                "fit_months" => stage["fit_months"],
+                "requested_horizon" => stage["fit_months"],
+                "effective_scoring_horizon" => stage["fit_months"],
+                "score" => 1.0 + 0.01 * slot,
+                "evaluated_vector" => [0.1 * slot, 0.2 * slot],
+                "parameter_names" => ["fixture.beta[1]", "fixture.beta[2]"],
+                "metrics" => Dict("weekly_control_score" => 0.8 + 0.01 * slot,
+                                  "daily_detections_cumulative" => 0.9,
+                                  "temporal_jump_penalty" => 0.0),
+                "provenance" => Dict("adapter" => "deterministic_fixture",
+                                     "source_config" => preflight["config_path"],
+                                     "source_stage" => index == 1 ? nothing : plan[index - 1]["name"],
+                                     "output_root" => stage_root),
+                "transition_delta_report" => Dict(
+                    "coordinate_space" => "effective_named",
+                    "candidate_class" => index == 1 ? "new_dimension" : "archive_transfer",
+                    "max_abs_delta" => index == 1 ? 0.0 : 0.02,
+                    "policy_outcome" => "accepted"),
+            ))
+        end
+        report = O.survivor_archive_update(predecessor_archive, entries;
+            current_stage=stage["name"], current_fit_months=stage["fit_months"],
+            target_size=3, max_size=200, return_report=true)
+        archive = report["archive"]
+        archive_path = joinpath(stage_root, "survivor_archive.json")
+        O.safe_save_json(archive_path, archive; label="fixture_survivor_archive")
+        manifest_path = O.persist_archive_transfer_manifest(stage_root, archive;
+            archive_path=archive_path, stage=stage["name"], fit_months=stage["fit_months"])
+        gate = O.archive_quality_gate(archive; current_stage=stage["name"],
+            current_fit_months=stage["fit_months"], current_best_score=1.01,
+            current_quality_band=Dict("threshold" => 1.10),
+            current_minimum_size=1, current_diversity_passed=true, target_size=3)
+        gate["status"] == "passed" || error("fixture stage gate blocked: $(stage["name"])")
+        O.safe_save_json(joinpath(stage_root, "stage_extension_gate.json"), gate;
+                         label="fixture_stage_gate")
+        transfer_ids = [x["candidate"] for x in archive]
+        transfer = Dict("source_archive_path" => manifest_path,
+            "source_stage" => stage["name"], "target_stage" => index < length(plan) ? plan[index + 1]["name"] : nothing,
+            "source_horizon_months" => stage["fit_months"], "admitted_ids" => transfer_ids,
+            "candidate_order" => transfer_ids, "protected_transfer_slots" => transfer_ids,
+            "archive_lineage" => predecessor_path)
+        O.safe_save_json(joinpath(stage_root, "transfer_manifest.json"), transfer;
+                         label="fixture_transfer_manifest")
+        O.safe_save_json(joinpath(stage_root, "stage_state.json"), Dict(
+            "status" => "committed", "stage" => stage["name"], "iteration" => 1,
+            "fit_months" => stage["fit_months"], "requested_days" => stage["requested_days"],
+            "effective_days" => stage["effective_days"], "archive_path" => manifest_path,
+            "archive_ids" => transfer_ids, "best_candidate" => transfer_ids[1],
+            "rng_state" => Dict("algorithm" => "fixture-fixed", "stream" => index),
+            "prefix_hash" => bytes2hex(sha256(JSON.json(predecessor_archive)))))
+        O.safe_save_json(joinpath(stage_root, "full_reusable_state.json"), Dict(
+            "status" => "committed", "stage" => stage["name"],
+            "source_archive_path" => manifest_path, "admitted_ids" => transfer_ids,
+            "parameter_names" => ["fixture.beta[1]", "fixture.beta[2]"],
+            "transition_delta_report" => [x["transition_delta_report"] for x in archive]))
+        push!(stages, merge(stage, Dict("stage_root" => stage_root,
+            "archive_path" => manifest_path, "archive_ids" => transfer_ids,
+            "gate" => gate, "source_archive_path" => predecessor_path,
+            "status" => "committed")))
+        predecessor_archive = archive
+        predecessor_path = manifest_path
+    end
+    summary = Dict("status" => "fixture_complete", "adapter_mode" => "deterministic_fixture",
+        "output_root" => output_root, "target_months" => target, "monthly_days" => monthly_days,
+        "stages" => stages, "deferred" => Dict("simulation" => "DEFERRED",
+            "multi_seed" => "DEFERRED", "slurm" => "DEFERRED",
+            "validation_replicates" => "DEFERRED"),
+        "provenance" => Dict("config_path" => preflight["config_path"],
+            "threshold" => 0.9, "preflight_before_execution" => true))
+    O.safe_save_json(joinpath(output_root, "pipeline_summary.json"), summary;
+                     label="fixture_pipeline_summary")
+    return summary
+end
+
 function run_pipeline(batch_path::String)
     batch_dir = dirname(abspath(batch_path))
     batch = JSON.parsefile(batch_path)
@@ -48,6 +179,10 @@ function run_pipeline(batch_path::String)
     # output root. This is intentionally separate from optimizer execution.
     preflight_config(base_path; readiness=false)
     base_config = JSON.parsefile(base_path)
+    if get(batch, "adapter_mode", "") == "fixture"
+        return run_fixture_pipeline(batch_path, base_config,
+                                     preflight_config(base_path; readiness=true), batch)
+    end
     if haskey(base_config, "gt_dir")
         base_config["gt_dir"] = resolve_path(
             String(base_config["gt_dir"]),
@@ -55,6 +190,7 @@ function run_pipeline(batch_path::String)
         )
     end
     output_root = resolve_path(String(batch["output_root"]), batch_dir)
+    ispath(output_root) && error("pipeline output root already exists: $output_root")
     mkpath(output_root)
     use_slurm = Bool(get(batch, "use_slurm", true))
 
