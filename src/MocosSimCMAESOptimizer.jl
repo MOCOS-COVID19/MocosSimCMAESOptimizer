@@ -16,7 +16,8 @@ const CMA_SIGMA_MAX = 0.12
 const NEW_TEMPORAL_VARIANCE = 0.04
 
 export main, run_optimizer, run_long_horizon, run_nuts_from_archive,
-       run_nuts_from_stage, posterior_reusable_state, safe_save_json
+       run_nuts_from_stage, posterior_reusable_state, safe_save_json,
+       survivor_archive_update, archive_quality_gate, load_transfer_survivor_archive
 
 struct ExternalSimConfig
     gt_dir::String
@@ -669,28 +670,105 @@ function archive_parameter_distance(a::AbstractDict, b::AbstractDict)
     return norm(Float64.(va) - Float64.(vb)) / sqrt(max(length(va), 1))
 end
 
-function survivor_archive_update(existing, entries; max_size::Int=SURVIVOR_ARCHIVE_SIZE, min_distance::Float64=SURVIVOR_MIN_DISTANCE)
+function _archive_normalized_distance(a::AbstractDict, b::AbstractDict, bounds)
+    va = get(a, "evaluated_vector", nothing)
+    vb = get(b, "evaluated_vector", nothing)
+    va isa AbstractVector && vb isa AbstractVector || return Inf
+    length(va) == length(vb) || return Inf
+    xa = try Float64.(va) catch; return Inf end
+    xb = try Float64.(vb) catch; return Inf end
+    all(isfinite, xa) && all(isfinite, xb) || return Inf
+    scales = if bounds !== nothing && length(bounds) == length(xa)
+        [max(Float64(x[2]) - Float64(x[1]), eps()) for x in bounds]
+    else
+        # Candidate-local normalization avoids a large-scale coordinate
+        # dominating diversity when no parameter bounds were supplied.
+        fill(1.0, length(xa))
+    end
+    return norm((xa .- xb) ./ scales) / sqrt(max(length(xa), 1))
+end
+
+function _archive_rejection_reason(entry::AbstractDict; current_stage=nothing, current_fit_months=nothing)
+    status = String(get(entry, "status", ""))
+    current_stage !== nothing && status != "completed" && return "status"
+    current_stage !== nothing && String(get(entry, "stage", "")) != String(current_stage) && return "stage"
+    if current_fit_months !== nothing
+        horizon = get(entry, "fit_months", get(entry, "scoring_horizon_months", nothing))
+        (horizon === nothing || Int(horizon) != Int(current_fit_months)) && return "horizon"
+    end
+    score = try Float64(get(entry, "score", Inf)) catch; Inf end
+    vector = get(entry, "evaluated_vector", nothing)
+    (!isfinite(score) || !(vector isa AbstractVector)) && return "nonfinite"
+    values = try Float64.(vector) catch; Float64[] end
+    all(isfinite, values) || return "nonfinite"
+    return nothing
+end
+
+function _archive_quality_band(scores::Vector{Float64}; mad_multiplier=SURVIVOR_SCORE_MAD_MULTIPLIER)
+    best = minimum(scores)
+    med = median(scores)
+    mad = median(abs.(scores .- med))
+    floor = SURVIVOR_RELATIVE_SCORE_FLOOR * max(abs(best), 1.0)
+    scale = max(mad, floor, 1e-8)
+    return Dict{String,Any}(
+        "best" => best, "median" => med, "mad" => mad,
+        "relative_floor" => floor, "scale" => scale,
+        "multiplier" => mad_multiplier,
+        "threshold" => best + mad_multiplier * scale,
+        "reason" => mad > floor ? "mad" : "relative_floor",
+    )
+end
+
+"""
+    survivor_archive_update(existing, entries; ...)
+
+Build the reusable archive product. `max_size` is only a technical cap;
+`target_size` is the adaptive nominal target. With `return_report=true`, a
+durable-policy-shaped report is returned instead of only the selected vector.
+"""
+function survivor_archive_update(existing, entries;
+    max_size::Int=SURVIVOR_ARCHIVE_SIZE,
+    target_size::Int=40,
+    min_distance::Float64=SURVIVOR_MIN_DISTANCE,
+    parameter_bounds=nothing,
+    current_stage=nothing,
+    current_fit_months=nothing,
+    return_report::Bool=false)
+    max_size > 0 || throw(ArgumentError("archive cap must be positive"))
     pool = Any[]
+    rejected = Dict{String,Int}()
+    seen = Set{String}()
     for entry in vcat(collect(existing), collect(entries))
         entry isa AbstractDict || continue
-        score = try Float64(get(entry, "score", Inf)) catch; Inf end
-        vector = get(entry, "evaluated_vector", nothing)
-        isfinite(score) && vector isa AbstractVector || continue
-        push!(pool, entry)
+        reason = _archive_rejection_reason(entry;
+            current_stage=current_stage, current_fit_months=current_fit_months)
+        reason !== nothing && (rejected[reason] = get(rejected, reason, 0) + 1; continue)
+        id = string(get(entry, "candidate", get(entry, "id", "")))
+        if !isempty(id) && id in seen
+            rejected["duplicate"] = get(rejected, "duplicate", 0) + 1
+            continue
+        end
+        !isempty(id) && push!(seen, id)
+        push!(pool, deepcopy(entry))
     end
-    isempty(pool) && return Any[]
+    isempty(pool) && return return_report ? Dict{String,Any}(
+        "archive" => Any[], "archive_count" => 0, "configured_target" => target_size,
+        "technical_cap" => max_size, "quality_band" => nothing,
+        "rejected_counts" => rejected, "adaptive_target_status" => "constrained") : Any[]
     sort!(pool, by = x -> Float64(x["score"]))
 
     scores = Float64[Float64(entry["score"]) for entry in pool]
-    best_score = first(scores)
-    score_mad = median(abs.(scores .- median(scores)))
-    robust_scale = max(
-        score_mad,
-        SURVIVOR_RELATIVE_SCORE_FLOOR * max(abs(best_score), 1.0),
-        1e-8,
-    )
-    score_threshold = best_score + SURVIVOR_SCORE_MAD_MULTIPLIER * robust_scale
+    quality_band = _archive_quality_band(scores)
+    score_threshold = quality_band["threshold"]
     quality_pool = [entry for entry in pool if Float64(entry["score"]) <= score_threshold]
+    distance_bounds = parameter_bounds
+    if distance_bounds === nothing && !isempty(quality_pool)
+        vectors = [try Float64.(x["evaluated_vector"]) catch; Float64[] end for x in quality_pool]
+        if !isempty(vectors) && all(v -> length(v) == length(first(vectors)), vectors)
+            distance_bounds = [(minimum(v[i] for v in vectors), maximum(v[i] for v in vectors))
+                               for i in eachindex(first(vectors))]
+        end
+    end
 
     objectives = [archive_objectives(entry) for entry in quality_pool]
     pareto = Any[]
@@ -702,22 +780,86 @@ function survivor_archive_update(existing, entries; max_size::Int=SURVIVOR_ARCHI
         push!(pareto, entry)
     end
     isempty(pareto) && (pareto = [first(quality_pool)])
-    sort!(pareto, by = x -> Float64(x["score"]))
+    sort!(pareto, by = x -> (Float64(x["score"]), string(get(x, "candidate", ""))))
 
     selected = Any[]
+    desired = min(max_size, max(target_size, 1))
     for entry in pareto
-        any(archive_parameter_distance(entry, other) < min_distance for other in selected) && continue
+        any(_archive_normalized_distance(entry, other, distance_bounds) < min_distance for other in selected) && continue
         push!(selected, entry)
-        length(selected) >= max_size && break
+        length(selected) >= desired && break
     end
-    if length(selected) < max_size
-        for entry in pareto
+    if length(selected) < desired
+        for entry in quality_pool
             any(selected_entry === entry for selected_entry in selected) && continue
+            any(_archive_normalized_distance(entry, other, distance_bounds) < min_distance for other in selected) && continue
             push!(selected, entry)
-            length(selected) >= max_size && break
+            length(selected) >= desired && break
         end
     end
-    return selected
+    constrained = length(quality_pool) < target_size
+    for entry in selected
+        if current_stage !== nothing
+            entry["admission_reason"] = "current_stage_quality_and_diversity"
+            entry["quality_threshold"] = score_threshold
+            entry["archive_provenance"] = get(entry, "provenance", Dict{String,Any}())
+            entry["requested_horizon"] = get(entry, "requested_horizon", current_fit_months)
+            entry["effective_scoring_horizon"] = get(entry, "effective_scoring_horizon", current_fit_months)
+            entry["transition_delta_report"] = get(entry, "transition_delta_report",
+                Dict{String,Any}("status" => "not_available", "candidate_class" => "unknown"))
+        end
+    end
+    pairwise = Float64[]
+    for i in eachindex(selected)
+        for j in (i + 1):length(selected)
+            i < j && push!(pairwise, _archive_normalized_distance(selected[i], selected[j], distance_bounds))
+        end
+    end
+    report = Dict{String,Any}(
+        "archive" => selected, "archive_count" => length(selected),
+        "configured_target" => target_size, "technical_cap" => max_size,
+        "adaptive_target_status" => constrained ? "constrained" : "met",
+        "quality_band" => quality_band, "quality_pool_count" => length(quality_pool),
+        "pareto_count" => length(pareto), "min_parameter_distance" => min_distance,
+        "diversity" => Dict{String,Any}(
+            "pairwise_count" => length(pairwise),
+            "minimum_distance" => isempty(pairwise) ? 0.0 : minimum(pairwise),
+            "mean_distance" => isempty(pairwise) ? 0.0 : mean(pairwise),
+        ),
+        "rejected_counts" => rejected,
+        "diversity_policy" => "normalized_parameter_distance",
+        "scalar_best" => first(pool),
+    )
+    return return_report ? report : selected
+end
+
+function archive_quality_gate(archive; current_stage=nothing, current_fit_months=nothing,
+    current_best_score=Inf, target_size::Int=40, minimum_size::Int=1,
+    quality_band=nothing, diversity_passed=nothing,
+    quality_band_constrained::Bool=false, allow_reduced_archive::Bool=true)
+    values = archive isa AbstractVector ? collect(archive) : Any[]
+    valid = [x for x in values if x isa AbstractDict &&
+        _archive_rejection_reason(x; current_stage=current_stage,
+            current_fit_months=current_fit_months) === nothing]
+    best = isempty(valid) ? Inf : minimum(Float64(x["score"]) for x in valid)
+    quality_ok = isfinite(Float64(current_best_score)) && best <= Float64(current_best_score)
+    count_ok = length(valid) >= minimum_size &&
+        (length(valid) >= target_size || (quality_band_constrained && allow_reduced_archive))
+    diversity_ok = diversity_passed === nothing ? !isempty(valid) : Bool(diversity_passed)
+    passed = quality_ok && count_ok && diversity_ok
+    reason = passed ? "current_objective_quality_and_archive_eligible" :
+        (!quality_ok ? "current_objective_quality_failed" :
+         (!count_ok ? "insufficient_admitted_count" : "insufficient_diversity"))
+    return Dict{String,Any}(
+        "status" => passed ? "passed" : "blocked", "next_stage_created" => false,
+        "current_stage" => current_stage, "current_fit_months" => current_fit_months,
+        "current_best_score" => current_best_score, "archive_best_score" => best,
+        "configured_target" => target_size, "minimum_count" => minimum_size,
+        "admitted_count" => length(valid), "quality_band" => quality_band,
+        "diversity_passed" => diversity_ok, "refusal_reason" => reason,
+        "reduced_archive_policy" => "allow_only_when_quality_band_constrained",
+        "quality_band_constrained" => quality_band_constrained,
+    )
 end
 
 function archive_vector_for_stage(entry::AbstractDict, specs_stage::Vector{ParamSpec}, fallback::Vector{Float64})
@@ -3234,6 +3376,13 @@ function run_stage(
                     inject_temporal_prefix_locks!(candidate_cfg, seed, previous_specs)
                     transfer_entry = ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
                     candidate_class = transfer_entry === nothing ? "immigrant/escape" : "archive_transfer"
+                    if transfer_entry !== nothing
+                        x = archive_vector_for_stage(transfer_entry, specs_stage, x)
+                        x, clip_info = clip_candidate(x, specs_stage)
+                        cand_cfg = vector_to_config(seed, specs_stage, x, active_months)
+                        inject_frozen!(cand_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
+                        inject_temporal_prefix_locks!(cand_cfg, seed, previous_specs)
+                    end
                     transition = enforce_transition_policy(seed, candidate_cfg, specs_stage, transfer_entry;
                         candidate_class=candidate_class, policy="reject")
                     cand_dir = joinpath(iter_root, @sprintf("cand_%02d", ci))
@@ -3272,6 +3421,13 @@ function run_stage(
                 inject_temporal_prefix_locks!(cand_cfg, seed, previous_specs)
                 transfer_entry = ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
                 candidate_class = transfer_entry === nothing ? "immigrant/escape" : "archive_transfer"
+                if transfer_entry !== nothing
+                    x = archive_vector_for_stage(transfer_entry, specs_stage, x)
+                    x, clip_info = clip_candidate(x, specs_stage)
+                    cand_cfg = vector_to_config(seed, specs_stage, x, active_months)
+                    inject_frozen!(cand_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
+                    inject_temporal_prefix_locks!(cand_cfg, seed, previous_specs)
+                end
                 transition = enforce_transition_policy(seed, cand_cfg, specs_stage, transfer_entry;
                     candidate_class=candidate_class, policy="reject")
                 transition_report = transition["report"]
@@ -3413,6 +3569,11 @@ function run_stage(
                     "config" => deepcopy(cand_cfg),
                     "metrics" => metrics,
                     "transition_delta_report" => transition_report,
+                    "provenance" => Dict{String,Any}(
+                        "source" => transfer_entry === nothing ? "cma_population" : "predecessor_archive",
+                        "predecessor_archive_entry" => transfer_entry === nothing ? nothing : get(transfer_entry, "candidate", nothing),
+                        "candidate_class" => candidate_class,
+                    ),
                 )
                 top_candidates[key] = candidate_entry
                 push!(iteration_top_candidates, candidate_entry)
@@ -3435,6 +3596,13 @@ function run_stage(
                 inject_temporal_prefix_locks!(candidate_cfg, seed, previous_specs)
                 transfer_entry = ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
                 candidate_class = transfer_entry === nothing ? "immigrant/escape" : "archive_transfer"
+                if transfer_entry !== nothing
+                    x = archive_vector_for_stage(transfer_entry, specs_stage, x)
+                    x, clip_info = clip_candidate(x, specs_stage)
+                    cand_cfg = vector_to_config(seed, specs_stage, x, active_months)
+                    inject_frozen!(cand_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
+                    inject_temporal_prefix_locks!(cand_cfg, seed, previous_specs)
+                end
                 transition = enforce_transition_policy(seed, candidate_cfg, specs_stage, transfer_entry;
                     candidate_class=candidate_class, policy="reject")
                 transition_report = transition["report"]
@@ -3476,6 +3644,11 @@ function run_stage(
                     "parameter_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
                     "metrics" => metrics,
                     "transition_delta_report" => transition_report,
+                    "provenance" => Dict{String,Any}(
+                        "source" => transfer_entry === nothing ? "cma_population" : "predecessor_archive",
+                        "predecessor_archive_entry" => transfer_entry === nothing ? nothing : get(transfer_entry, "candidate", nothing),
+                        "candidate_class" => candidate_class,
+                    ),
                 )
                 top_candidates[key] = candidate_entry
                 push!(iteration_top_candidates, candidate_entry)
@@ -3524,8 +3697,16 @@ function run_stage(
         iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
         mkpath(iter_root)
         safe_save_json(joinpath(iter_root, "top_candidates.json"), safe_iteration_top_k(iteration_top_candidates, cfg.objective.top_k); label="iteration_top_candidates")
-        survivor_archive = survivor_archive_update(survivor_archive, iteration_top_candidates)
+        archive_report = survivor_archive_update(
+            survivor_archive, iteration_top_candidates;
+            current_stage=stage.name, current_fit_months=active_months,
+            target_size=40, max_size=SURVIVOR_ARCHIVE_SIZE,
+            return_report=true,
+        )
+        survivor_archive = archive_report["archive"]
         safe_save_json(archive_path, survivor_archive; label="survivor_archive")
+        safe_save_json(joinpath(stage_root, "survivor_archive_summary.json"),
+            archive_report; label="survivor_archive_summary")
         safe_save_json(joinpath(stage_root, "full_reusable_state.json"),
             full_reusable_state_from_cma(stage, specs_stage, state;
                 transition_report=stage_transition_report); label="full_reusable_state")
@@ -3541,6 +3722,9 @@ function run_stage(
         "best_score" => best_score,
         "best_candidate" => best_candidate,
         "top_candidates" => top_k_entries(collect(values(top_candidates)), cfg.objective.top_k),
+        "survivor_archive" => survivor_archive,
+        "archive_summary" => isfile(joinpath(stage_root, "survivor_archive_summary.json")) ?
+            load_json(joinpath(stage_root, "survivor_archive_summary.json")) : nothing,
         "best_vector" => best_vector,
         "sigma" => state.sigma,
         "covariance" => state.covariance,
@@ -3565,7 +3749,7 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
     current_seed = deepcopy(seed)
     predecessor_archive = Any[]
 
-    for stage in cfg.stages
+    for (stage_index, stage) in enumerate(cfg.stages)
         stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
         resume_info = stage_resume_info(stage_root)
         resume_from = resume_info === nothing ? 0 : Int(resume_info["last_iter"])
@@ -3584,6 +3768,34 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             previous_specs=previous_specs,
             predecessor_archive=predecessor_archive,
         )
+        if stage_index < length(cfg.stages)
+            archive_summary = get(result, "archive_summary", nothing)
+            archive_values = get(result, "survivor_archive", Any[])
+            archive_summary isa AbstractDict || (archive_summary = Dict{String,Any}())
+            gate = archive_quality_gate(archive_values;
+                current_stage=stage.name, current_fit_months=stage.fit_months,
+                current_best_score=result["best_score"], target_size=40,
+                minimum_size=1,
+                quality_band=get(archive_summary, "quality_band", nothing),
+                quality_band_constrained=get(archive_summary, "adaptive_target_status", "") == "constrained")
+            safe_save_json(joinpath(stage_root, "stage_extension_gate.json"), gate;
+                label="stage_extension_gate")
+            if gate["status"] != "passed"
+                blocked = merge(gate, Dict{String,Any}(
+                    "status" => "blocked",
+                    "next_stage_created" => false,
+                    "reason" => gate["refusal_reason"],
+                ))
+                safe_save_json(joinpath(stage_root, "stage_blocked.json"), blocked;
+                    label="stage_blocked")
+                push!(stage_outputs, Dict(
+                    "stage" => result["stage"], "best_score" => result["best_score"],
+                    "archive_count" => length(archive_values), "extension_gate" => gate,
+                ))
+                append!(all_history, result["history"])
+                break
+            end
+        end
         posterior_path = nothing
         if cfg.posterior.enabled
             posterior_path = run_nuts_from_stage(
