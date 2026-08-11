@@ -1,6 +1,7 @@
 using Test
 using JSON
 using HDF5
+using SHA
 
 const REPO = normpath(joinpath(@__DIR__, ".."))
 const JULIA = get(ENV, "JULIA", "/Users/marcinbodych/Workspace/saxocov/julia-1.7.0/bin/julia")
@@ -65,6 +66,32 @@ const JULIA = get(ENV, "JULIA", "/Users/marcinbodych/Workspace/saxocov/julia-1.7
     @test all(s["gate"]["status"] == "passed" for s in summary["stages"])
     @test all(isfile(joinpath(s["stage_root"], "preflight_manifest.json"))
               for s in summary["stages"])
+    # Trusted trajectory/CMA state must be durable at every handoff, not just
+    # represented by the scalar archive identifiers.
+    trajectory_ids = String[]
+    for (i, stage) in enumerate(summary["stages"])
+        state = JSON.parsefile(joinpath(stage["stage_root"], "stage_state.json"))
+        reusable = JSON.parsefile(joinpath(stage["stage_root"], "full_reusable_state.json"))
+        @test haskey(state, "trajectory_identity")
+        @test haskey(state, "historical_trajectory")
+        @test haskey(state, "prefix_hash")
+        @test haskey(state, "locked_intervals")
+        @test haskey(reusable, "cma_state")
+        @test haskey(reusable, "trajectory_identity")
+        @test reusable["admitted_ids"] == state["transfer_archive_ids"]
+        push!(trajectory_ids, String(state["trajectory_identity"]))
+        if i > 1
+            previous = JSON.parsefile(joinpath(summary["stages"][i - 1]["stage_root"], "stage_state.json"))
+            @test state["trajectory_identity"] == previous["trajectory_identity"]
+            @test state["historical_trajectory"]["prefix_values"] ==
+                  previous["historical_trajectory"]["values"]
+            @test state["historical_trajectory"]["prefix_hash"] ==
+                  bytes2hex(SHA.sha256(JSON.json(previous["historical_trajectory"]["values"])))
+            @test all(get(c, "candidate_class", "") == "archive_transfer"
+                      for c in JSON.parsefile(joinpath(stage["stage_root"], "transfer_candidates.json")))
+        end
+    end
+    @test length(unique(trajectory_ids)) == 1
     # Every extension must consume the canonical archive finalized by its
     # immediate predecessor, while current-stage survivor selection remains a
     # separate artifact.
@@ -81,8 +108,10 @@ const JULIA = get(ENV, "JULIA", "/Users/marcinbodych/Workspace/saxocov/julia-1.7
         @test transfer["protected_transfer_slots"] == previous["archive_ids"]
         @test isempty(intersect(Set(transfer["protected_transfer_slots"]),
                                 Set(transfer["immigrant_slots"])))
-        @test JSON.parsefile(joinpath(current["stage_root"], "transfer_candidates.json")) ==
-              JSON.parsefile(joinpath(previous["stage_root"], "survivor_archive.json"))
+        transferred = JSON.parsefile(joinpath(current["stage_root"], "transfer_candidates.json"))
+        predecessor_archive = JSON.parsefile(joinpath(previous["stage_root"], "survivor_archive.json"))
+        @test [c["candidate"] for c in transferred] == [c["candidate"] for c in predecessor_archive]
+        @test [c["evaluated_vector"] for c in transferred] == [c["evaluated_vector"] for c in predecessor_archive]
         @test current["archive_ids"] != transfer["admitted_ids"]
     end
     @test isfile(joinpath(summary["output_root"], "pipeline_summary.json"))

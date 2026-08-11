@@ -79,6 +79,13 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
     ispath(output_root) && error("fixture output root already exists: $output_root")
     mkpath(output_root)
     stages = Any[]
+    # The fixture models one trusted historical trajectory.  Its identity is
+    # stable across stages, while each stage appends only its newly exposed
+    # suffix.  This is deliberately deterministic and does not invoke a
+    # simulator.
+    trajectory_identity = bytes2hex(sha256("fixture-trusted-trajectory-v1"))
+    historical_values = Float64[]
+    previous_prefix_hash = bytes2hex(sha256(JSON.json(historical_values)))
     for (index, stage) in enumerate(plan)
         # Transfer is a read-only handoff from the one authoritative,
         # immediate predecessor.  Validate it before creating the target
@@ -111,6 +118,25 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
         end
         stage_root = joinpath(output_root, String(stage["name"]))
         mkpath(stage_root)
+        prefix_values = copy(historical_values)
+        prefix_hash = bytes2hex(sha256(JSON.json(prefix_values)))
+        requested_days = Int(stage["requested_days"])
+        append!(historical_values,
+            [0.2 + 0.001 * day for day in (length(historical_values) + 1):requested_days])
+        locked_intervals = [
+            Dict("name" => "fixture.trajectory[$day]", "start_day" => day,
+                 "end_day" => day, "value" => value, "class" => "locked")
+            for (day, value) in enumerate(prefix_values)
+        ]
+        historical_trajectory = Dict(
+            "identity" => trajectory_identity,
+            "prefix_values" => prefix_values,
+            "prefix_hash" => prefix_hash,
+            "values" => copy(historical_values),
+            "start_day" => isempty(prefix_values) ? nothing : 1,
+            "end_day" => requested_days,
+            "initialized_suffix" => requested_days - length(prefix_values),
+        )
         manifest = deepcopy(preflight)
         manifest["stage"] = stage
         manifest["source_stage"] = index == 1 ? nothing : plan[index - 1]["name"]
@@ -130,6 +156,12 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
                 "score" => 1.0 + 0.01 * slot,
                 "evaluated_vector" => [0.1 * slot, 0.2 * slot],
                 "parameter_names" => ["fixture.beta[1]", "fixture.beta[2]"],
+                "trajectory_identity" => trajectory_identity,
+                "historical_trajectory" => deepcopy(historical_trajectory),
+                "prefix_hash" => prefix_hash,
+                "candidate_class" => index == 1 ? "new_dimension" : "new_dimension",
+                "source_archive_id" => nothing,
+                "admitted_predecessor_id" => nothing,
                 "metrics" => Dict("weekly_control_score" => 0.8 + 0.01 * slot,
                                   "daily_detections_cumulative" => 0.9,
                                   "temporal_jump_penalty" => 0.0),
@@ -165,7 +197,18 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
         transfer_ids = incoming_manifest === nothing ? String[] :
             String.(incoming_manifest["admitted_order"])
         current_ids = [String(x["candidate"]) for x in archive]
-        transfer_archive = incoming_archive
+        # Transfer records are immutable lineage records.  Add target-stage
+        # classification without changing the canonical predecessor archive.
+        transfer_archive = [
+            merge(deepcopy(entry), Dict{String,Any}(
+                "candidate_class" => "archive_transfer",
+                "trajectory_identity" => trajectory_identity,
+                "historical_trajectory" => deepcopy(historical_trajectory),
+                "prefix_hash" => prefix_hash,
+                "admitted_predecessor_id" => get(entry, "candidate", nothing),
+                "source_archive_id" => incoming_manifest === nothing ? nothing : incoming_manifest["archive_id"],
+                "locked_intervals" => deepcopy(locked_intervals),
+            )) for entry in incoming_archive]
         O.safe_save_json(joinpath(stage_root, "transfer_candidates.json"),
                          transfer_archive; label="fixture_transfer_candidates")
         transfer = Dict("source_archive_path" => manifest_path,
@@ -175,7 +218,12 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
             "source_archive_id" => incoming_manifest === nothing ? nothing : incoming_manifest["archive_id"],
             "admitted_ids" => transfer_ids, "candidate_order" => transfer_ids,
             "protected_transfer_slots" => transfer_ids, "immigrant_slots" => String[],
-            "archive_lineage" => incoming_path)
+            "archive_lineage" => incoming_path,
+            "trajectory_identity" => trajectory_identity,
+            "prefix_hash" => prefix_hash,
+            "locked_intervals" => locked_intervals,
+            "source_reusable_state_path" => index == 1 ? nothing :
+                joinpath(output_root, String(plan[index - 1]["name"]), "full_reusable_state.json"))
         # For the first stage there is no predecessor; for later stages the
         # source path must remain the exact canonical predecessor manifest.
         index > 1 && (transfer["source_archive_path"] = incoming_path)
@@ -191,20 +239,44 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
             "source_archive_path" => incoming_path,
             "source_archive_id" => incoming_manifest === nothing ? nothing : incoming_manifest["archive_id"],
             "rng_state" => Dict("algorithm" => "fixture-fixed", "stream" => index),
-            "prefix_hash" => bytes2hex(sha256(JSON.json(transfer_archive)))))
+            "trajectory_identity" => trajectory_identity,
+            "historical_trajectory" => historical_trajectory,
+            "prefix_hash" => prefix_hash,
+            "locked_intervals" => locked_intervals,
+            "new_suffix_days" => requested_days - length(prefix_values),
+            "previous_prefix_hash" => previous_prefix_hash))
+        cma_state = Dict{String,Any}(
+            "state_id" => string(stage["name"], ":cma:", trajectory_identity),
+            "parameter_names" => ["fixture.beta[1]", "fixture.beta[2]"],
+            "mean" => [0.1, 0.2], "sigma" => [0.08, 0.08],
+            "covariance" => [[0.04, 0.0], [0.0, 0.04]],
+            "p_c" => [0.0, 0.0], "p_sigma" => [0.0, 0.0],
+            "source_archive_ids" => transfer_ids)
         O.safe_save_json(joinpath(stage_root, "full_reusable_state.json"), Dict(
             "status" => "committed", "stage" => stage["name"],
             "source_archive_path" => incoming_path, "admitted_ids" => transfer_ids,
             "parameter_names" => ["fixture.beta[1]", "fixture.beta[2]"],
-            "transition_delta_report" => [x["transition_delta_report"] for x in archive]))
+            "transition_delta_report" => [x["transition_delta_report"] for x in archive],
+            "trajectory_identity" => trajectory_identity,
+            "prefix_hash" => prefix_hash,
+            "historical_trajectory" => historical_trajectory,
+            "locked_intervals" => locked_intervals,
+            "cma_state" => cma_state,
+            "source_archive_ids" => transfer_ids,
+            "state_provenance" => Dict("source" => incoming_path,
+                "admitted_predecessor_ids" => transfer_ids,
+                "scalar_best_usable" => false)))
         push!(stages, merge(stage, Dict("stage_root" => stage_root,
             "archive_path" => manifest_path, "archive_ids" => current_ids,
             "transfer_archive_ids" => transfer_ids,
             "current_archive_ids" => current_ids,
             "source_archive_path" => incoming_path,
             "source_archive_id" => incoming_manifest === nothing ? nothing : incoming_manifest["archive_id"],
+            "trajectory_identity" => trajectory_identity,
+            "prefix_hash" => prefix_hash,
             "gate" => gate,
             "status" => "committed")))
+        previous_prefix_hash = prefix_hash
     end
     summary = Dict("status" => "fixture_complete", "adapter_mode" => "deterministic_fixture",
         "output_root" => output_root, "target_months" => target, "monthly_days" => monthly_days,
