@@ -55,6 +55,64 @@ end
     @test O.objective_score(cfg, metrics, 0.0, 0.0, 0.0) == 2.0
 end
 
+@testset "zero-weight nonfinite optional terms are ignored" begin
+    objective = O.ObjectiveConfig(Dict{String,Float64}(
+            "daily_detections" => 1.0,
+            "weekly_control" => 0.0,
+        ), 1, 1.0, 1, "baseline", 0.0, 0.0)
+    posterior = O.PosteriorConfig(false, "diagonal_gaussian_weekly", 1, 1, 1,
+        0.05, 1.0, 1.0, 1.0, 1.0, 0.0)
+    cfg = O.OptimizerConfig("seed", "out", 30, O.StageConfig[],
+        Dict{String,Tuple{Float64,Float64}}(), Dict{String,Tuple{Float64,Float64}}(),
+        Dict{String,Dict{String,Any}}(), "monthly", Dict{String,Float64}(),
+        Dict{String,Any}(), objective, nothing, Dict{String,Vector{String}}(),
+        nothing, posterior)
+    @test O.objective_score(cfg, Dict{String,Any}("daily_detections" => 2.0),
+        Inf, Inf, Inf) == 2.0
+end
+
+@testset "positive-weight nonfinite optional terms propagate Inf" begin
+    objective = O.ObjectiveConfig(Dict{String,Float64}(
+            "daily_detections" => 1.0,
+            "weekly_control" => 1.0,
+        ), 1, 1.0, 1, "baseline", 0.5, 0.25)
+    posterior = O.PosteriorConfig(false, "diagonal_gaussian_weekly", 1, 1, 1,
+        0.05, 1.0, 1.0, 1.0, 1.0, 0.0)
+    cfg = O.OptimizerConfig("seed", "out", 30, O.StageConfig[],
+        Dict{String,Tuple{Float64,Float64}}(), Dict{String,Tuple{Float64,Float64}}(),
+        Dict{String,Dict{String,Any}}(), "monthly", Dict{String,Float64}(),
+        Dict{String,Any}(), objective, nothing, Dict{String,Vector{String}}(),
+        nothing, posterior)
+    @test isinf(O.objective_score(cfg, Dict{String,Any}("daily_detections" => 2.0),
+        Inf, 0.0, 0.0))
+    @test isinf(O.objective_score(cfg, Dict{String,Any}("daily_detections" => 2.0),
+        0.0, Inf, 0.0))
+    @test isinf(O.objective_score(cfg, Dict{String,Any}("daily_detections" => 2.0),
+        0.0, 0.0, Inf))
+end
+
+@testset "effective metric manifest records weighted optional terms" begin
+    objective = O.ObjectiveConfig(Dict{String,Float64}(
+            "daily_detections" => 1.0,
+            "weekly_control" => 0.0,
+        ), 1, 1.0, 1, "baseline", 0.0, 0.25)
+    posterior = O.PosteriorConfig(false, "diagonal_gaussian_weekly", 1, 1, 1,
+        0.05, 1.0, 1.0, 1.0, 1.0, 0.0)
+    cfg = O.OptimizerConfig("seed", "out", 30, O.StageConfig[],
+        Dict{String,Tuple{Float64,Float64}}(), Dict{String,Tuple{Float64,Float64}}(),
+        Dict{String,Dict{String,Any}}(), "monthly", Dict{String,Float64}(),
+        Dict{String,Any}(), objective, nothing, Dict{String,Vector{String}}(),
+        nothing, posterior)
+    manifest = O.effective_metric_manifest(
+        cfg, Dict{String,Any}("daily_detections" => 2.0), Inf, Inf, 0.0)
+    @test manifest["weekly_control"]["weight"] == 0.0
+    @test manifest["weekly_control"]["enabled"] == false
+    @test manifest["temporal_jump_penalty"]["weight"] == 0.0
+    @test manifest["infection_extrema_penalty"]["weight"] == 0.25
+    @test manifest["infection_extrema_penalty"]["enabled"] == true
+    @test manifest["weekly_control"]["source_present"] == true
+end
+
 @testset "cumulative distribution guards empty and preserves indices" begin
     mktempdir() do root
         daily = joinpath(root, "daily.h5")
@@ -112,5 +170,7 @@ end
         score, payload = O.score_from_daily(cfg, daily, 3)
         @test isfinite(score)
         @test payload["validation_window"] isa Dict{String,Any}
+        @test payload["effective_metric_manifest"] isa Dict{String,Any}
+        @test payload["effective_metric_manifest"]["weekly_control"]["weight"] == 0.0
     end
 end

@@ -2356,27 +2356,9 @@ function objective_score_legacy(
     jump_penalty::Float64,
     extrema_penalty::Float64,
 )
-    weights = cfg.objective.weights
-    combined = 0.0
-    for (metric, default_weight) in OBJECTIVE_METRIC_DEFAULTS
-        combined += get(weights, metric, default_weight) * get(metrics, metric, 0.0)
-    end
-    # Preserve optional age-specific weights when they are explicitly present
-    # in the configuration, while keeping all unconfigured metrics neutral.
-    for (metric, value) in metrics
-        metric in keys(OBJECTIVE_METRIC_DEFAULTS) && continue
-        metric == "weekly_control_score" && continue
-        metric == "temporal_jump_penalty" && continue
-        metric == "infection_extrema_penalty" && continue
-        metric == "vector_log_likelihood" && continue
-        endswith(metric, "_cumulative") && continue
-        haskey(weights, metric) || continue
-        combined += weights[metric] * value
-    end
-    combined += get(weights, "weekly_control", 1.0) * weekly_control
-    return combined +
-           cfg.objective.temporal_jump_weight * jump_penalty +
-           cfg.objective.infection_extrema_weight * extrema_penalty
+    # Keep the compatibility entry point on the canonical guarded path so
+    # local and collected scoring cannot diverge on non-finite optional terms.
+    return objective_score(cfg, metrics, weekly_control, jump_penalty, extrema_penalty)
 end
 
 function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, days::Int; workdir::String)
@@ -2431,6 +2413,77 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int, c
     return objective_score(cfg, metrics, weekly_control, jump_penalty, extrema_penalty), metrics
 end
 
+"""Describe the effective weighted objective terms before arithmetic.
+
+The manifest intentionally remains heterogeneous: scoring diagnostics can
+contain structured validation payloads alongside scalar metrics.  Optional
+terms are enabled only when their effective weight is positive and their
+source is present; a non-finite value is then a deterministic failure rather
+than an accidental `0 * Inf` NaN.
+"""
+function effective_metric_manifest(
+    cfg::OptimizerConfig,
+    metrics::AbstractDict,
+    weekly_control::Real,
+    jump_penalty::Real,
+    extrema_penalty::Real,
+)
+    weights = cfg.objective.weights
+    manifest = Dict{String,Any}()
+    for (metric, default_weight) in OBJECTIVE_METRIC_DEFAULTS
+        weight = Float64(get(weights, metric, default_weight))
+        present = haskey(metrics, metric)
+        manifest[metric] = Dict(
+            "enabled" => present && weight > 0.0,
+            "required" => present && weight > 0.0,
+            "weight" => weight,
+            "source_present" => present,
+            "all_missing_policy" => "Inf",
+        )
+    end
+    for metric in keys(weights)
+        metric in keys(OBJECTIVE_METRIC_DEFAULTS) && continue
+        metric in ("weekly_control", "temporal_jump_penalty",
+                   "infection_extrema_penalty") && continue
+        haskey(manifest, metric) && continue
+        manifest[metric] = Dict(
+            "enabled" => haskey(metrics, metric) && weights[metric] > 0.0,
+            "required" => haskey(metrics, metric) && weights[metric] > 0.0,
+            "weight" => Float64(weights[metric]),
+            "source_present" => haskey(metrics, metric),
+            "all_missing_policy" => "Inf",
+        )
+    end
+    weekly_weight = Float64(get(weights, "weekly_control", 1.0))
+    manifest["weekly_control"] = Dict(
+        "enabled" => weekly_weight > 0.0,
+        "required" => weekly_weight > 0.0,
+        "weight" => weekly_weight,
+        "source_present" => true,
+        "finite" => isfinite(weekly_control),
+        "all_missing_policy" => "Inf",
+    )
+    jump_weight = cfg.objective.temporal_jump_weight
+    manifest["temporal_jump_penalty"] = Dict(
+        "enabled" => jump_weight > 0.0,
+        "required" => jump_weight > 0.0,
+        "weight" => jump_weight,
+        "source_present" => true,
+        "finite" => isfinite(jump_penalty),
+        "all_missing_policy" => "Inf",
+    )
+    extrema_weight = cfg.objective.infection_extrema_weight
+    manifest["infection_extrema_penalty"] = Dict(
+        "enabled" => extrema_weight > 0.0,
+        "required" => extrema_weight > 0.0,
+        "weight" => extrema_weight,
+        "source_present" => true,
+        "finite" => isfinite(extrema_penalty),
+        "all_missing_policy" => "Inf",
+    )
+    return manifest
+end
+
 function objective_score(
     cfg::OptimizerConfig,
     metrics::AbstractDict,
@@ -2440,34 +2493,21 @@ function objective_score(
 )
     weights = cfg.objective.weights
     total = 0.0
-    manifest = Dict{String,Any}()
+    manifest = effective_metric_manifest(
+        cfg, metrics, weekly_control, jump_penalty, extrema_penalty)
+    invalid = false
     for (metric, default_weight) in OBJECTIVE_METRIC_DEFAULTS
         weight = Float64(get(weights, metric, default_weight))
         value_present = haskey(metrics, metric)
         value = value_present ? try Float64(metrics[metric]) catch; Inf end : Inf
-        # A metric absent from the reference manifest is optional.  When its
-        # source exists, score construction records Inf for missing candidate
-        # output, which is the required-metric failure path.
-        required = value_present && weight > 0.0
-        manifest[metric] = Dict("enabled" => required, "required" => required,
-                                "weight" => weight, "source_present" => value_present,
-                                "all_missing_policy" => "Inf")
-        if required && (!value_present || !isfinite(value))
-            return Inf
-        end
         value_present || continue
-        weight == 0.0 && continue
+        weight > 0.0 && !isfinite(value) && (invalid = true)
+        weight <= 0.0 && continue
         total += weight * value
     end
     wc_weight = Float64(get(weights, "weekly_control", 1.0))
-    manifest["weekly_control"] = Dict("enabled" => wc_weight > 0,
-        "required" => wc_weight > 0, "weight" => wc_weight,
-        "source_present" => isfinite(weekly_control), "all_missing_policy" => "Inf")
-    wc_weight > 0 && !isfinite(weekly_control) && return Inf
-    total += wc_weight * weekly_control
-    if !isfinite(jump_penalty) || !isfinite(extrema_penalty)
-        return Inf
-    end
+    wc_weight > 0.0 && !isfinite(weekly_control) && (invalid = true)
+    wc_weight > 0.0 && (total += wc_weight * weekly_control)
     for (metric, raw_value) in metrics
         metric in keys(OBJECTIVE_METRIC_DEFAULTS) && continue
         metric in ("weekly_control_score", "temporal_jump_penalty",
@@ -2476,13 +2516,19 @@ function objective_score(
         haskey(weights, metric) || continue
         weight = Float64(weights[metric])
         value = try Float64(raw_value) catch; Inf end
-        weight > 0 && !isfinite(value) && return Inf
-        weight == 0 && continue
+        weight > 0.0 && !isfinite(value) && (invalid = true)
+        weight <= 0.0 && continue
         total += weight * value
     end
-    total += cfg.objective.temporal_jump_weight * jump_penalty +
-             cfg.objective.infection_extrema_weight * extrema_penalty
-    isfinite(total) ? total : Inf
+    jump_weight = cfg.objective.temporal_jump_weight
+    extrema_weight = cfg.objective.infection_extrema_weight
+    jump_weight > 0.0 && !isfinite(jump_penalty) && (invalid = true)
+    extrema_weight > 0.0 && !isfinite(extrema_penalty) && (invalid = true)
+    jump_weight > 0.0 && (total += jump_weight * jump_penalty)
+    extrema_weight > 0.0 && (total += extrema_weight * extrema_penalty)
+    metrics isa Dict{String,Any} &&
+        (metrics["effective_metric_manifest"] = manifest)
+    !invalid && isfinite(total) ? total : Inf
 end
 
 function validation_score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
