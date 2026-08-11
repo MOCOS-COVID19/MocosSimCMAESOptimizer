@@ -183,6 +183,17 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
             current_stage=stage["name"], current_fit_months=stage["fit_months"],
             target_size=3, max_size=200, return_report=true)
         archive = report["archive"]
+        # Terminal classifications are persisted independently of the
+        # selection result.  Resume must consume these records, rather than
+        # inferring completion from candidate directories.
+        O.safe_save_json(joinpath(stage_root, "top_candidates.json"), entries;
+                         label="fixture_top_candidates")
+        open(joinpath(stage_root, "iter_metrics.jsonl"), "w") do io
+            for entry in entries
+                JSON.print(io, entry)
+                print(io, '\n')
+            end
+        end
         archive_path = joinpath(stage_root, "survivor_archive.json")
         O.safe_save_json(archive_path, archive; label="fixture_survivor_archive")
         manifest_path = O.persist_archive_transfer_manifest(stage_root, archive;
@@ -266,6 +277,10 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
             "state_provenance" => Dict("source" => incoming_path,
                 "admitted_predecessor_ids" => transfer_ids,
                 "scalar_best_usable" => false)))
+        O.atomic_save_json(joinpath(stage_root, "iter_1", "iteration_commit.json"),
+            Dict("status" => "committed", "stage" => stage["name"],
+                 "iteration" => 1,
+                 "candidate_ids" => [String(x["candidate"]) for x in entries]))
         push!(stages, merge(stage, Dict("stage_root" => stage_root,
             "archive_path" => manifest_path, "archive_ids" => current_ids,
             "transfer_archive_ids" => transfer_ids,
@@ -290,6 +305,107 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
     return summary
 end
 
+"""Load a previously completed fixture root without replaying its stages.
+
+The fixture adapter has no external work to poll, so a committed summary is
+the only safe resume point.  Validate the cross-stage joins before returning
+it; in particular, do not let directory existence stand in for terminal
+state.
+"""
+function resume_fixture_pipeline(output_root::String)
+    summary_path = joinpath(output_root, "pipeline_summary.json")
+    isfile(summary_path) || error(
+        "fixture output root exists without a committed pipeline_summary.json")
+    summary = try
+        JSON.parsefile(summary_path)
+    catch err
+        error("fixture pipeline summary is malformed: $(sprint(showerror, err))")
+    end
+    status = String(get(summary, "status", ""))
+    if status == "fixture_blocked"
+        isfile(joinpath(output_root, "blocked_state.json")) ||
+            error("blocked fixture root lacks durable blocked_state.json")
+        return summary
+    end
+    status == "fixture_complete" ||
+        error("fixture output root is not committed; refusing unsafe resume")
+    stages = get(summary, "stages", nothing)
+    stages isa AbstractVector && !isempty(stages) ||
+        error("committed fixture summary has no stages")
+    previous_name = nothing
+    for stage in stages
+        stage isa AbstractDict || error("committed fixture stage is malformed")
+        name = String(get(stage, "name", ""))
+        root = String(get(stage, "stage_root", joinpath(output_root, name)))
+        root == joinpath(output_root, name) ||
+            error("fixture stage root escapes output root: $name")
+        get(stage, "status", "") == "committed" ||
+            error("fixture stage is not committed: $name")
+        required = ("preflight_manifest.json", "stage_state.json",
+                    "iter_metrics.jsonl", "top_candidates.json",
+                    "survivor_archive.json", "full_reusable_state.json",
+                    "transfer_manifest.json", "transfer_candidates.json",
+                    "iter_1/iteration_commit.json")
+        all(isfile(joinpath(root, file)) for file in required) ||
+            error("fixture stage is missing committed artifacts: $name")
+        state = try JSON.parsefile(joinpath(root, "stage_state.json"))
+        catch err
+            error("fixture stage state is malformed: $name")
+        end
+        reusable = try JSON.parsefile(joinpath(root, "full_reusable_state.json"))
+        catch err
+            error("fixture reusable state is malformed: $name")
+        end
+        get(state, "status", "") == "committed" ||
+            error("fixture stage state is not committed: $name")
+        get(reusable, "status", "") == "committed" ||
+            error("fixture reusable state is not committed: $name")
+        String(get(state, "stage", "")) == name ||
+            error("fixture stage state identity mismatch: $name")
+        String(get(reusable, "stage", "")) == name ||
+            error("fixture reusable state identity mismatch: $name")
+        archive = try JSON.parsefile(joinpath(root, "survivor_archive.json"))
+        catch err
+            error("fixture archive is malformed: $name")
+        end
+        archive isa AbstractVector && !isempty(archive) ||
+            error("fixture archive is empty or malformed: $name")
+        terminal_rows = Any[]
+        for line in eachline(joinpath(root, "iter_metrics.jsonl"))
+            isempty(strip(line)) || push!(terminal_rows, JSON.parse(line))
+        end
+        terminal_rows isa AbstractVector && !isempty(terminal_rows) ||
+            error("fixture terminal classifications are missing: $name")
+        all(row isa AbstractDict &&
+            get(row, "status", "") in ("completed", "failed", "skipped")
+            for row in terminal_rows) ||
+            error("fixture terminal classification is nonterminal: $name")
+        top = JSON.parsefile(joinpath(root, "top_candidates.json"))
+        top isa AbstractVector && length(top) == length(terminal_rows) ||
+            error("fixture top candidates do not join terminal metrics: $name")
+        commit = JSON.parsefile(joinpath(root, "iter_1", "iteration_commit.json"))
+        get(commit, "status", "") == "committed" &&
+            String(get(commit, "stage", "")) == name &&
+            Int(get(commit, "iteration", 0)) == 1 ||
+            error("fixture iteration commit is invalid: $name")
+        admitted = get(reusable, "admitted_ids", Any[])
+        transfer_rows = JSON.parsefile(joinpath(root, "transfer_candidates.json"))
+        known_ids = Set{Any}(vcat(
+            [get(entry, "candidate", nothing) for entry in archive],
+            transfer_rows isa AbstractVector ?
+                [get(entry, "candidate", nothing) for entry in transfer_rows] : Any[]))
+        all(id in known_ids for id in admitted) ||
+            error("fixture reusable state references an unarchived candidate: $name")
+        if previous_name !== nothing
+            transfer = JSON.parsefile(joinpath(root, "transfer_manifest.json"))
+            String(get(transfer, "source_stage", "")) == previous_name ||
+                error("fixture predecessor lineage mismatch: $name")
+        end
+        previous_name = name
+    end
+    return summary
+end
+
 function run_pipeline(batch_path::String)
     batch_dir = dirname(abspath(batch_path))
     batch = JSON.parsefile(batch_path)
@@ -299,6 +415,10 @@ function run_pipeline(batch_path::String)
     preflight_config(base_path; readiness=false)
     base_config = JSON.parsefile(base_path)
     if get(batch, "adapter_mode", "") == "fixture"
+        output_root = resolve_path(String(batch["output_root"]), batch_dir)
+        if ispath(output_root)
+            return resume_fixture_pipeline(output_root)
+        end
         return run_fixture_pipeline(batch_path, base_config,
                                      preflight_config(base_path; readiness=true), batch)
     end

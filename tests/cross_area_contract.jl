@@ -116,4 +116,26 @@ const JULIA = get(ENV, "JULIA", "/Users/marcinbodych/Workspace/saxocov/julia-1.7
     end
     @test isfile(joinpath(summary["output_root"], "pipeline_summary.json"))
     @test !isdir(joinpath(summary["output_root"], "advanced_cli.jl"))
+
+    # A committed rerun must be a read-only resume.  Hash every durable
+    # artifact, not just the top-level summary, so duplicate stage writes or
+    # advancement are observable.
+    durable = String[]
+    for (dir, _, files) in walkdir(summary["output_root"])
+        append!(durable, joinpath.(dir, files))
+    end
+    before = Dict(path => bytes2hex(SHA.sha256(read(path))) for path in durable)
+    rerun = read(`$JULIA --project=$REPO $REPO/scripts/run_pipeline.jl $batch_path`, String)
+    rerun_summary = JSON.parse(rerun)
+    @test rerun_summary == summary
+    after = Dict(path => bytes2hex(SHA.sha256(read(path))) for path in durable)
+    @test after == before
+
+    # Removing a committed state artifact must fail closed rather than
+    # treating the existing directory as completed work.
+    rm(joinpath(summary["stages"][2]["stage_root"], "stage_state.json"))
+    proc = run(`$JULIA --project=$REPO $REPO/scripts/run_pipeline.jl $batch_path`;
+               wait=false)
+    wait(proc)
+    @test !success(proc)
 end
