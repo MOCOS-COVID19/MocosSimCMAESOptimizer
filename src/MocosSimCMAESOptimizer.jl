@@ -275,11 +275,13 @@ function transition_delta_report(previous::AbstractDict, current::AbstractDict;
             "provenance" => candidate_class))
     end
     deltas = [abs(Float64(r["delta"])) for r in rows if r["class"] == "archive_transfer"]
+    overall = any(x > limit for x in deltas) ?
+        (policy == "clip" ? "clipped" : policy) : "accepted"
     return Dict{String,Any}("coordinate_space" => coordinate_space, "version" => version,
         "candidate_class" => candidate_class, "coordinates" => rows,
         "max_abs_delta" => isempty(deltas) ? 0.0 : maximum(deltas),
         "norm" => isempty(deltas) ? 0.0 : norm(deltas), "limit" => limit,
-        "policy_outcome" => any(x > limit for x in deltas) ? policy : "accepted")
+        "policy_outcome" => overall)
 end
 
 """Validate all dimensions and numerical invariants before CMA sampling."""
@@ -778,6 +780,79 @@ function effective_transition_report(seed::AbstractDict, cfg::AbstractDict,
     end
     return transition_delta_report(prior, current;
         candidate_class=candidate_class, coordinate_classes=classes, limit=limit)
+end
+
+"""Apply transition policy before a candidate reaches scoring or admission.
+
+The returned config is always the effective config.  Rejected transfers have
+no effective candidate and callers must classify them terminally.
+"""
+function enforce_transition_policy(seed::AbstractDict, cfg::AbstractDict,
+                                   specs_stage::Vector{ParamSpec},
+                                   source_entry=nothing;
+                                   candidate_class::String="new_dimension",
+                                   limit::Float64=0.15,
+                                   policy::String="reject")
+    policy in ("reject", "clip", "exception") ||
+        throw(ArgumentError("unsupported transition policy: $policy"))
+    names = ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
+    values = Float64[]
+    for spec in specs_stage
+        raw = try get_nested(cfg, spec.name) catch; Any[] end
+        raw isa AbstractVector || (raw = [raw])
+        append!(values, Float64.(raw))
+    end
+    length(values) == length(names) ||
+        throw(ArgumentError("candidate coordinate count does not match stage specification"))
+    prior = source_entry isa AbstractDict ?
+        Dict{String,Any}("param_names" => get(source_entry, "parameter_names", String[]),
+                         "values" => get(source_entry, "evaluated_vector", Float64[])) :
+        Dict{String,Any}("param_names" => names, "values" => initial_vector(seed, specs_stage))
+    old_names = String.(get(prior, "param_names", String[]))
+    old_values = Float64.(get(prior, "values", Float64[]))
+    old_map = Dict(name => i for (i, name) in enumerate(old_names))
+    effective = copy(values)
+    over_limit = false
+    for (i, name) in enumerate(names)
+        haskey(old_map, name) && old_map[name] <= length(old_values) || continue
+        delta = effective[i] - old_values[old_map[name]]
+        abs(delta) <= limit && continue
+        over_limit = true
+        if policy == "clip"
+            effective[i] = old_values[old_map[name]] + sign(delta) * limit
+        end
+    end
+    effective_cfg = deepcopy(cfg)
+    idx = 1
+    for spec in specs_stage
+        if spec.kind == :scalar
+            set_nested!(effective_cfg, spec.name, effective[idx])
+            idx += 1
+        else
+            current = collect(Float64.(get_nested(effective_cfg, spec.name)))
+            for j in 1:min(spec.length, length(current))
+                current[j] = effective[idx]
+                idx += 1
+            end
+            set_nested!(effective_cfg, spec.name, current)
+        end
+    end
+    report = effective_transition_report(seed, effective_cfg, specs_stage, source_entry;
+        candidate_class=candidate_class, limit=limit)
+    for (i, row) in enumerate(report["coordinates"])
+        row["raw_value"] = values[i]
+        row["effective_value"] = effective[i]
+    end
+    if over_limit && policy == "reject"
+        report["policy_outcome"] = "reject"
+        return Dict{String,Any}("status" => "rejected", "config" => nothing, "report" => report)
+    elseif over_limit && policy == "exception"
+        report["policy_outcome"] = "exception"
+        return Dict{String,Any}("status" => "rejected", "config" => nothing, "report" => report)
+    elseif over_limit && policy == "clip"
+        report["policy_outcome"] = "clipped"
+    end
+    return Dict{String,Any}("status" => "accepted", "config" => effective_cfg, "report" => report)
 end
 
 function stage_resume_info(stage_root::String)
@@ -2720,10 +2795,20 @@ function run_stage(
                     candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
                     inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
                     inject_temporal_prefix_locks!(candidate_cfg, seed, previous_specs)
+                    transfer_entry = ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
+                    candidate_class = transfer_entry === nothing ? "immigrant/escape" : "archive_transfer"
+                    transition = enforce_transition_policy(seed, candidate_cfg, specs_stage, transfer_entry;
+                        candidate_class=candidate_class, policy="reject")
                     cand_dir = joinpath(iter_root, @sprintf("cand_%02d", ci))
                     mkpath(cand_dir)
-                    save_json(joinpath(cand_dir, "config.json"), candidate_cfg)
-                    println(io, cand_dir)
+                    if transition["status"] == "rejected"
+                        safe_save_json(joinpath(cand_dir, "transition_rejected.json"),
+                            transition["report"]; label="transition_rejected")
+                    else
+                        candidate_cfg = transition["config"]
+                        save_json(joinpath(cand_dir, "config.json"), candidate_cfg)
+                        println(io, cand_dir)
+                    end
                 end
             end
             jobid = submit_slurm_array(cfg, list_file)
@@ -2750,10 +2835,16 @@ function run_stage(
                 inject_temporal_prefix_locks!(cand_cfg, seed, previous_specs)
                 transfer_entry = ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
                 candidate_class = transfer_entry === nothing ? "immigrant/escape" : "archive_transfer"
-                transition_report = effective_transition_report(seed, cand_cfg, specs_stage, transfer_entry;
-                    candidate_class=candidate_class)
+                transition = enforce_transition_policy(seed, cand_cfg, specs_stage, transfer_entry;
+                    candidate_class=candidate_class, policy="reject")
+                transition_report = transition["report"]
+                cand_cfg = transition["config"]
+                transition_rejected = transition["status"] == "rejected"
                 skipped = isfile(joinpath(cand_dir, "skipped.ok"))
-                metrics = if skipped
+                metrics = if transition_rejected
+                    Dict("score" => Inf, "metrics" => Dict(), "simulated" => "transition_rejected",
+                         "status" => "failed", "failure_class" => "transition_policy_reject")
+                elseif skipped
                     metrics_payload = Dict("score" => Inf, "simulated" => "real_skipped", "status" => "skipped")
                     safe_save_json(joinpath(cand_dir, "metrics.json"), metrics_payload; label="candidate_metrics")
                     Dict("score" => Inf, "metrics" => Dict(), "simulated" => "real_skipped", "status" => "skipped")
@@ -2907,9 +2998,15 @@ function run_stage(
                 inject_temporal_prefix_locks!(candidate_cfg, seed, previous_specs)
                 transfer_entry = ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
                 candidate_class = transfer_entry === nothing ? "immigrant/escape" : "archive_transfer"
-                transition_report = effective_transition_report(seed, candidate_cfg, specs_stage, transfer_entry;
-                    candidate_class=candidate_class)
-                metrics = score_candidate(candidate_cfg, cfg, days; workdir=joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"))
+                transition = enforce_transition_policy(seed, candidate_cfg, specs_stage, transfer_entry;
+                    candidate_class=candidate_class, policy="reject")
+                transition_report = transition["report"]
+                candidate_cfg = transition["config"]
+                metrics = transition["status"] == "rejected" ?
+                    Dict{String,Any}("score" => Inf, "status" => "failed",
+                                     "simulated" => "transition_rejected",
+                                     "failure_class" => "transition_policy_reject") :
+                    score_candidate(candidate_cfg, cfg, days; workdir=joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"))
                 safe_save_json(joinpath(joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)_cand_$(ci)"), "metrics.json"), metrics; label="candidate_metrics")
                 score = metrics["score"]
                 if get(metrics, "status", "completed") == "completed" && isfinite(Float64(score))
@@ -3062,6 +3159,33 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             )
             if posterior_path !== nothing
                 posterior_state = posterior_reusable_state(posterior_path)
+                posterior_archive_path = joinpath(stage_root, "survivor_archive.json")
+                posterior_archive = isfile(posterior_archive_path) ? load_json(posterior_archive_path) : Any[]
+                posterior_archive isa AbstractVector || (posterior_archive = Any[])
+                posterior_names = String.(get(posterior_state, "param_names", String[]))
+                posterior_prior = isempty(posterior_archive) ?
+                    Dict{String,Any}(
+                        "param_names" => posterior_names,
+                        "values" => initial_vector(current_seed, stage_specs(current_seed, specs, cfg, stage))) :
+                    Dict{String,Any}(
+                        "param_names" => get(posterior_archive[1], "parameter_names", String[]),
+                        "values" => get(posterior_archive[1], "evaluated_vector", Float64[]))
+                posterior_state["transition_delta_report"] = transition_delta_report(
+                    posterior_prior,
+                    Dict{String,Any}("param_names" => posterior_names,
+                                     "values" => posterior_state["mean"]);
+                    candidate_class=isempty(posterior_archive) ? "new_dimension" : "archive_transfer",
+                    policy="reject")
+                posterior_state["archive_provenance"] = isempty(posterior_archive) ? nothing :
+                    Dict{String,Any}("source_archive_path" => posterior_archive_path,
+                                     "source_archive_entry" => get(posterior_archive[1], "candidate", nothing),
+                                     "source_stage" => get(posterior_archive[1], "stage", nothing),
+                                     "predecessor" => "immediate_admitted_archive")
+                posterior_state["predecessor_provenance"] = isempty(posterior_archive) ? nothing :
+                    Dict{String,Any}("archive_path" => posterior_archive_path,
+                                     "archive_entry_id" => get(posterior_archive[1], "candidate", nothing),
+                                     "stage" => get(posterior_archive[1], "stage", nothing),
+                                     "horizon_months" => get(posterior_archive[1], "fit_months", stage.fit_months))
                 state = build_state_from_reusable(
                     current_seed,
                     stage_specs(current_seed, specs, cfg, stage),

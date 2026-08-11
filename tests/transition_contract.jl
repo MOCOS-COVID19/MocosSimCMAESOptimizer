@@ -73,6 +73,21 @@ const O = MocosSimCMAESOptimizer
         "interval_times" => [1, 31, 61],
     ))
     specs2 = [O.ParamSpec("curve.interval_values", :temporal, 3, 0.0, 1.0)]
+    # Candidate transfer policy is enforced before any scorer/archive consumer.
+    transfer_cfg = Dict{String,Any}("curve" => Dict{String,Any}("interval_values" => [0.9, 0.4, 0.9]))
+    rejected = O.enforce_transition_policy(seed2, transfer_cfg, specs2,
+        Dict{String,Any}("parameter_names" => ["curve.interval_values[1]", "curve.interval_values[2]", "curve.interval_values[3]"],
+                         "evaluated_vector" => [0.1, 0.1, 0.1]);
+        candidate_class="archive_transfer", limit=0.1, policy="reject")
+    @test rejected["status"] == "rejected"
+    @test rejected["report"]["policy_outcome"] == "reject"
+    clipped = O.enforce_transition_policy(seed2, transfer_cfg, specs2,
+        Dict{String,Any}("parameter_names" => ["curve.interval_values[1]", "curve.interval_values[2]", "curve.interval_values[3]"],
+                         "evaluated_vector" => [0.1, 0.1, 0.1]);
+        candidate_class="archive_transfer", limit=0.1, policy="clip")
+    @test clipped["status"] == "accepted"
+    @test clipped["report"]["policy_outcome"] == "clipped"
+    @test clipped["config"]["curve"]["interval_values"] == [0.2, 0.2, 0.2]
     a = O.build_state_from_reusable(seed2, specs2, reusable; rng=MersenneTwister(8))
     b = O.build_state_from_reusable(seed2, specs2, reusable; rng=MersenneTwister(8))
     @test a.mean == b.mean
