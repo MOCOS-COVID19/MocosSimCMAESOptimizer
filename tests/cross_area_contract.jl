@@ -5,6 +5,123 @@ using SHA
 
 const REPO = normpath(joinpath(@__DIR__, ".."))
 const JULIA = get(ENV, "JULIA", "/Users/marcinbodych/Workspace/saxocov/julia-1.7.0/bin/julia")
+const DEFAULT_FIXTURE_SUBPROCESS_TIMEOUT_SECONDS = 30.0
+
+"""Run a fixture subprocess without allowing a hung child to hang validation.
+
+Both output streams are redirected to independent files so a chatty child
+cannot block on pipe capacity; they are drained after termination. A timeout
+is a blocked fixture, never a successful or failed pipeline result, and its
+evidence is retained under a fresh fixture root.
+"""
+function run_fixture_subprocess(command::Cmd, phase::String, batch_path::String;
+                                timeout_seconds::Float64 = try
+                                    parse(Float64, get(ENV,
+                                        "FIXTURE_SUBPROCESS_TIMEOUT_SECONDS", "30"))
+                                catch
+                                    DEFAULT_FIXTURE_SUBPROCESS_TIMEOUT_SECONDS
+                                end,
+                                poll_seconds::Float64 = 0.05)
+    timeout_seconds > 0 || error("fixture subprocess timeout must be positive")
+    started = time()
+    batch_dir = dirname(abspath(batch_path))
+    output_dir = mktempdir(batch_dir; prefix=".fixture-subprocess-")
+    stdout_path = joinpath(output_dir, "stdout")
+    stderr_path = joinpath(output_dir, "stderr")
+    stdout_io, stderr_io = open(stdout_path, "w"), open(stderr_path, "w")
+    process = run(pipeline(command, stdout_io, stderr_io); wait=false)
+    close(stdout_io)
+    close(stderr_io)
+    timed_out = false
+    while process_running(process)
+        if time() - started >= timeout_seconds
+            timed_out = true
+            try
+                kill(process, 15)
+            catch
+                # The process may have exited between polling and termination.
+            end
+            # Julia children can be inside a long sleep and defer TERM.  Force
+            # termination after a short grace period so validation itself
+            # remains bounded.
+            sleep(0.1)
+            if process_running(process)
+                try
+                    kill(process, 9)
+                catch
+                end
+            end
+            break
+        end
+        sleep(min(poll_seconds, max(timeout_seconds - (time() - started), 0.001)))
+    end
+    wait(process)
+    stdout_text = read(stdout_path, String)
+    stderr_text = read(stderr_path, String)
+    elapsed = time() - started
+    status = timed_out ? "blocked" : (success(process) ? "completed" : "failed")
+    result = Dict{String,Any}(
+        "status" => status,
+        "phase" => phase,
+        "command" => string(command),
+        "timeout_seconds" => timeout_seconds,
+        "elapsed_seconds" => elapsed,
+        "exit_code" => try process.exitcode catch; nothing end,
+        "stdout" => stdout_text,
+        "stderr" => stderr_text,
+    )
+    if timed_out
+        blocked_root = joinpath(batch_dir, "fixture_blocked")
+        ispath(blocked_root) && error("fixture blocked evidence root already exists: $blocked_root")
+        mkpath(blocked_root)
+        result["evidence_root"] = blocked_root
+        result["blocked_state_path"] = joinpath(blocked_root, "blocked_state.json")
+        open(result["blocked_state_path"], "w") do io
+            JSON.print(io, Dict(
+                "status" => "fixture_blocked",
+                "phase" => phase,
+                "command" => string(command),
+                "timeout_seconds" => timeout_seconds,
+                "elapsed_seconds" => elapsed,
+                "exit_code" => result["exit_code"],
+                "stdout" => stdout_text,
+                "stderr" => stderr_text,
+                "batch_path" => abspath(batch_path),
+            ))
+        end
+    else
+        rm(output_dir; recursive=true, force=true)
+    end
+    return result
+end
+
+function require_fixture_subprocess(result::Dict{String,Any}, phase::String)
+    @test result["status"] == "completed"
+    result["status"] == "completed" ||
+        error("fixture subprocess blocked or failed during $phase; evidence=$(get(result, "blocked_state_path", "none"))")
+    return result
+end
+
+@testset "fixture subprocess timeout is bounded and durable" begin
+    root = mktempdir()
+    script = joinpath(root, "hang.jl")
+    write(script, "println(\"fixture-started\"); flush(stdout); sleep(60)\n")
+    batch_path = joinpath(root, "batch.json")
+    write(batch_path, "{}")
+    result = run_fixture_subprocess(
+        `$JULIA --startup-file=no $script`, "timeout-regression", batch_path;
+        timeout_seconds=2.0,
+    )
+    @test result["status"] == "blocked"
+    @test result["elapsed_seconds"] < 5.0
+    blocked_path = result["blocked_state_path"]
+    @test isfile(blocked_path)
+    blocked = JSON.parsefile(blocked_path)
+    @test blocked["status"] == "fixture_blocked"
+    @test blocked["phase"] == "timeout-regression"
+    @test occursin("fixture-started", blocked["stdout"])
+    @test blocked["command"] == result["command"]
+end
 
 @testset "fixture-only staged two-year pipeline" begin
     root = mktempdir()
@@ -54,8 +171,11 @@ const JULIA = get(ENV, "JULIA", "/Users/marcinbodych/Workspace/saxocov/julia-1.7
                    Dict("name"=>"stage_24m", "fit_months"=>24)])
     batch_path = joinpath(cfgdir, "batch.json")
     open(batch_path, "w") do io JSON.print(io, batch) end
-    output = read(`$JULIA --project=$REPO $REPO/scripts/run_pipeline.jl $batch_path`, String)
-    summary = JSON.parse(output)
+    startup = run_fixture_subprocess(
+        `$JULIA --project=$REPO $REPO/scripts/run_pipeline.jl $batch_path`,
+        "startup/preflight", batch_path; timeout_seconds=120.0)
+    require_fixture_subprocess(startup, "startup/preflight")
+    summary = JSON.parse(startup["stdout"])
     @test summary["status"] == "fixture_complete"
     @test summary["target_months"] == 24
     @test summary["deferred"]["simulation"] == "DEFERRED"
@@ -146,7 +266,11 @@ const JULIA = get(ENV, "JULIA", "/Users/marcinbodych/Workspace/saxocov/julia-1.7
     # reconstruct it from the committed, content-validated stage artifacts.
     summary_bytes = read(joinpath(summary["output_root"], "pipeline_summary.json"))
     rm(joinpath(summary["output_root"], "pipeline_summary.json"))
-    reconstructed = JSON.parse(read(`$JULIA --project=$REPO $REPO/scripts/run_pipeline.jl $batch_path`, String))
+    resume = run_fixture_subprocess(
+        `$JULIA --project=$REPO $REPO/scripts/run_pipeline.jl $batch_path`,
+        "resume", batch_path; timeout_seconds=120.0)
+    require_fixture_subprocess(resume, "resume")
+    reconstructed = JSON.parse(resume["stdout"])
     @test reconstructed == summary
     @test isfile(joinpath(summary["output_root"], "pipeline_summary.json"))
 
@@ -158,10 +282,11 @@ const JULIA = get(ENV, "JULIA", "/Users/marcinbodych/Workspace/saxocov/julia-1.7
     tampered_manifest = JSON.parse(original_text)
     tampered_manifest["source_archive_path"] = joinpath(summary["output_root"], "wrong-survivor_archive.json")
     open(manifest_path, "w") do io JSON.print(io, tampered_manifest) end
-    tampered_proc = run(`$JULIA --project=$REPO $REPO/scripts/run_pipeline.jl $batch_path`;
-                        wait=false)
-    wait(tampered_proc)
-    @test !success(tampered_proc)
+    tampered_proc = run_fixture_subprocess(
+        `$JULIA --project=$REPO $REPO/scripts/run_pipeline.jl $batch_path`,
+        "expected-rejection/lineage", batch_path; timeout_seconds=120.0)
+    @test tampered_proc["status"] == "failed"
+    @test tampered_proc["exit_code"] != 0
     open(manifest_path, "w") do io
         write(io, original_manifest)
     end
@@ -176,8 +301,11 @@ const JULIA = get(ENV, "JULIA", "/Users/marcinbodych/Workspace/saxocov/julia-1.7
         append!(durable, joinpath.(dir, files))
     end
     before = Dict(path => bytes2hex(SHA.sha256(read(path))) for path in durable)
-    rerun = read(`$JULIA --project=$REPO $REPO/scripts/run_pipeline.jl $batch_path`, String)
-    rerun_summary = JSON.parse(rerun)
+    rerun_proc = run_fixture_subprocess(
+        `$JULIA --project=$REPO $REPO/scripts/run_pipeline.jl $batch_path`,
+        "resume/idempotence", batch_path; timeout_seconds=120.0)
+    require_fixture_subprocess(rerun_proc, "resume/idempotence")
+    rerun_summary = JSON.parse(rerun_proc["stdout"])
     @test rerun_summary == summary
     after = Dict(path => bytes2hex(SHA.sha256(read(path))) for path in durable)
     @test after == before
@@ -185,8 +313,9 @@ const JULIA = get(ENV, "JULIA", "/Users/marcinbodych/Workspace/saxocov/julia-1.7
     # Removing a committed state artifact must fail closed rather than
     # treating the existing directory as completed work.
     rm(joinpath(summary["stages"][2]["stage_root"], "stage_state.json"))
-    proc = run(`$JULIA --project=$REPO $REPO/scripts/run_pipeline.jl $batch_path`;
-               wait=false)
-    wait(proc)
-    @test !success(proc)
+    proc = run_fixture_subprocess(
+        `$JULIA --project=$REPO $REPO/scripts/run_pipeline.jl $batch_path`,
+        "expected-rejection/missing-state", batch_path; timeout_seconds=120.0)
+    @test proc["status"] == "failed"
+    @test proc["exit_code"] != 0
 end
