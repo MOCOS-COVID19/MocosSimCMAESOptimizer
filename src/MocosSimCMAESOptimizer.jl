@@ -2666,6 +2666,69 @@ function safe_save_json(path::String, value; label::String=path)
     end
 end
 
+"""Persist terminal posterior rejection evidence and invalidate stale state.
+
+The reusable-state path is replaced with an invalidation record using a
+same-directory temporary file and rename, so a reader cannot observe a
+partially written posterior state.  The invalidated record intentionally
+omits state fields such as `mean` and `covariance`; `load_full_reusable_state`
+therefore fails closed if a resumed stage encounters it.
+"""
+function persist_posterior_rejection!(
+    stage_root::String,
+    transition::AbstractDict;
+    reusable_state_path::String=joinpath(stage_root, "posterior_reusable_state.json"),
+    stage::String="",
+    fit_months::Int=0,
+)
+    evidence = deepcopy(get(transition, "terminal_evidence", Dict{String,Any}()))
+    evidence["status"] = "failed"
+    evidence["policy_outcome"] = "reject"
+    evidence["failure_class"] = get(
+        evidence, "failure_class", "posterior_transition_policy_reject",
+    )
+    evidence["stage"] = stage
+    evidence["fit_months"] = fit_months
+    evidence["terminal"] = true
+    rejection_path = joinpath(stage_root, "posterior_transition_rejected.json")
+    safe_save_json(rejection_path, evidence; label="posterior_transition_rejected")
+
+    invalidated = Dict{String,Any}(
+        "status" => "invalidated",
+        "policy_outcome" => "reject",
+        "failure_class" => evidence["failure_class"],
+        "stage" => stage,
+        "fit_months" => fit_months,
+        "terminal_evidence_path" => rejection_path,
+        "invalidated_at" => string(Dates.now()),
+    )
+    if isfile(reusable_state_path)
+        mkpath(dirname(reusable_state_path))
+        temporary_path = tempname(dirname(reusable_state_path))
+        try
+            save_json(temporary_path, invalidated)
+            mv(temporary_path, reusable_state_path; force=true)
+        finally
+            isfile(temporary_path) && rm(temporary_path; force=true)
+        end
+    end
+
+    blocked = Dict{String,Any}(
+        "status" => "blocked",
+        "terminal" => true,
+        "stage" => stage,
+        "fit_months" => fit_months,
+        "policy_outcome" => "reject",
+        "failure_class" => evidence["failure_class"],
+        "reason" => "posterior transfer rejected; stage progression stopped",
+        "posterior_transition_rejected" => rejection_path,
+        "invalidated_reusable_state" => reusable_state_path,
+        "next_stage_created" => false,
+    )
+    safe_save_json(joinpath(stage_root, "stage_blocked.json"), blocked; label="stage_blocked")
+    return blocked
+end
+
 function append_cma_candidate_record(
     iter_root::String,
     stage::StageConfig,
@@ -3269,14 +3332,17 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
                     active_months=stage.fit_months, policy="reject",
                 )
                 if posterior_transition["status"] == "rejected"
-                    # Rejection is terminal evidence only.  In particular, do
-                    # not construct a CMA state or leave a reusable posterior
-                    # artifact that a later stage could consume.
-                    safe_save_json(
-                        joinpath(stage_root, "posterior_transition_rejected.json"),
-                        posterior_transition["terminal_evidence"];
-                        label="posterior_transition_rejected",
+                    # Rejection is terminal for this stage.  Persist evidence,
+                    # invalidate any stale reusable posterior atomically, and
+                    # stop before archive seed derivation or next-stage setup.
+                    persist_posterior_rejection!(
+                        stage_root,
+                        posterior_transition;
+                        reusable_state_path=joinpath(stage_root, "posterior_reusable_state.json"),
+                        stage=stage.name,
+                        fit_months=stage.fit_months,
                     )
+                    break
                 else
                     posterior_state = posterior_transition["state"]
                     posterior_state["archive_provenance"] = posterior_source === nothing ? nothing :

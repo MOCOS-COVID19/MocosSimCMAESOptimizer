@@ -131,4 +131,26 @@ const O = MocosSimCMAESOptimizer
     @test clipped_posterior["report"]["coordinates"][1]["raw_value"] == 0.9
     @test clipped_posterior["report"]["coordinates"][1]["effective_value"] == 0.2
     @test clipped_posterior["report"]["coordinates"][1]["class"] == "archive_transfer"
+
+    # A rejected posterior handoff must invalidate stale reusable state
+    # atomically and leave durable blocked evidence for orchestration resume.
+    rejection_root = mktempdir()
+    stale_state_path = joinpath(rejection_root, "posterior_reusable_state.json")
+    O.safe_save_json(stale_state_path, Dict("mean" => [0.9], "param_names" => ["stale"]))
+    terminal = O.persist_posterior_rejection!(
+        rejection_root,
+        rejected_posterior;
+        reusable_state_path=stale_state_path,
+        stage="long",
+        fit_months=6,
+    )
+    @test terminal["status"] == "blocked"
+    @test terminal["policy_outcome"] == "reject"
+    @test terminal["failure_class"] == "posterior_transition_policy_reject"
+    @test isfile(joinpath(rejection_root, "posterior_transition_rejected.json"))
+    @test isfile(joinpath(rejection_root, "stage_blocked.json"))
+    invalidated = O.load_json(stale_state_path)
+    @test invalidated["status"] == "invalidated"
+    @test invalidated["policy_outcome"] == "reject"
+    @test !haskey(invalidated, "mean")
 end
