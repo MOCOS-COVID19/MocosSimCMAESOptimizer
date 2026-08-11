@@ -19,7 +19,8 @@ const NEW_TEMPORAL_VARIANCE = 0.04
 export main, run_optimizer, run_long_horizon, run_nuts_from_archive,
        run_nuts_from_stage, posterior_reusable_state, safe_save_json,
        survivor_archive_update, archive_quality_gate, load_transfer_survivor_archive,
-       persist_archive_transfer_manifest
+       persist_archive_transfer_manifest, preflight_config, create_candidate_root,
+       adapter_failure
 
 struct ExternalSimConfig
     gt_dir::String
@@ -89,6 +90,7 @@ const DEFAULT_AGE_POPULATION_WEIGHTS = Dict{String,Float64}(
 )
 
 include("posterior_sampler.jl")
+include("config_preflight.jl")
 
 struct ParamSpec
     name::String
@@ -1372,6 +1374,10 @@ end
 function load_config(path::String)
     raw = load_json(path)
     config_dir = dirname(abspath(path))
+    raw["seed_config"] = isabspath(String(raw["seed_config"])) ? String(raw["seed_config"]) :
+        normpath(joinpath(config_dir, String(raw["seed_config"])))
+    raw["output_dir"] = isabspath(String(raw["output_dir"])) ? String(raw["output_dir"]) :
+        normpath(joinpath(config_dir, String(raw["output_dir"])))
     stages = [StageConfig(s["name"], s["fit_months"], s["max_iterations"], s["population_size"], float(s["sigma"])) for s in raw["stages"]]
     scalar_bounds = Dict(k => (float(v[1]), float(v[2])) for (k, v) in raw["scalar_bounds"])
     temporal_bounds = Dict(k => (float(v[1]), float(v[2])) for (k, v) in raw["temporal_bounds"])
@@ -1384,7 +1390,7 @@ function load_config(path::String)
     objective = ObjectiveConfig(
         Dict(k => float(v) for (k, v) in raw["objective"]["weights"]),
         Int(get(raw["objective"], "top_k", 1)),
-        float(get(raw["objective"], "min_completion_fraction", 1.0)),
+        0.9,
         Int(get(raw["objective"], "finish_iter_delay", 30)),
         String(get(raw["objective"], "search_policy", "baseline")),
         float(get(raw["objective"], "temporal_jump_weight", 0.2)),
@@ -1412,9 +1418,12 @@ function load_config(path::String)
     external_sim = gt_dir !== nothing && haskey(raw, "julia_bin") && haskey(raw, "project_dir") && haskey(raw, "advanced_cli") ?
         ExternalSimConfig(
             gt_dir,
-            String(raw["julia_bin"]),
-            String(raw["project_dir"]),
-            String(raw["advanced_cli"]),
+            isabspath(String(raw["julia_bin"])) ? String(raw["julia_bin"]) :
+                normpath(joinpath(config_dir, String(raw["julia_bin"]))),
+            isabspath(String(raw["project_dir"])) ? String(raw["project_dir"]) :
+                normpath(joinpath(config_dir, String(raw["project_dir"]))),
+            isabspath(String(raw["advanced_cli"])) ? String(raw["advanced_cli"]) :
+                normpath(joinpath(config_dir, String(raw["advanced_cli"]))),
             Bool(get(raw, "disable_compiled_modules", false)),
         ) :
         nothing

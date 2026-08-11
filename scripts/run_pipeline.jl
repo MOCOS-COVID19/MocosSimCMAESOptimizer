@@ -44,6 +44,9 @@ function run_pipeline(batch_path::String)
     batch_dir = dirname(abspath(batch_path))
     batch = JSON.parsefile(batch_path)
     base_path = resolve_path(String(batch["base_config"]), batch_dir)
+    # Validate all source paths and schemas before touching the requested
+    # output root. This is intentionally separate from optimizer execution.
+    preflight_config(base_path; readiness=false)
     base_config = JSON.parsefile(base_path)
     if haskey(base_config, "gt_dir")
         base_config["gt_dir"] = resolve_path(
@@ -123,5 +126,21 @@ function run_pipeline(batch_path::String)
     return summary
 end
 
-length(ARGS) == 1 || error("Usage: julia scripts/run_pipeline.jl pipeline.json")
-println(JSON.json(run_pipeline(ARGS[1])))
+function run_readiness(config_path::String)
+    manifest = preflight_config(config_path; readiness=true)
+    parent = dirname(manifest["paths"]["output_dir"])
+    root = create_candidate_root(parent, "readiness")
+    manifest["readiness_root"] = root
+    manifest["expected_artifacts"] = ["preflight_manifest.json", "no_simulation_invocations"]
+    manifest["deferred"] = ["advanced_cli.jl", "validation_replicates", "Slurm"]
+    safe_save_json(joinpath(root, "preflight_manifest.json"), manifest; label="readiness_manifest")
+    return manifest
+end
+
+if length(ARGS) == 2 && ARGS[1] == "--readiness"
+    println(JSON.json(run_readiness(ARGS[2])))
+elseif length(ARGS) == 1
+    println(JSON.json(run_pipeline(ARGS[1])))
+else
+    error("Usage: julia scripts/run_pipeline.jl [--readiness] pipeline.json")
+end
