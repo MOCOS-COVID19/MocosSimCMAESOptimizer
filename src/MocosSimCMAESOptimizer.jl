@@ -659,6 +659,36 @@ function validate_committed_artifacts(stage_root::String)
         committed = get(commit, "status", "") == "committed" &&
             String(get(commit, "stage", "")) == stage &&
             Int(get(commit, "iteration", -1)) == iteration
+        # A commit is only trusted when its hash manifest is self-consistent.
+        # Older hand-built fixtures may omit the optional manifest, but every
+        # production commit written by run_stage includes it.
+        if haskey(commit, "artifact_hashes")
+            hashes = commit["artifact_hashes"]
+            hashes isa AbstractDict || push!(contradictions, "artifact hash manifest is not an object")
+            if hashes isa AbstractDict
+                keys_manifest = sort(String.(collect(keys(hashes))))
+                expected_keys = haskey(commit, "artifact_key_set") ?
+                    sort(String.(commit["artifact_key_set"])) : keys_manifest
+                keys_manifest == expected_keys ||
+                    push!(contradictions, "artifact hash manifest key set mismatch")
+                sort(intersect(keys_manifest, sort(collect(keys(paths))))) ==
+                    sort(collect(keys(paths))) ||
+                    push!(contradictions, "artifact hash manifest missing required key")
+                all(isfile(joinpath(stage_root, relative)) for relative in keys_manifest) ||
+                    push!(contradictions, "artifact hash manifest contains unknown artifact key")
+                if haskey(commit, "artifact_hash_manifest")
+                    digest = bytes2hex(SHA.sha256(JSON.json(hashes)))
+                    String(commit["artifact_hash_manifest"]) == digest ||
+                        push!(contradictions, "artifact hash manifest integrity mismatch")
+                end
+                for (relative, expected) in hashes
+                    artifact = joinpath(stage_root, String(relative))
+                    isfile(artifact) || push!(contradictions, "missing committed artifact: $relative")
+                    isfile(artifact) && bytes2hex(SHA.sha256(read(artifact))) != String(expected) &&
+                        push!(contradictions, "committed artifact hash mismatch: $relative")
+                end
+            end
+        end
     end
     committed || push!(contradictions, "missing or mismatched committed iteration manifest")
     identities = Tuple{String,Int,Int}[]

@@ -102,6 +102,72 @@ function validate_fixture_provenance(stage_root, entries, archive, report, state
         "archive_count" => length(archive), "reusable_admitted_ids" => get(reusable, "admitted_ids", Any[]))
 end
 
+function validate_consumed_trusted_state(stage_root::String,
+                                         expected_stage::String,
+                                         expected_horizon::Int;
+                                         previous_root::Union{Nothing,String}=nothing)
+    state_path = joinpath(stage_root, "stage_state.json")
+    reusable_path = joinpath(stage_root, "full_reusable_state.json")
+    isfile(state_path) || error("missing trusted predecessor stage_state.json: $stage_root")
+    isfile(reusable_path) || error("missing trusted predecessor full_reusable_state.json: $stage_root")
+    state = JSON.parsefile(state_path)
+    reusable = JSON.parsefile(reusable_path)
+    state isa AbstractDict && reusable isa AbstractDict ||
+        error("trusted predecessor state artifacts are malformed: $stage_root")
+    String(get(state, "status", "")) == "committed" ||
+        error("trusted predecessor stage is not committed: $expected_stage")
+    String(get(reusable, "status", "")) == "committed" ||
+        error("trusted predecessor reusable state is not committed: $expected_stage")
+    String(get(state, "stage", "")) == expected_stage ||
+        error("trusted predecessor stage identity mismatch: $expected_stage")
+    String(get(reusable, "stage", "")) == expected_stage ||
+        error("trusted predecessor reusable stage identity mismatch: $expected_stage")
+    Int(get(state, "fit_months", -1)) == expected_horizon ||
+        error("trusted predecessor horizon mismatch: $expected_stage")
+    String(get(state, "trajectory_identity", "")) != "" ||
+        error("trusted predecessor trajectory identity missing: $expected_stage")
+    String(get(reusable, "trajectory_identity", "")) == String(state["trajectory_identity"]) ||
+        error("trusted predecessor trajectory identity mismatch: $expected_stage")
+    historical = get(state, "historical_trajectory", nothing)
+    reusable_historical = get(reusable, "historical_trajectory", nothing)
+    historical isa AbstractDict && reusable_historical isa AbstractDict ||
+        error("trusted predecessor historical trajectory missing: $expected_stage")
+    get(historical, "values", Any[]) == get(reusable_historical, "values", Any[]) ||
+        error("trusted predecessor historical values mismatch: $expected_stage")
+    String(get(state, "prefix_hash", "")) ==
+        bytes2hex(sha256(JSON.json(get(historical, "prefix_values", Any[])))) ||
+        error("trusted predecessor prefix hash mismatch: $expected_stage")
+    String(get(reusable, "prefix_hash", "")) == String(state["prefix_hash"]) ||
+        error("trusted predecessor reusable prefix hash mismatch: $expected_stage")
+    locked = get(state, "locked_intervals", nothing)
+    locked isa AbstractVector || error("trusted predecessor locked prefix missing: $expected_stage")
+    cma = get(reusable, "cma_state", nothing)
+    cma isa AbstractDict || error("trusted predecessor CMA state missing: $expected_stage")
+    all(haskey(cma, field) for field in
+        ("parameter_names", "mean", "sigma", "covariance", "p_c", "p_sigma")) ||
+        error("trusted predecessor CMA state is incomplete: $expected_stage")
+    state_cma = get(state, "cma_state", nothing)
+    state_cma isa AbstractDict || error("trusted predecessor stage CMA state missing: $expected_stage")
+    all(get(state_cma, field, nothing) == get(cma, field, nothing)
+        for field in ("parameter_names", "mean", "sigma", "covariance", "p_c", "p_sigma")) ||
+        error("trusted predecessor CMA state mismatch: $expected_stage")
+    archive_path = abspath(joinpath(stage_root, "survivor_archive.json"))
+    String(get(state, "archive_path", "")) == archive_path ||
+        error("trusted predecessor archive path mismatch: $expected_stage")
+    archive = JSON.parsefile(archive_path)
+    archive_ids = [String(get(x, "candidate", "")) for x in archive]
+    get(state, "archive_ids", Any[]) == archive_ids ||
+        error("trusted predecessor archive ordering mismatch: $expected_stage")
+    get(reusable, "selected_archive_ids", Any[]) == archive_ids ||
+        error("trusted predecessor reusable archive ordering mismatch: $expected_stage")
+    if previous_root !== nothing
+        source_path = abspath(joinpath(previous_root, "survivor_archive.json"))
+        String(get(state, "source_archive_path", "")) == source_path ||
+            error("trusted predecessor source archive path mismatch: $expected_stage")
+    end
+    return state, reusable
+end
+
 function validate_fixture_stage_plan(batch, monthly_days)
     raw_stages = get(batch, "stages", nothing)
     raw_stages isa AbstractVector && !isempty(raw_stages) ||
@@ -156,6 +222,11 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
         incoming_manifest = nothing
         if index > 1
             source_stage = String(plan[index - 1]["name"])
+            source_root = joinpath(output_root, source_stage)
+            predecessor_state, predecessor_reusable =
+                validate_consumed_trusted_state(
+                    source_root, source_stage, Int(plan[index - 1]["fit_months"]);
+                    previous_root=index > 2 ? joinpath(output_root, String(plan[index - 2]["name"])) : nothing)
             expected_path = joinpath(output_root, source_stage,
                                      "archive_transfer_manifest.json")
             expected_archive_path = joinpath(output_root, source_stage,
@@ -177,9 +248,24 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
                 stage_order=[String(x["name"]) for x in plan])
             incoming_path = expected_archive_path
             incoming_manifest = JSON.parsefile(expected_path)
+            incoming_manifest["canonical_archive_path"] ==
+                abspath(joinpath(source_root, "survivor_archive.json")) ||
+                error("fixture transfer manifest archive path is not canonical")
+            incoming_manifest["admitted_order"] == incoming_manifest["admitted_ids"] ||
+                error("fixture transfer manifest ordering mismatch")
+            incoming_manifest["admitted_ids"] == predecessor_state["archive_ids"] ||
+                error("fixture transfer manifest does not consume predecessor state")
+            incoming_manifest["admitted_ids"] == predecessor_reusable["selected_archive_ids"] ||
+                error("fixture transfer manifest does not consume predecessor reusable archive")
         end
         stage_root = joinpath(output_root, String(stage["name"]))
         mkpath(stage_root)
+        # The predecessor is the sole source of trusted history.  Rebuilding
+        # this from fixture constants would let a mutated predecessor be
+        # silently bypassed during extension.
+        if index > 1
+            historical_values = copy(predecessor_state["historical_trajectory"]["values"])
+        end
         prefix_values = copy(historical_values)
         prefix_hash = bytes2hex(sha256(JSON.json(prefix_values)))
         requested_days = Int(stage["requested_days"])
@@ -358,6 +444,7 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
             "locked_intervals" => locked_intervals,
             "new_suffix_days" => requested_days - length(prefix_values),
             "previous_prefix_hash" => previous_prefix_hash))
+        state = JSON.parsefile(joinpath(stage_root, "stage_state.json"))
         cma_state = Dict{String,Any}(
             "state_id" => string(stage["name"], ":cma:", trajectory_identity),
             "parameter_names" => ["fixture.beta[1]", "fixture.beta[2]"],
@@ -365,6 +452,9 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
             "covariance" => [[0.04, 0.0], [0.0, 0.04]],
             "p_c" => [0.0, 0.0], "p_sigma" => [0.0, 0.0],
             "source_archive_ids" => transfer_ids)
+        state["cma_state"] = cma_state
+        O.safe_save_json(joinpath(stage_root, "stage_state.json"), state;
+                         label="fixture_stage_state_with_cma")
         reusable_state = Dict(
             "status" => "committed", "stage" => stage["name"],
             "source_archive_path" => incoming_path, "admitted_ids" => transfer_ids,
@@ -399,10 +489,14 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
             file => bytes2hex(sha256(read(joinpath(stage_root, file))))
             for file in committed_files)
         O.atomic_save_json(joinpath(stage_root, "iter_1", "iteration_commit.json"),
-            Dict("status" => "committed", "stage" => stage["name"],
-                 "iteration" => 1,
-                 "candidate_ids" => [String(x["candidate"]) for x in entries],
-                 "artifact_hashes" => artifact_hashes))
+            let commit = Dict("status" => "committed", "stage" => stage["name"],
+                              "iteration" => 1,
+                              "candidate_ids" => [String(x["candidate"]) for x in entries],
+                              "artifact_hashes" => artifact_hashes,
+                              "artifact_key_set" => committed_files)
+                commit["artifact_hash_manifest"] = fixture_hash_manifest_digest(artifact_hashes)
+                commit
+            end)
         push!(stages, merge(stage, Dict("stage_root" => stage_root,
             "archive_path" => archive_path, "archive_manifest_path" => manifest_path,
             "archive_ids" => current_ids,
@@ -434,6 +528,13 @@ end
 
 function fixture_artifact_hash(path)
     return bytes2hex(sha256(read(path)))
+end
+
+function fixture_hash_manifest_digest(hashes)
+    ordered = Dict{String,Any}(
+        String(k) => hashes[k] for k in sort(String.(collect(keys(hashes))))
+    )
+    return bytes2hex(sha256(JSON.json(ordered)))
 end
 
 function validate_fixture_stage_root(root::String, previous_root::Union{Nothing,String}=nothing)
@@ -474,6 +575,11 @@ function validate_fixture_stage_root(root::String, previous_root::Union{Nothing,
     for field in ("parameter_names", "mean", "sigma", "covariance", "p_c", "p_sigma")
         haskey(cma, field) || error("fixture CMA state lacks $field: $stage")
     end
+    state_cma = get(state, "cma_state", nothing)
+    state_cma isa AbstractDict &&
+        all(get(state_cma, field, nothing) == get(cma, field, nothing)
+            for field in ("parameter_names", "mean", "sigma", "covariance", "p_c", "p_sigma")) ||
+        error("fixture stage/reusable CMA state mismatch: $stage")
     archive_ids = [String(get(x, "candidate", "")) for x in archive]
     get(state, "archive_ids", Any[]) == archive_ids ||
         error("fixture state/archive IDs disagree: $stage")
@@ -493,6 +599,14 @@ function validate_fixture_stage_root(root::String, previous_root::Union{Nothing,
         error("fixture commit identity mismatch: $stage")
     hashes = get(commit, "artifact_hashes", nothing)
     hashes isa AbstractDict || error("fixture commit has no artifact hashes: $stage")
+    expected_keys = sort(String.(required[1:end-1]))
+    sort(String.(collect(keys(hashes)))) == expected_keys ||
+        error("fixture artifact hash manifest has an inexact key set: $stage")
+    get(commit, "artifact_key_set", Any[]) == required[1:end-1] ||
+        error("fixture artifact key set is not exact: $stage")
+    String(get(commit, "artifact_hash_manifest", "")) ==
+        fixture_hash_manifest_digest(hashes) ||
+        error("fixture artifact hash manifest integrity mismatch: $stage")
     for (file, expected) in hashes
         path = joinpath(root, String(file))
         isfile(path) && fixture_artifact_hash(path) == String(expected) ||

@@ -77,3 +77,43 @@ end
     @test any(occursin("status", c) || occursin("contradiction", c)
               for c in report["contradictions"])
 end
+
+@testset "committed artifact manifest rejects extras and tampering" begin
+    root = mktempdir()
+    stage_root, _ = write_committed_fixture(root)
+    commit_path = joinpath(stage_root, "iter_1", "iteration_commit.json")
+    commit = O.load_json(commit_path)
+    committed = [
+        "stage_state.json", "iter_metrics.jsonl", "top_candidates.json",
+        "survivor_archive.json", "full_reusable_state.json",
+    ]
+    hashes = Dict{String,Any}(name => bytes2hex(SHA.sha256(read(joinpath(stage_root, name))))
+                              for name in committed)
+    commit["artifact_hashes"] = hashes
+    commit["artifact_key_set"] = committed
+    commit["artifact_hash_manifest"] = bytes2hex(SHA.sha256(JSON.json(hashes)))
+    O.safe_save_json(commit_path, commit)
+    @test O.validate_committed_artifacts(stage_root)["valid"]
+
+    commit = O.load_json(commit_path)
+    commit["artifact_hashes"]["unexpected.json"] = bytes2hex(SHA.sha256(UInt8[]))
+    commit["artifact_key_set"] = vcat(commit["artifact_key_set"], ["unexpected.json"])
+    O.safe_save_json(commit_path, commit)
+    extra = O.validate_committed_artifacts(stage_root)
+    @test !extra["valid"]
+    @test any(occursin("unexpected", c) || occursin("artifact key", c)
+              for c in extra["contradictions"])
+    # Restore the committed manifest before testing content tampering.
+    commit = O.load_json(commit_path)
+    delete!(commit["artifact_hashes"], "unexpected.json")
+    commit["artifact_key_set"] = committed
+    commit["artifact_hash_manifest"] = bytes2hex(SHA.sha256(JSON.json(commit["artifact_hashes"])))
+    O.safe_save_json(commit_path, commit)
+
+    open(joinpath(stage_root, "survivor_archive.json"), "a") do io
+        print(io, "\n")
+    end
+    tampered = O.validate_committed_artifacts(stage_root)
+    @test !tampered["valid"]
+    @test any(occursin("hash", lowercase(c)) for c in tampered["contradictions"])
+end
