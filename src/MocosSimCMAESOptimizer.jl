@@ -934,88 +934,151 @@ function load_transfer_survivor_archive(output_dir::String, current_stage::Strin
                                         expected_fit_months::Union{Nothing,Int}=nothing,
                                         expected_manifest_path::Union{Nothing,String}=nothing,
                                         expected_archive_id::Union{Nothing,String}=nothing,
-                                        stage_order=nothing)
+                                        stage_order=nothing,
+                                        configuration=nothing,
+                                        return_evidence::Bool=false)
+    reject(reason; details=Dict{String,Any}()) = begin
+        evidence = Dict{String,Any}(
+            "status" => "rejected",
+            "failure_class" => String(reason),
+            "current_stage" => current_stage,
+            "predecessor_stage" => predecessor_stage,
+            "expected_fit_months" => expected_fit_months,
+        )
+        merge!(evidence, details)
+        return return_evidence ? evidence : Any[]
+    end
     # This is an untrusted file boundary.  Every conversion and consistency
     # check is deliberately inside one rejection boundary: malformed JSON
     # must never escape as a MethodError/ArgumentError/TypeError.
     try
-        source_stage = if stage_order === nothing
-            predecessor_stage === nothing && return Any[]
-            String(predecessor_stage)
-        else
-            order = collect(stage_order)
-            all(x -> x isa AbstractString, order) || return Any[]
-            names = String.(order)
-            length(unique(names)) == length(names) || return Any[]
-            current_stage in names || return Any[]
-            i = findfirst(==(current_stage), names)
-            i === nothing || i <= 1 ? nothing : names[i - 1]
+        # A caller-selected predecessor is not authoritative.  The direct API
+        # requires either the normalized stage order or a configuration that
+        # contains it, so sibling archives cannot be selected by identity.
+        if stage_order === nothing && configuration !== nothing
+            stage_order = if configuration isa AbstractDict
+                configured_order = get(configuration, "stage_order",
+                    get(configuration, :stage_order, nothing))
+                configured_order === nothing && haskey(configuration, "stages") &&
+                    (configured_order = [
+                        s isa AbstractDict ? get(s, "name", get(s, :name, "")) :
+                        (hasproperty(s, :name) ? getproperty(s, :name) : "")
+                        for s in configuration["stages"]])
+                configured_order
+            elseif hasproperty(configuration, :stage_order)
+                getproperty(configuration, :stage_order)
+            elseif hasproperty(configuration, :stages)
+                stages = getproperty(configuration, :stages)
+                [hasproperty(s, :name) ? getproperty(s, :name) :
+                    (s isa AbstractDict ? get(s, "name", "") : "") for s in stages]
+            else
+                nothing
+            end
         end
-        source_stage === nothing && return Any[]
-        predecessor_stage !== nothing && String(predecessor_stage) != source_stage && return Any[]
+        stage_order === nothing && return reject("missing_authoritative_stage_order")
+        source_stage = begin
+            order = try collect(stage_order) catch; return reject("invalid_authoritative_stage_order") end
+            all(x -> x isa AbstractString && !isempty(x), order) ||
+                return reject("invalid_authoritative_stage_order")
+            names = String.(order)
+            length(unique(names)) == length(names) ||
+                return reject("invalid_authoritative_stage_order")
+            current_stage in names || return reject("current_stage_not_in_authoritative_order")
+            i = findfirst(==(current_stage), names)
+            i === nothing && return reject("current_stage_not_in_authoritative_order")
+            i <= 1 && return reject("current_stage_has_no_predecessor")
+            names[i - 1]
+        end
+        predecessor_stage !== nothing && String(predecessor_stage) != source_stage &&
+            return reject("predecessor_stage_not_immediate_predecessor";
+                details=Dict("derived_predecessor_stage" => source_stage))
         # Only the immediate, canonical predecessor is trusted.  Searching
         # sibling stages can silently mix incompatible horizons/provenance.
         stage_root = joinpath(output_dir, source_stage)
         path = joinpath(stage_root, "survivor_archive.json")
-        isfile(path) || return Any[]
+        isfile(path) || return reject("missing_archive")
         manifest_path = joinpath(stage_root, "archive_transfer_manifest.json")
-        isfile(manifest_path) || return Any[]
+        isfile(manifest_path) || return reject("missing_transfer_manifest")
         expected_manifest_path !== nothing &&
-            abspath(expected_manifest_path) != abspath(manifest_path) && return Any[]
+            abspath(expected_manifest_path) != abspath(manifest_path) &&
+            return reject("manifest_path_mismatch")
         manifest = load_json(manifest_path)
-        manifest isa AbstractDict || return Any[]
+        manifest isa AbstractDict || return reject("malformed_transfer_manifest")
 
         required = ("schema_version", "canonical_archive_path", "source_stage",
             "source_fit_months", "horizon", "archive_id", "archive_hash",
             "admitted_ids", "admitted_order", "archive_count")
-        all(haskey(manifest, key) for key in required) || return Any[]
-        manifest["schema_version"] isa AbstractString || return Any[]
-        manifest["canonical_archive_path"] isa AbstractString || return Any[]
-        manifest["source_stage"] isa AbstractString || return Any[]
-        manifest["archive_id"] isa AbstractString || return Any[]
-        manifest["archive_hash"] isa AbstractString || return Any[]
-        manifest["source_stage"] == source_stage || return Any[]
-        manifest["canonical_archive_path"] == abspath(path) || return Any[]
+        for key in required
+            haskey(manifest, key) || return reject(
+                key == "schema_version" ? "schema_version_missing" :
+                "missing_manifest_metadata";
+                details=Dict("missing_field" => key))
+        end
+        manifest["schema_version"] isa AbstractString ||
+            return reject("schema_version_missing")
+        manifest["schema_version"] == "archive-transfer-v2" ||
+            return reject("schema_version_mismatch")
+        manifest["canonical_archive_path"] isa AbstractString ||
+            return reject("canonical_archive_path_invalid")
+        manifest["source_stage"] isa AbstractString ||
+            return reject("source_stage_invalid")
+        manifest["archive_id"] isa AbstractString ||
+            return reject("archive_id_invalid")
+        manifest["archive_hash"] isa AbstractString ||
+            return reject("archive_hash_invalid")
+        manifest["source_stage"] == source_stage ||
+            return reject("source_stage_not_immediate_predecessor";
+                details=Dict("derived_predecessor_stage" => source_stage))
+        manifest["canonical_archive_path"] == abspath(path) ||
+            return reject("canonical_archive_path_mismatch")
         # JSON booleans are not valid integer counts/horizons.
         isint(x) = x isa Integer && !(x isa Bool)
-        isint(manifest["source_fit_months"]) || return Any[]
-        isint(manifest["horizon"]) || return Any[]
-        isint(manifest["archive_count"]) || return Any[]
-        manifest["source_fit_months"] == manifest["horizon"] || return Any[]
+        isint(manifest["source_fit_months"]) || return reject("source_fit_months_invalid")
+        isint(manifest["horizon"]) || return reject("horizon_invalid")
+        isint(manifest["archive_count"]) || return reject("archive_count_invalid")
+        manifest["source_fit_months"] == manifest["horizon"] ||
+            return reject("horizon_mismatch")
         expected_fit_months !== nothing &&
-            manifest["source_fit_months"] != expected_fit_months && return Any[]
-        manifest["admitted_ids"] isa AbstractVector || return Any[]
-        manifest["admitted_order"] isa AbstractVector || return Any[]
-        all(x -> x isa AbstractString && !isempty(x), manifest["admitted_ids"]) || return Any[]
-        all(x -> x isa AbstractString && !isempty(x), manifest["admitted_order"]) || return Any[]
+            manifest["source_fit_months"] != expected_fit_months &&
+            return reject("expected_horizon_mismatch")
+        manifest["admitted_ids"] isa AbstractVector || return reject("admitted_ids_invalid")
+        manifest["admitted_order"] isa AbstractVector || return reject("admitted_order_invalid")
+        all(x -> x isa AbstractString && !isempty(x), manifest["admitted_ids"]) ||
+            return reject("admitted_ids_invalid")
+        all(x -> x isa AbstractString && !isempty(x), manifest["admitted_order"]) ||
+            return reject("admitted_order_invalid")
         admitted_ids = String.(manifest["admitted_ids"])
         admitted_order = String.(manifest["admitted_order"])
-        admitted_ids == admitted_order || return Any[]
-        length(unique(admitted_ids)) == length(admitted_ids) || return Any[]
+        admitted_ids == admitted_order || return reject("admitted_order_mismatch")
+        length(unique(admitted_ids)) == length(admitted_ids) ||
+            return reject("duplicate_admitted_ids")
 
         values = load_json(path)
-        values isa AbstractVector || return Any[]
-        all(x -> x isa AbstractDict, values) || return Any[]
+        values isa AbstractVector || return reject("malformed_archive")
+        all(x -> x isa AbstractDict, values) || return reject("malformed_archive")
         payload_ids = String[]
         for x in values
-            haskey(x, "candidate") || haskey(x, "id") || return Any[]
+            haskey(x, "candidate") || haskey(x, "id") || return reject("archive_id_missing")
             id = haskey(x, "candidate") ? x["candidate"] : x["id"]
-            id isa AbstractString && !isempty(id) || return Any[]
+            id isa AbstractString && !isempty(id) || return reject("archive_id_invalid")
             push!(payload_ids, String(id))
         end
-        payload_ids == admitted_ids || return Any[]
-        manifest["archive_count"] == length(admitted_ids) || return Any[]
-        length(values) == manifest["archive_count"] || return Any[]
+        payload_ids == admitted_ids || return reject("archive_payload_order_mismatch")
+        manifest["archive_count"] == length(admitted_ids) ||
+            return reject("archive_count_mismatch")
+        length(values) == manifest["archive_count"] || return reject("archive_count_mismatch")
         payload_hash = _archive_payload_hash(values)
-        manifest["archive_hash"] == payload_hash || return Any[]
+        manifest["archive_hash"] == payload_hash || return reject("archive_hash_mismatch")
         archive_id = string(source_stage, ":", manifest["horizon"], ":", payload_hash)
-        manifest["archive_id"] == archive_id || return Any[]
-        expected_archive_id !== nothing && expected_archive_id != archive_id && return Any[]
+        manifest["archive_id"] == archive_id || return reject("archive_id_mismatch")
+        expected_archive_id !== nothing && expected_archive_id != archive_id &&
+            return reject("expected_archive_id_mismatch")
         all(_archive_rejection_reason(x; current_stage=source_stage,
-            current_fit_months=expected_fit_months) === nothing for x in values) || return Any[]
+            current_fit_months=expected_fit_months) === nothing for x in values) ||
+            return reject("archive_entry_ineligible")
         return deepcopy(values)
     catch
-        return Any[]
+        return reject("archive_loader_exception")
     end
 end
 

@@ -35,7 +35,8 @@ end
     manifest_path = O.persist_archive_transfer_manifest(stage, values; fit_months=3)
     loaded = O.load_transfer_survivor_archive(root, "long";
         predecessor_stage="short", expected_fit_months=3,
-        expected_manifest_path=manifest_path)
+        expected_manifest_path=manifest_path,
+        stage_order=["short", "long"])
     @test loaded == values
     @test JSON.parsefile(manifest_path)["admitted_ids"] == ["a", "b"]
 end
@@ -81,7 +82,8 @@ end
     @test manifest["archive_count"] == 2
     @test O.load_transfer_survivor_archive(root, "long";
         predecessor_stage="short", expected_fit_months=3,
-        expected_manifest_path=manifest_path) == values
+        expected_manifest_path=manifest_path,
+        stage_order=["short", "long"]) == values
 
     manifest["admitted_order"] = ["b", "a"]
     O.safe_save_json(manifest_path, manifest)
