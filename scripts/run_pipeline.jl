@@ -79,9 +79,36 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
     ispath(output_root) && error("fixture output root already exists: $output_root")
     mkpath(output_root)
     stages = Any[]
-    predecessor_archive = Any[]
-    predecessor_path = nothing
     for (index, stage) in enumerate(plan)
+        # Transfer is a read-only handoff from the one authoritative,
+        # immediate predecessor.  Validate it before creating the target
+        # stage root so stale, sibling, scalar-only, or tampered sources
+        # fail closed without leaving a misleading next-stage artifact.
+        incoming_archive = Any[]
+        incoming_path = nothing
+        incoming_manifest = nothing
+        if index > 1
+            source_stage = String(plan[index - 1]["name"])
+            expected_path = joinpath(output_root, source_stage,
+                                     "archive_transfer_manifest.json")
+            evidence = O.load_transfer_survivor_archive(
+                output_root, String(stage["name"]);
+                predecessor_stage=source_stage,
+                expected_fit_months=Int(plan[index - 1]["fit_months"]),
+                expected_manifest_path=expected_path,
+                stage_order=[String(x["name"]) for x in plan],
+                return_evidence=true)
+            evidence isa AbstractDict && get(evidence, "status", "") == "rejected" &&
+                error("fixture predecessor archive rejected: $(evidence["failure_class"])")
+            incoming_archive = O.load_transfer_survivor_archive(
+                output_root, String(stage["name"]);
+                predecessor_stage=source_stage,
+                expected_fit_months=Int(plan[index - 1]["fit_months"]),
+                expected_manifest_path=expected_path,
+                stage_order=[String(x["name"]) for x in plan])
+            incoming_path = expected_path
+            incoming_manifest = JSON.parsefile(expected_path)
+        end
         stage_root = joinpath(output_root, String(stage["name"]))
         mkpath(stage_root)
         manifest = deepcopy(preflight)
@@ -117,7 +144,10 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
                     "policy_outcome" => "accepted"),
             ))
         end
-        report = O.survivor_archive_update(predecessor_archive, entries;
+        # Current-stage survivor selection is intentionally independent from
+        # the incoming transfer archive.  The latter is persisted verbatim as
+        # transfer_candidates and never re-selected or replaced by immigrants.
+        report = O.survivor_archive_update(Any[], entries;
             current_stage=stage["name"], current_fit_months=stage["fit_months"],
             target_size=3, max_size=200, return_report=true)
         archive = report["archive"]
@@ -132,32 +162,49 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
         gate["status"] == "passed" || error("fixture stage gate blocked: $(stage["name"])")
         O.safe_save_json(joinpath(stage_root, "stage_extension_gate.json"), gate;
                          label="fixture_stage_gate")
-        transfer_ids = [x["candidate"] for x in archive]
+        transfer_ids = incoming_manifest === nothing ? String[] :
+            String.(incoming_manifest["admitted_order"])
+        current_ids = [String(x["candidate"]) for x in archive]
+        transfer_archive = incoming_archive
+        O.safe_save_json(joinpath(stage_root, "transfer_candidates.json"),
+                         transfer_archive; label="fixture_transfer_candidates")
         transfer = Dict("source_archive_path" => manifest_path,
-            "source_stage" => stage["name"], "target_stage" => index < length(plan) ? plan[index + 1]["name"] : nothing,
-            "source_horizon_months" => stage["fit_months"], "admitted_ids" => transfer_ids,
-            "candidate_order" => transfer_ids, "protected_transfer_slots" => transfer_ids,
-            "archive_lineage" => predecessor_path)
+            "source_stage" => index == 1 ? nothing : plan[index - 1]["name"],
+            "target_stage" => stage["name"],
+            "source_horizon_months" => index == 1 ? nothing : plan[index - 1]["fit_months"],
+            "source_archive_id" => incoming_manifest === nothing ? nothing : incoming_manifest["archive_id"],
+            "admitted_ids" => transfer_ids, "candidate_order" => transfer_ids,
+            "protected_transfer_slots" => transfer_ids, "immigrant_slots" => String[],
+            "archive_lineage" => incoming_path)
+        # For the first stage there is no predecessor; for later stages the
+        # source path must remain the exact canonical predecessor manifest.
+        index > 1 && (transfer["source_archive_path"] = incoming_path)
         O.safe_save_json(joinpath(stage_root, "transfer_manifest.json"), transfer;
                          label="fixture_transfer_manifest")
         O.safe_save_json(joinpath(stage_root, "stage_state.json"), Dict(
             "status" => "committed", "stage" => stage["name"], "iteration" => 1,
             "fit_months" => stage["fit_months"], "requested_days" => stage["requested_days"],
             "effective_days" => stage["effective_days"], "archive_path" => manifest_path,
-            "archive_ids" => transfer_ids, "best_candidate" => transfer_ids[1],
+            "archive_ids" => current_ids, "transfer_archive_ids" => transfer_ids,
+            "best_candidate" => current_ids[1],
+            "current_archive_ids" => current_ids,
+            "source_archive_path" => incoming_path,
+            "source_archive_id" => incoming_manifest === nothing ? nothing : incoming_manifest["archive_id"],
             "rng_state" => Dict("algorithm" => "fixture-fixed", "stream" => index),
-            "prefix_hash" => bytes2hex(sha256(JSON.json(predecessor_archive)))))
+            "prefix_hash" => bytes2hex(sha256(JSON.json(transfer_archive)))))
         O.safe_save_json(joinpath(stage_root, "full_reusable_state.json"), Dict(
             "status" => "committed", "stage" => stage["name"],
-            "source_archive_path" => manifest_path, "admitted_ids" => transfer_ids,
+            "source_archive_path" => incoming_path, "admitted_ids" => transfer_ids,
             "parameter_names" => ["fixture.beta[1]", "fixture.beta[2]"],
             "transition_delta_report" => [x["transition_delta_report"] for x in archive]))
         push!(stages, merge(stage, Dict("stage_root" => stage_root,
-            "archive_path" => manifest_path, "archive_ids" => transfer_ids,
-            "gate" => gate, "source_archive_path" => predecessor_path,
+            "archive_path" => manifest_path, "archive_ids" => current_ids,
+            "transfer_archive_ids" => transfer_ids,
+            "current_archive_ids" => current_ids,
+            "source_archive_path" => incoming_path,
+            "source_archive_id" => incoming_manifest === nothing ? nothing : incoming_manifest["archive_id"],
+            "gate" => gate,
             "status" => "committed")))
-        predecessor_archive = archive
-        predecessor_path = manifest_path
     end
     summary = Dict("status" => "fixture_complete", "adapter_mode" => "deterministic_fixture",
         "output_root" => output_root, "target_months" => target, "monthly_days" => monthly_days,

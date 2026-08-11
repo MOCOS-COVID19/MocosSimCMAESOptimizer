@@ -65,6 +65,26 @@ const JULIA = get(ENV, "JULIA", "/Users/marcinbodych/Workspace/saxocov/julia-1.7
     @test all(s["gate"]["status"] == "passed" for s in summary["stages"])
     @test all(isfile(joinpath(s["stage_root"], "preflight_manifest.json"))
               for s in summary["stages"])
+    # Every extension must consume the canonical archive finalized by its
+    # immediate predecessor, while current-stage survivor selection remains a
+    # separate artifact.
+    for i in 2:length(summary["stages"])
+        previous = summary["stages"][i - 1]
+        current = summary["stages"][i]
+        transfer = JSON.parsefile(joinpath(current["stage_root"], "transfer_manifest.json"))
+        @test transfer["source_archive_path"] == previous["archive_path"]
+        @test transfer["source_stage"] == previous["name"]
+        @test transfer["target_stage"] == current["name"]
+        @test transfer["source_horizon_months"] == previous["fit_months"]
+        @test transfer["admitted_ids"] == previous["archive_ids"]
+        @test transfer["candidate_order"] == previous["archive_ids"]
+        @test transfer["protected_transfer_slots"] == previous["archive_ids"]
+        @test isempty(intersect(Set(transfer["protected_transfer_slots"]),
+                                Set(transfer["immigrant_slots"])))
+        @test JSON.parsefile(joinpath(current["stage_root"], "transfer_candidates.json")) ==
+              JSON.parsefile(joinpath(previous["stage_root"], "survivor_archive.json"))
+        @test current["archive_ids"] != transfer["admitted_ids"]
+    end
     @test isfile(joinpath(summary["output_root"], "pipeline_summary.json"))
     @test !isdir(joinpath(summary["output_root"], "advanced_cli.jl"))
 end
