@@ -91,4 +91,44 @@ const O = MocosSimCMAESOptimizer
     a = O.build_state_from_reusable(seed2, specs2, reusable; rng=MersenneTwister(8))
     b = O.build_state_from_reusable(seed2, specs2, reusable; rng=MersenneTwister(8))
     @test a.mean == b.mean
+
+    posterior_state = Dict{String,Any}(
+        "stage" => "posterior",
+        "param_names" => ["curve.interval_values[1]", "curve.interval_values[2]",
+                          "curve.interval_values[3]"],
+        "mean" => [0.9, 0.4, 0.9],
+        "sigma" => [0.1, 0.1, 0.1],
+        "covariance" => Matrix{Float64}(I, 3, 3),
+    )
+    posterior_source = Dict{String,Any}(
+        "parameter_names" => posterior_state["param_names"],
+        "evaluated_vector" => [0.1, 0.1, 0.1],
+        "candidate" => "archive-7",
+        "stage" => "short",
+        "fit_months" => 3,
+    )
+    rejected_posterior = O.enforce_posterior_reusable_state(
+        seed2, specs2, posterior_state, posterior_source;
+        active_months=3, limit=0.1, policy="reject",
+    )
+    @test rejected_posterior["status"] == "rejected"
+    @test rejected_posterior["state"] === nothing
+    @test rejected_posterior["report"]["policy_outcome"] == "reject"
+    @test rejected_posterior["terminal_evidence"]["failure_class"] ==
+          "posterior_transition_policy_reject"
+
+    clipped_posterior = O.enforce_posterior_reusable_state(
+        seed2, specs2, posterior_state, posterior_source;
+        active_months=3, limit=0.1, policy="clip",
+    )
+    @test clipped_posterior["status"] == "accepted"
+    @test clipped_posterior["state"]["mean"] == [0.2, 0.2, 0.2]
+    @test clipped_posterior["report"]["policy_outcome"] == "clipped"
+    @test clipped_posterior["state"]["transition_delta_report"] ===
+          clipped_posterior["report"]
+    @test clipped_posterior["report"]["source_provenance"]["archive_entry_id"] ==
+          "archive-7"
+    @test clipped_posterior["report"]["coordinates"][1]["raw_value"] == 0.9
+    @test clipped_posterior["report"]["coordinates"][1]["effective_value"] == 0.2
+    @test clipped_posterior["report"]["coordinates"][1]["class"] == "archive_transfer"
 end

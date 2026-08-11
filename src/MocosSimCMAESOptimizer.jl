@@ -855,6 +855,106 @@ function enforce_transition_policy(seed::AbstractDict, cfg::AbstractDict,
     return Dict{String,Any}("status" => "accepted", "config" => effective_cfg, "report" => report)
 end
 
+"""Apply the transition contract to a posterior reusable state before use.
+
+Posterior means are already in effective coordinate space, so this helper
+clips/rejects the mean directly and carries the complete report into the
+state.  Callers must not construct or persist the returned state on reject.
+"""
+function enforce_posterior_reusable_state(
+    seed::AbstractDict,
+    specs_stage::Vector{ParamSpec},
+    posterior_state::AbstractDict,
+    source_entry=nothing;
+    active_months::Int=0,
+    limit::Float64=0.15,
+    policy::String="reject",
+)
+    policy in ("reject", "clip", "exception") ||
+        throw(ArgumentError("unsupported transition policy: $policy"))
+    state = deepcopy(posterior_state)
+    names = String.(get(state, "param_names", String[]))
+    mean = Float64.(get(state, "mean", Float64[]))
+    expected_names = ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
+    length(names) == length(mean) || throw(ArgumentError("posterior state name/mean dimensions disagree"))
+    names == expected_names || throw(ArgumentError("posterior state coordinates do not match target stage"))
+
+    prior = source_entry isa AbstractDict ?
+        Dict{String,Any}(
+            "param_names" => get(source_entry, "parameter_names", String[]),
+            "values" => get(source_entry, "evaluated_vector", Float64[]),
+        ) :
+        Dict{String,Any}("param_names" => expected_names,
+                         "values" => initial_vector(seed, specs_stage))
+    prior_names = String.(get(prior, "param_names", String[]))
+    prior_values = Float64.(get(prior, "values", Float64[]))
+    prior_map = Dict(name => i for (i, name) in enumerate(prior_names))
+    effective = copy(mean)
+    over_limit = false
+    for (i, name) in enumerate(names)
+        haskey(prior_map, name) && prior_map[name] <= length(prior_values) || continue
+        delta = effective[i] - prior_values[prior_map[name]]
+        abs(delta) <= limit && continue
+        over_limit = true
+        policy == "clip" && (effective[i] = prior_values[prior_map[name]] + sign(delta) * limit)
+    end
+    current = Dict{String,Any}("param_names" => names, "values" => effective)
+    classes = [
+        haskey(prior_map, name) && prior_map[name] <= length(prior_values) &&
+            abs(effective[i] - prior_values[prior_map[name]]) <= 1e-12 ?
+            "locked" : (haskey(prior_map, name) ? "archive_transfer" : "new_dimension")
+        for (i, name) in enumerate(names)
+    ]
+    report = transition_delta_report(prior, current;
+        candidate_class=source_entry isa AbstractDict ? "archive_transfer" : "new_dimension",
+        coordinate_classes=classes, limit=limit, policy=policy)
+    report["raw_values"] = mean
+    report["effective_values"] = effective
+    report["active_months"] = active_months
+    report["source_provenance"] = source_entry isa AbstractDict ?
+        Dict{String,Any}(
+            "archive_entry_id" => get(source_entry, "candidate", nothing),
+            "source_stage" => get(source_entry, "stage", nothing),
+            "source_fit_months" => get(source_entry, "fit_months", nothing),
+        ) :
+        Dict{String,Any}("source" => "seed_prior")
+    for (i, row) in enumerate(report["coordinates"])
+        row["raw_value"] = mean[i]
+        row["effective_value"] = effective[i]
+        row["provenance"] = report["source_provenance"]
+    end
+    if over_limit && policy == "reject"
+        report["policy_outcome"] = "reject"
+        evidence = Dict{String,Any}(
+            "status" => "failed",
+            "failure_class" => "posterior_transition_policy_reject",
+            "simulated" => "posterior_transition_rejected",
+            "active_months" => active_months,
+            "transition_delta_report" => report,
+        )
+        return Dict{String,Any}("status" => "rejected", "state" => nothing,
+                                "report" => report, "terminal_evidence" => evidence)
+    elseif over_limit && policy == "exception"
+        report["policy_outcome"] = "exception"
+        evidence = Dict{String,Any}(
+            "status" => "failed",
+            "failure_class" => "posterior_transition_policy_exception",
+            "simulated" => "posterior_transition_rejected",
+            "active_months" => active_months,
+            "transition_delta_report" => report,
+        )
+        return Dict{String,Any}("status" => "rejected", "state" => nothing,
+                                "report" => report, "terminal_evidence" => evidence)
+    elseif over_limit && policy == "clip"
+        report["policy_outcome"] = "clipped"
+    end
+    state["mean"] = effective
+    state["transition_delta_report"] = report
+    state["transition_policy_outcome"] = report["policy_outcome"]
+    return Dict{String,Any}("status" => "accepted", "state" => state, "report" => report,
+                            "terminal_evidence" => nothing)
+end
+
 function stage_resume_info(stage_root::String)
     iter_infos = Vector{Tuple{Int,String,Bool}}()
     isdir(stage_root) || return nothing
@@ -3162,46 +3262,50 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
                 posterior_archive_path = joinpath(stage_root, "survivor_archive.json")
                 posterior_archive = isfile(posterior_archive_path) ? load_json(posterior_archive_path) : Any[]
                 posterior_archive isa AbstractVector || (posterior_archive = Any[])
-                posterior_names = String.(get(posterior_state, "param_names", String[]))
-                posterior_prior = isempty(posterior_archive) ?
-                    Dict{String,Any}(
-                        "param_names" => posterior_names,
-                        "values" => initial_vector(current_seed, stage_specs(current_seed, specs, cfg, stage))) :
-                    Dict{String,Any}(
-                        "param_names" => get(posterior_archive[1], "parameter_names", String[]),
-                        "values" => get(posterior_archive[1], "evaluated_vector", Float64[]))
-                posterior_state["transition_delta_report"] = transition_delta_report(
-                    posterior_prior,
-                    Dict{String,Any}("param_names" => posterior_names,
-                                     "values" => posterior_state["mean"]);
-                    candidate_class=isempty(posterior_archive) ? "new_dimension" : "archive_transfer",
-                    policy="reject")
-                posterior_state["archive_provenance"] = isempty(posterior_archive) ? nothing :
-                    Dict{String,Any}("source_archive_path" => posterior_archive_path,
-                                     "source_archive_entry" => get(posterior_archive[1], "candidate", nothing),
-                                     "source_stage" => get(posterior_archive[1], "stage", nothing),
-                                     "predecessor" => "immediate_admitted_archive")
-                posterior_state["predecessor_provenance"] = isempty(posterior_archive) ? nothing :
-                    Dict{String,Any}("archive_path" => posterior_archive_path,
-                                     "archive_entry_id" => get(posterior_archive[1], "candidate", nothing),
-                                     "stage" => get(posterior_archive[1], "stage", nothing),
-                                     "horizon_months" => get(posterior_archive[1], "fit_months", stage.fit_months))
-                state = build_state_from_reusable(
-                    current_seed,
-                    stage_specs(current_seed, specs, cfg, stage),
-                    posterior_state;
-                    sigma_floor=max(0.08, 0.75 * stage.sigma),
-                    temporal_unlock_multiplier=1.0,
-                    covariance_inflation=cfg.posterior.transfer_covariance_inflation,
-                    sigma_multiplier=cfg.posterior.transfer_sigma_multiplier,
-                    new_dimension_variance=cfg.posterior.new_dimension_variance,
-                    rng=rng,
+                posterior_source = isempty(posterior_archive) ? nothing : posterior_archive[1]
+                posterior_specs = stage_specs(current_seed, specs, cfg, stage)
+                posterior_transition = enforce_posterior_reusable_state(
+                    current_seed, posterior_specs, posterior_state, posterior_source;
+                    active_months=stage.fit_months, policy="reject",
                 )
-                safe_save_json(
-                    joinpath(stage_root, "posterior_reusable_state.json"),
-                    posterior_state;
-                    label="posterior_reusable_state",
-                )
+                if posterior_transition["status"] == "rejected"
+                    # Rejection is terminal evidence only.  In particular, do
+                    # not construct a CMA state or leave a reusable posterior
+                    # artifact that a later stage could consume.
+                    safe_save_json(
+                        joinpath(stage_root, "posterior_transition_rejected.json"),
+                        posterior_transition["terminal_evidence"];
+                        label="posterior_transition_rejected",
+                    )
+                else
+                    posterior_state = posterior_transition["state"]
+                    posterior_state["archive_provenance"] = posterior_source === nothing ? nothing :
+                        Dict{String,Any}("source_archive_path" => posterior_archive_path,
+                                         "source_archive_entry" => get(posterior_source, "candidate", nothing),
+                                         "source_stage" => get(posterior_source, "stage", nothing),
+                                         "predecessor" => "immediate_admitted_archive")
+                    posterior_state["predecessor_provenance"] = posterior_source === nothing ? nothing :
+                        Dict{String,Any}("archive_path" => posterior_archive_path,
+                                         "archive_entry_id" => get(posterior_source, "candidate", nothing),
+                                         "stage" => get(posterior_source, "stage", nothing),
+                                         "horizon_months" => get(posterior_source, "fit_months", stage.fit_months))
+                    state = build_state_from_reusable(
+                        current_seed,
+                        posterior_specs,
+                        posterior_state;
+                        sigma_floor=max(0.08, 0.75 * stage.sigma),
+                        temporal_unlock_multiplier=1.0,
+                        covariance_inflation=cfg.posterior.transfer_covariance_inflation,
+                        sigma_multiplier=cfg.posterior.transfer_sigma_multiplier,
+                        new_dimension_variance=cfg.posterior.new_dimension_variance,
+                        rng=rng,
+                    )
+                    safe_save_json(
+                        joinpath(stage_root, "posterior_reusable_state.json"),
+                        posterior_state;
+                        label="posterior_reusable_state",
+                    )
+                end
             end
         end
         canonical_archive_path = joinpath(stage_root, "survivor_archive.json")
