@@ -154,13 +154,18 @@ def main():
     args = parser.parse_args()
     root = args.pipeline_root.resolve()
     stage_dirs = sorted(
-        [path for path in root.glob("*/real_sims/*") if path.is_dir()],
+        [
+            path for path in root.glob("*/real_sims/*")
+            if path.is_dir() and not path.name.startswith(".")
+        ],
         key=lambda path: path.as_posix(),
     )
     if not stage_dirs:
         raise FileNotFoundError(f"No stage simulation directories found under {root}")
-    short_dir = stage_dirs[0]
-    long_dir = stage_dirs[-1]
+    short_dirs = [path for path in stage_dirs if path.name.startswith("short")]
+    long_dirs = [path for path in stage_dirs if path.name.startswith("long")]
+    short_dir = sorted(short_dirs or stage_dirs, key=lambda path: path.as_posix())[0]
+    long_dir = sorted(long_dirs or stage_dirs, key=lambda path: path.as_posix())[-1]
     short_stage = short_dir.parents[1].name
     long_stage = long_dir.parents[1].name
     short_summary = load(short_dir / "stage_state.json")

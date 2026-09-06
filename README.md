@@ -1,75 +1,52 @@
-## Parameter evolution plots
-
-To plot how selected parameters evolve across a search tree:
-
-```bash
-uv run -- python drawing-utilities/plot_param_evolution.py \
-  --search-dir runs/wcss3m/real_sims \
-  --out-dir runs/wcss3m/real_sims/plots
-```
-
-To rebuild the interactive HTML viewer for a plots directory:
-
-```bash
-python3 drawing-utilities/build_plot_viewer.py \
-  --plots-dir config8/real_sims/plots \
-  --title "Config8 plot explorer"
-```
-
-This regenerates `index.html`, includes `gt_vs_sim.png` entries from sibling stage/iteration/candidate directories, loads nearby `metrics.json`, and orders `gt_vs_sim` items by lowest `score` first.
-
 # MocosSimCMAESOptimizer
 
-This package runs a synthetic CMA-ES optimizer against a configurable epidemic simulation seed and records the best parameter combinations per stage.
+This package implements the staged CMA-ES/NUTS orchestration pipeline. The reliable path is currently fixture-backed: it exercises stage transitions, archive handoff, scoring, persistence, and resume semantics without launching a live simulator.
 
-## Requirements
+## Completed reliable pipeline
 
-- Julia (the project uses the versions declared in `Project.toml`; run `julia --project=. -e 'using Pkg; Pkg.instantiate()'` to install dependencies).
-- A seed configuration file referencing the simulation state (e.g., `seed/config2.json`).
-- Writable output directory for storing optimizer artifacts.
+- **Canonical transitions:** stage changes use name-based parameter transitions and explicit effective-coordinate delta reports; positional coincidence is not used as identity.
+- **Paired-index scoring:** observed and simulated series are paired by their original indices before scoring, preserving alignment when rows are filtered or rejected.
+- **Reliable archive:** survivor archives adapt around 30–50 entries (subject to the configured bounds) and are admitted only when the archive quality gate passes. The immediate predecessor archive and its transfer manifest are consumed by the next stage.
+- **Commit and resume integrity:** production and fixture commits have distinct schemas and complete artifact key/hash manifests. Validation rejects missing, extra, tampered, or fixture-shaped production artifacts; interruption/resume restores the RNG stream, population, archive, and next iteration deterministically.
+- **Readiness:** the four-stage, 24-month pipeline readiness check is fixture-only and verifies orchestration without starting an external simulation.
 
-## Configuration
+## Julia 1.7 fixture checks
 
-1. Update `optimizer_config.json` to point at the desired seed file, output directory, and CMA-ES parameters.
-2. Define:
-   - `scalar_bounds` and `temporal_bounds` to constrain parameter search ranges.
-   - `stages` that specify the number of fit months, iterations, population size, and starting sigma.
-   - `objective` weights plus `recent_days`/`early_reject_multiplier` to shape scoring.
+Use the repository's Julia 1.7 binary and project environment:
 
-## Running the optimizer
+```sh
+JULIA=/Users/marcinbodych/Workspace/saxocov/julia-1.7.0/bin/julia
+$JULIA --project=. tests/scoring_contract.jl
+$JULIA --project=. tests/transition_contract.jl
+$JULIA --project=. tests/archive_two_stage_contract.jl
+$JULIA --project=. tests/orchestration_commit_idempotence.jl
+$JULIA --project=. tests/transition_orchestration_fixtures.jl
+$JULIA --project=. tests/readiness_no_launch_fixture.jl
+```
+
+The readiness fixture is intentionally no-launch: it must not invoke `advanced_cli`.
+
+## Configuration and local runs
+
+`pipeline_config.json` describes the staged pipeline; `optimizer_config.json` configures a direct optimizer run. Dependencies can be installed with:
+
+```sh
+julia --project=. -e 'using Pkg; Pkg.instantiate()'
+```
+
+For a configured local optimizer run:
 
 ```sh
 julia --project=. run_optimizer.jl [path/to/optimizer_config.json]
 ```
 
-- If no config path is provided, `run_optimizer.jl` loads the default `optimizer_config.json` in the repository root.
-- Results (best candidates, history, summaries) are written into the configured `output_dir` (e.g., `runs/default/`).
+Results are written below the configured output directory. Do not interpret a fixture run as evidence of simulator validity.
 
-## Inspecting results
+## Explicitly deferred
 
-- Each stage emits `<stage>_best_candidate.json` with the optimized configuration for that stage.
-- The optimizer also drops `optimizer_history.json`, `stage_summary.json`, `final_best_candidate.json`, and `<stage>_summary.json` under `output_dir`.
-- Per-stage runtime logs are written under `output_dir/real_sims/<stage>/` as `stage_state.json` and `iter_metrics.jsonl`.
+The following are **DEFERRED** and are not claimed by the reliable pipeline:
 
-## Testing
-
-```sh
-julia --project=. tests/smoke_test.jl
-```
-
-This script runs the optimizer against the default configuration and prints the summary dictionary.
-
-## Running on Slurm
-
-Use the thin wrapper, which enables per-iteration Slurm array dispatch inside `run_optimizer.jl`:
-
-```sh
-sbatch scripts/run_cmaes.slurm
-```
-
-If invoking manually on a Slurm node:
-```sh
-/home/mbodych/1.7.0-school_class/julia-1.7.0/bin/julia --project=. run_optimizer.jl --slurm
-```
-
-If a run stops mid-stage, re-running the same command resumes from the latest `real_sims/<stage>/stage_state.json` and `iter_metrics.jsonl` artifacts.
+- real `advanced_cli` simulation execution;
+- Slurm dispatch or cluster runs;
+- validation replicates;
+- multi-seed runs.

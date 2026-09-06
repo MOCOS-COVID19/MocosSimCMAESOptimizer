@@ -1,4 +1,10 @@
 {
+  "temporal_parameterization": "monthly",
+  "validation": {
+    "enabled": true,
+    "holdout_days": 28,
+    "seeds": [42, 43, 44]
+  },
   "seed_config": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/seed/config13.json",
   "output_dir": "/home/mbodych/1.7.0-school_class/MocosSimCMAESOptimizer/runs/config13",
   "monthly_days": 30,
@@ -41,27 +47,31 @@
   },
   "objective": {
     "weights": {
-      "full_daily": 1.0,
-      "recent_daily": 1.5,
-      "cumulative": 0.35,
-      "peak_height": 0.5,
-      "peak_timing": 0.5,
-      "slope": 0.25,
       "daily_detections": 1.0,
       "daily_hospitalizations": 0.0,
       "daily_deaths": 1.0,
       "daily_student_detections": 0.0,
       "daily_detections_cumulative": 1.0,
+      "daily_detections_cumulative_blocked": 0.5,
       "daily_hospitalizations_cumulative": 0.0,
       "daily_deaths_cumulative": 1.0,
+      "daily_deaths_cumulative_blocked": 0.5,
       "daily_student_detections_cumulative": 0.0,
       "weekly_control": 1.0
     },
     "top_k": 5,
-    "min_completion_fraction": 0.5,
+    "min_completion_fraction": 1.0,
     "finish_iter_delay": 15,
     "temporal_jump_weight": 0.5,
     "infection_extrema_weight": 0.1
+  },
+  "age_population_weights": {
+    "00_04": 0.043326963479,
+    "05_14": 0.092000943853,
+    "15_34": 0.191816378028,
+    "35_59": 0.331854151940,
+    "60_79": 0.248931116037,
+    "80_plus": 0.092070446663
   },
   "posterior": {
     "enabled": true,
