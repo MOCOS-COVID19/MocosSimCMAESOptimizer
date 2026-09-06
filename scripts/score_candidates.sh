@@ -22,6 +22,7 @@
 #   $3 = PROJECT_DIR (MocosSimLauncher project)
 #   $4 = ADVANCED_CLI (advanced_cli.jl)
 #   $5 = GT_DIR (directory with daily_* CSVs)
+#   $6 = adapter timeout in seconds (optional; defaults to 3600)
 
 set -euo pipefail
 
@@ -30,6 +31,7 @@ JULIA_BIN="$2"
 PROJECT_DIR="$3"
 ADVANCED_CLI="$4"
 GT_DIR="$5"
+TIMEOUT_SECONDS="${6:-3600}"
 
 IDX=${SLURM_ARRAY_TASK_ID:-0}
 
@@ -63,10 +65,39 @@ if command -v uv >/dev/null 2>&1; then
   uv pip install matplotlib numpy h5py >/dev/null 2>&1 || true
 fi
 
-if ! "$JULIA_BIN" --project="$PROJECT_DIR" --compiled-modules=no --threads=4 "$ADVANCED_CLI" "$CFG" \
-  --output-daily "$OUT_DAILY" --output-summary "$OUT_SUMMARY"; then
+STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+COMMAND=("$JULIA_BIN" "--project=$PROJECT_DIR" "--compiled-modules=no" "--threads=4"
+  "$ADVANCED_CLI" "$CFG" "--output-daily" "$OUT_DAILY" "--output-summary" "$OUT_SUMMARY")
+set +e
+timeout --signal=TERM --kill-after=30 "$TIMEOUT_SECONDS" "${COMMAND[@]}" \
+  >"$CAND_DIR/adapter.stdout.log" 2>"$CAND_DIR/adapter.stderr.log"
+EXIT_CODE=$?
+set -e
+FINISHED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+export STARTED_AT FINISHED_AT EXIT_CODE TIMEOUT_SECONDS CAND_DIR
+python3 - "${COMMAND[@]}" <<'PY'
+import json, os, sys
+root = os.environ["CAND_DIR"]
+exit_code = int(os.environ["EXIT_CODE"])
+payload = {
+    "schema_version": "adapter-invocation-v1",
+    "command": sys.argv[1:],
+    "working_directory": root,
+    "started_at": os.environ["STARTED_AT"],
+    "finished_at": os.environ["FINISHED_AT"],
+    "timeout_seconds": float(os.environ["TIMEOUT_SECONDS"]),
+    "timed_out": exit_code in (124, 137),
+    "exit_code": exit_code,
+    "success": exit_code == 0,
+    "stdout": os.path.join(root, "adapter.stdout.log"),
+    "stderr": os.path.join(root, "adapter.stderr.log"),
+}
+with open(os.path.join(root, "adapter_invocation.json"), "w") as stream:
+    json.dump(payload, stream, indent=2)
+PY
+if [ "$EXIT_CODE" -ne 0 ]; then
   touch "$FAILED_OK"
-  exit 1
+  exit "$EXIT_CODE"
 fi
 
 # Optional plotting per candidate (non-fatal on failure)
