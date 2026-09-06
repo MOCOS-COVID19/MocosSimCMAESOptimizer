@@ -30,6 +30,10 @@ The readiness fixture is intentionally no-launch: it must not invoke `advanced_c
 
 `pipeline_config.json` describes the staged pipeline; `optimizer_config.json` configures a direct optimizer run. Dependencies can be installed with:
 
+For a repository audit and a prioritized implementation plan for automatic,
+dynamic calibration of the Saxony 2020--2022 data, see
+[`docs/dynamic-calibration-roadmap.md`](docs/dynamic-calibration-roadmap.md).
+
 ```sh
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
