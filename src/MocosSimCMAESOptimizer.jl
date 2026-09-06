@@ -22,7 +22,11 @@ export main, run_optimizer, run_long_horizon, run_nuts_from_archive,
        persist_archive_transfer_manifest, preflight_config, create_candidate_root,
        adapter_failure, candidate_terminal_status, wait_for_iteration_outputs,
        stage_resume_info, materialize_terminal_candidate!, normalized_iteration_result,
-       atomic_save_json, validate_committed_artifacts, load_immediate_predecessor_state
+       atomic_save_json, validate_committed_artifacts, load_immediate_predecessor_state,
+       canonical_data_protocol, temporal_data_split,
+       stage_data_split, negative_binomial_loglikelihood,
+       run_production_smoke, validate_simulation_jld2,
+       compare_smoke_manifests
 
 struct ExternalSimConfig
     gt_dir::String
@@ -105,7 +109,9 @@ const DEFAULT_AGE_POPULATION_WEIGHTS = Dict{String,Float64}(
 )
 
 include("posterior_sampler.jl")
+include("data_protocol.jl")
 include("config_preflight.jl")
+include("production_smoke.jl")
 
 struct ParamSpec
     name::String
@@ -1819,10 +1825,11 @@ end
 function load_config(path::String)
     raw = load_json(path)
     config_dir = dirname(abspath(path))
-    raw["seed_config"] = isabspath(String(raw["seed_config"])) ? String(raw["seed_config"]) :
-        normpath(joinpath(config_dir, String(raw["seed_config"])))
-    raw["output_dir"] = isabspath(String(raw["output_dir"])) ? String(raw["output_dir"]) :
-        normpath(joinpath(config_dir, String(raw["output_dir"])))
+    seed_value = _expand_environment_variables(String(raw["seed_config"]), "seed_config")
+    raw["seed_config"] = isabspath(seed_value) ? seed_value : normpath(joinpath(config_dir, seed_value))
+    output_value = _expand_environment_variables(String(raw["output_dir"]), "output_dir")
+    raw["output_dir"] = isabspath(output_value) ? output_value :
+        normpath(joinpath(config_dir, output_value))
     stages = [StageConfig(s["name"], s["fit_months"], s["max_iterations"], s["population_size"], float(s["sigma"])) for s in raw["stages"]]
     scalar_bounds = Dict(k => (float(v[1]), float(v[2])) for (k, v) in raw["scalar_bounds"])
     temporal_bounds = Dict(k => (float(v[1]), float(v[2])) for (k, v) in raw["temporal_bounds"])
@@ -1855,20 +1862,17 @@ function load_config(path::String)
         float(get(posterior_raw, "new_dimension_variance", 2.0)),
         float(get(posterior_raw, "immigrant_fraction", 0.20)),
     )
-    gt_dir = haskey(raw, "gt_dir") ?
-        (isabspath(String(raw["gt_dir"])) ?
-            String(raw["gt_dir"]) :
-            normpath(joinpath(config_dir, String(raw["gt_dir"])))) :
+    gt_value = haskey(raw, "gt_dir") ?
+        _expand_environment_variables(String(raw["gt_dir"]), "gt_dir") : nothing
+    gt_dir = gt_value !== nothing ?
+        (isabspath(gt_value) ? gt_value : normpath(joinpath(config_dir, gt_value))) :
         nothing
     external_sim = gt_dir !== nothing && haskey(raw, "julia_bin") && haskey(raw, "project_dir") && haskey(raw, "advanced_cli") ?
         ExternalSimConfig(
             gt_dir,
-            isabspath(String(raw["julia_bin"])) ? String(raw["julia_bin"]) :
-                normpath(joinpath(config_dir, String(raw["julia_bin"]))),
-            isabspath(String(raw["project_dir"])) ? String(raw["project_dir"]) :
-                normpath(joinpath(config_dir, String(raw["project_dir"]))),
-            isabspath(String(raw["advanced_cli"])) ? String(raw["advanced_cli"]) :
-                normpath(joinpath(config_dir, String(raw["advanced_cli"]))),
+            _expand_environment_variables(String(raw["julia_bin"]), "julia_bin"),
+            _expand_environment_variables(String(raw["project_dir"]), "project_dir"),
+            _expand_environment_variables(String(raw["advanced_cli"]), "advanced_cli"),
             Bool(get(raw, "disable_compiled_modules", false)),
         ) :
         nothing
@@ -2253,13 +2257,39 @@ function run_external_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, day
         summary_path,
     ])
     cmd = Cmd(cmd_args)
+    timeout_seconds = Float64(get(cfg.validation, "adapter_timeout_seconds", 3600.0))
+    timeout_seconds > 0 || throw(ArgumentError("validation.adapter_timeout_seconds must be positive"))
+    stdout_path = joinpath(workdir, "adapter.stdout.log")
+    stderr_path = joinpath(workdir, "adapter.stderr.log")
+    started = now(UTC)
+    process = nothing
+    timed_out = false
     success = false
-    try
-        run(cmd)
-        success = true
-    catch err
-        @warn "External simulation failed" err
+    open(stdout_path, "w") do stdout_io
+        open(stderr_path, "w") do stderr_io
+            try
+                process = run(pipeline(cmd, stdout=stdout_io, stderr=stderr_io); wait=false)
+                wait_status = timedwait(() -> process_exited(process), timeout_seconds;
+                                        pollint=min(0.25, timeout_seconds))
+                timed_out = wait_status == :timed_out
+                if timed_out
+                    kill(process)
+                    wait(process)
+                end
+                success = !timed_out && Base.success(process)
+            catch err
+                @warn "External simulation failed" err
+            end
+        end
     end
+    invocation = Dict{String,Any}(
+        "schema_version" => "adapter-invocation-v1", "command" => cmd_args,
+        "working_directory" => workdir, "started_at" => string(started),
+        "finished_at" => string(now(UTC)), "timeout_seconds" => timeout_seconds,
+        "timed_out" => timed_out, "exit_code" => process === nothing ? nothing : process.exitcode,
+        "success" => success, "stdout" => stdout_path, "stderr" => stderr_path)
+    safe_save_json(joinpath(workdir, "adapter_invocation.json"), invocation;
+                   label="adapter_invocation")
     return success, daily_path
 end
 
@@ -2268,7 +2298,8 @@ function load_gt_series(gt_dir::String)
         path = joinpath(gt_dir, name)
         isfile(path) || return Union{Missing,Float64}[]
         parsed = _read_named_gt_csv(path)
-        rows = Tuple{Int,Union{Missing,Float64}}[(day, value) for (day, value) in parsed]
+        rows = Tuple{Int,Union{Missing,Float64}}[
+            (day, value == -1 ? missing : value) for (day, value) in parsed]
         isempty(rows) && return Float64[]
         sort!(rows, by = first)
         max_day = rows[end][1]
@@ -3083,7 +3114,7 @@ function vector_likelihood_payload(
     days::Int;
     family::String="diagonal_gaussian_weekly",
 )
-    family == "diagonal_gaussian_weekly" ||
+    family in ("diagonal_gaussian_weekly", "negative_binomial_weekly") ||
         error("Unsupported vector likelihood family: $family")
     dimensions = Any[]
     log_likelihood = 0.0
@@ -3099,10 +3130,14 @@ function vector_likelihood_payload(
             residual = prediction - observation
             scale = max(abs(observation), 1.0)
             standardized_residual = residual / scale
-            contribution = -0.5 * (
-                standardized_residual^2 +
-                log(2.0 * pi * scale^2)
-            )
+            dispersion = metric == "daily_deaths" ? 10.0 :
+                         metric == "daily_hospitalizations" ? 15.0 : 25.0
+            contribution = if family == "negative_binomial_weekly"
+                negative_binomial_loglikelihood(
+                    round(Int, max(observation, 0.0)), max(prediction, 0.0), dispersion)
+            else
+                -0.5 * (standardized_residual^2 + log(2.0 * pi * scale^2))
+            end
             log_likelihood += contribution
             push!(dimensions, Dict(
                 "metric" => metric,
@@ -3111,6 +3146,7 @@ function vector_likelihood_payload(
                 "prediction" => prediction,
                 "residual" => residual,
                 "scale" => scale,
+                "dispersion" => family == "negative_binomial_weekly" ? dispersion : nothing,
                 "standardized_residual" => standardized_residual,
                 "log_likelihood_contribution" => contribution,
             ))
@@ -3118,7 +3154,8 @@ function vector_likelihood_payload(
     end
     return Dict(
         "family" => family,
-        "scale_policy" => "max(abs(observation), 1.0)",
+        "scale_policy" => family == "negative_binomial_weekly" ?
+            "metric-specific fixed dispersion" : "max(abs(observation), 1.0)",
         "log_likelihood" => log_likelihood,
         "dimensions" => dimensions,
     )
@@ -3157,16 +3194,18 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     gt = load_gt_series(cfg.external_sim.gt_dir)
     sim_ok, daily_path = run_external_sim(cfg, candidate, days; workdir=workdir)
     sim_ok || return Inf, Dict("sim_failed" => true)
-    weekly_control = weekly_control_score(cfg, daily_path, gt, days)
-    vector_likelihood = vector_likelihood_payload(daily_path, gt, days; family=cfg.posterior.likelihood)
+    windows = stage_data_split(days, cfg.validation)
+    training_days = Int(windows["train"]["end_day"])
+    weekly_control = weekly_control_score(cfg, daily_path, gt, training_days)
+    vector_likelihood = vector_likelihood_payload(daily_path, gt, training_days; family=cfg.posterior.likelihood)
     # Validation carries structured diagnostics (window, retained indices,
     # and per-metric scores), so keep the score manifest heterogeneous.
     metrics = Dict{String,Any}()
     for (metric, gtvals) in gt
         isempty(gtvals) && continue
-        metrics[metric] = per_trajectory_rmae(daily_path, metric, drop_missing(gtvals), days)
-        metrics["$(metric)_cumulative"] = per_trajectory_cumulative_error(daily_path, metric, drop_missing(gtvals), days)
-        metrics["$(metric)_cumulative_blocked"] = per_trajectory_blocked_cumulative_error(daily_path, metric, gtvals, days)
+        metrics[metric] = per_trajectory_rmae(daily_path, metric, drop_missing(gtvals), training_days)
+        metrics["$(metric)_cumulative"] = per_trajectory_cumulative_error(daily_path, metric, drop_missing(gtvals), training_days)
+        metrics["$(metric)_cumulative_blocked"] = per_trajectory_blocked_cumulative_error(daily_path, metric, gtvals, training_days)
     end
     metrics["weekly_control_score"] = weekly_control
     jump_penalty = temporal_jump_penalty(cfg, candidate)
@@ -3174,6 +3213,9 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     extrema_penalty = infection_extrema_penalty(cfg, candidate)
     metrics["infection_extrema_penalty"] = extrema_penalty
     metrics["vector_log_likelihood"] = vector_likelihood["log_likelihood"]
+    cfg.posterior.likelihood == "negative_binomial_weekly" &&
+        (metrics["negative_binomial_log_likelihood"] =
+            -Float64(vector_likelihood["log_likelihood"]))
     validation = validation_score_from_daily(cfg, daily_path, days)
     metrics["validation_mean_error"] = Float64(get(validation, "mean_error", Inf))
     metrics["validation_window"] = validation
@@ -3182,16 +3224,18 @@ end
 
 function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int, candidate::Union{Nothing,AbstractDict}=nothing)
     gt = load_gt_series(cfg.external_sim.gt_dir)
-    weekly_control = weekly_control_score(cfg, daily_path, gt, days)
-    vector_likelihood = vector_likelihood_payload(daily_path, gt, days; family=cfg.posterior.likelihood)
+    windows = stage_data_split(days, cfg.validation)
+    training_days = Int(windows["train"]["end_day"])
+    weekly_control = weekly_control_score(cfg, daily_path, gt, training_days)
+    vector_likelihood = vector_likelihood_payload(daily_path, gt, training_days; family=cfg.posterior.likelihood)
     # The validation window is a structured diagnostic, not a scalar metric.
     # A heterogeneous payload prevents assigning it to a Float64-only dict.
     metrics = Dict{String,Any}()
     for (metric, gtvals) in gt
         isempty(gtvals) && continue
-        metrics[metric] = per_trajectory_rmae(daily_path, metric, gtvals, days)
-        metrics["$(metric)_cumulative"] = per_trajectory_cumulative_error(daily_path, metric, gtvals, days)
-        metrics["$(metric)_cumulative_blocked"] = per_trajectory_blocked_cumulative_error(daily_path, metric, gtvals, days)
+        metrics[metric] = per_trajectory_rmae(daily_path, metric, gtvals, training_days)
+        metrics["$(metric)_cumulative"] = per_trajectory_cumulative_error(daily_path, metric, gtvals, training_days)
+        metrics["$(metric)_cumulative_blocked"] = per_trajectory_blocked_cumulative_error(daily_path, metric, gtvals, training_days)
     end
     metrics["weekly_control_score"] = weekly_control
     jump_penalty = candidate === nothing ? 0.0 : temporal_jump_penalty(cfg, candidate)
@@ -3199,6 +3243,9 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int, c
     extrema_penalty = candidate === nothing ? 0.0 : infection_extrema_penalty(cfg, candidate)
     metrics["infection_extrema_penalty"] = extrema_penalty
     metrics["vector_log_likelihood"] = vector_likelihood["log_likelihood"]
+    cfg.posterior.likelihood == "negative_binomial_weekly" &&
+        (metrics["negative_binomial_log_likelihood"] =
+            -Float64(vector_likelihood["log_likelihood"]))
     validation = validation_score_from_daily(cfg, daily_path, days)
     metrics["validation_mean_error"] = Float64(get(validation, "mean_error", Inf))
     metrics["validation_window"] = validation
@@ -3327,8 +3374,10 @@ function validation_score_from_daily(cfg::OptimizerConfig, daily_path::String, d
     enabled = Bool(get(cfg.validation, "enabled", true))
     enabled || return Dict{String,Any}("enabled" => false, "mean_error" => 0.0,
                                        "retained_indices" => Int[], "count" => 0)
-    holdout_days = max(Int(get(cfg.validation, "holdout_days", 28)), 1)
-    requested_start = max(1, days - holdout_days + 1)
+    windows = stage_data_split(days, cfg.validation)
+    requested_start = Int(windows["validation"]["start_day"])
+    requested_end = Int(windows["validation"]["end_day"])
+    holdout_days = requested_end - requested_start + 1
     gt = load_gt_series(cfg.external_sim === nothing ? joinpath(MANAGER_ROOT, "gt") : cfg.external_sim.gt_dir)
     metric_scores = Dict{String,Float64}()
     retained = Int[]
@@ -3338,11 +3387,11 @@ function validation_score_from_daily(cfg::OptimizerConfig, daily_path::String, d
         trajs === nothing && continue
         scores = Float64[]
         for traj in trajs
-            requested_start > min(days, length(gt[metric]), length(traj)) && continue
+            requested_start > min(requested_end, length(gt[metric]), length(traj)) && continue
             g, s, idx = paired_observations(
-                gt[metric][requested_start:min(days, length(gt[metric]))],
-                traj[requested_start:min(days, length(traj))],
-                min(days, length(gt[metric]), length(traj)) - requested_start + 1)
+                gt[metric][requested_start:min(requested_end, length(gt[metric]))],
+                traj[requested_start:min(requested_end, length(traj))],
+                min(requested_end, length(gt[metric]), length(traj)) - requested_start + 1)
             isempty(idx) && continue
             push!(scores, rmae_series(s, g))
             append!(retained, requested_start .+ idx .- 1)
@@ -3355,6 +3404,7 @@ function validation_score_from_daily(cfg::OptimizerConfig, daily_path::String, d
     return Dict{String,Any}(
         "enabled" => true, "start_day" => actual_start, "end_day" => actual_end,
         "requested_start_day" => requested_start, "holdout_days" => holdout_days,
+        "split_mode" => windows["mode"],
         "seeds" => get(cfg.validation, "seeds", [42, 43, 44]),
         "metrics" => metric_scores, "retained_indices" => retained,
         "count" => length(retained),
@@ -3491,7 +3541,8 @@ function submit_slurm_array(cfg::OptimizerConfig, list_file::String)
     lines = readlines(list_file)
     n = length(lines)
     n == 0 && return ""
-    cmd = `sbatch --parsable -c 4 -t 01:00:00 --mem=20G --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir)`
+    timeout_seconds = Float64(get(cfg.validation, "adapter_timeout_seconds", 3600.0))
+    cmd = `sbatch --parsable -c 4 -t 01:00:00 --mem=20G --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir) $timeout_seconds`
     last_err = nothing
     for attempt in 1:5
         try
@@ -4115,6 +4166,8 @@ function run_stage(
                 poll=10.0,
                 min_completion_fraction=cfg.objective.min_completion_fraction,
                 finish_iter_delay=cfg.objective.finish_iter_delay,
+                max_wait=Float64(get(cfg.validation, "iteration_timeout_seconds",
+                                     get(cfg.validation, "adapter_timeout_seconds", 3600.0) + 300.0)),
             )
             @info "Iteration wait result" stage=stage.name iteration=iter jobid=jobid completed_count=wait_result["done"] failed_count=wait_result["failed"] pending_count=wait_result["pending_count"] threshold_reached=wait_result["threshold_reached"] iteration_truncated=wait_result["iteration_truncated"]
             if get(wait_result, "iteration_truncated", false)
@@ -4840,9 +4893,11 @@ end
 
 function main()
     use_slurm = "--slurm" in ARGS
-    config_args = filter(arg -> arg != "--slurm", ARGS)
+    preflight_only = "--preflight" in ARGS || "--no-launch" in ARGS
+    config_args = filter(arg -> !(arg in ("--slurm", "--preflight", "--no-launch")), ARGS)
     config_path = length(config_args) >= 1 ? config_args[1] : joinpath(dirname(@__DIR__), "optimizer_config.json")
-    result = run_optimizer(config_path; use_slurm=use_slurm)
+    result = preflight_only ? preflight_config(config_path; readiness=true) :
+             run_optimizer(config_path; use_slurm=use_slurm)
     println(JSON.json(result))
 end
 

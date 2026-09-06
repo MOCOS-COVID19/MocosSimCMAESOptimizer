@@ -1,0 +1,29 @@
+{
+  "schema_version": "production-smoke-v1",
+  "status": "passed",
+  "execution_mode": "local",
+  "optimizer_commit": "<40-character Git commit>",
+  "launcher_commit": "<40-character Git commit>",
+  "environment": {
+    "julia_version": "1.7.x",
+    "kernel": "Linux",
+    "architecture": "x86_64",
+    "cpu_threads": 4,
+    "active_project": "/path/to/Project.toml",
+    "working_directory": "/path/to/MocosSimCMAESOptimizer"
+  },
+  "input_identities": {
+    "config": {"path": "/path/to/optimizer_config.saxony.smoke.json", "sha256": "<sha256>"},
+    "seed_config": {"path": "/path/to/seed.json", "sha256": "<sha256>"},
+    "population": {"path": "/path/to/population.jld2", "sha256": "<sha256>"},
+    "covimod": {"path": "/path/to/covimod.jld2", "sha256": "<sha256>"},
+    "immunity_events": {"path": "/path/to/events.jld2", "sha256": "<sha256>"}
+  },
+  "rng": {"optimizer_seed": 42, "validation_seeds": []},
+  "stage": {"name": "production_smoke_3m", "fit_months": 3, "iterations": 1, "population_size": 2},
+  "commands": [["/path/to/julia", "--project=/path/to/launcher", "..."], ["/path/to/julia", "--project=/path/to/launcher", "..."]],
+  "candidates": [
+    {"candidate": 1, "status": {"status": "completed"}, "adapter_invocation": {"timeout_seconds": 900, "timed_out": false, "exit_code": 0, "success": true}, "output_validation": {"valid": true, "minimum_days": 90, "trajectory_count": 1, "required_metrics": ["daily_detections", "daily_deaths", "daily_hospitalizations"]}},
+    {"candidate": 2, "status": {"status": "completed"}, "adapter_invocation": {"timeout_seconds": 900, "timed_out": false, "exit_code": 0, "success": true}, "output_validation": {"valid": true, "minimum_days": 90, "trajectory_count": 1, "required_metrics": ["daily_detections", "daily_deaths", "daily_hospitalizations"]}}
+  ]
+}
