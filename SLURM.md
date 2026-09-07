@@ -1,29 +1,51 @@
 # Slurm: parallel candidate scoring for CMA-ES
 
-This repo’s CMA-ES can score candidates using real simulations. To parallelize scoring on Slurm:
+The recommended first production run is the 344-candidate (5.39%) profile in
+`optimizer_config.saxony.12m-pilot.json`. Complete the real local and Slurm smoke
+checks in `docs/production-baseline.md` before starting it. This profile stops at
+12 months, uses 9 months as an intermediate transfer stage, limits both longer
+stages to 24 candidates per generation, and leaves the 18/24/30-month stages
+outside the initial budget.
 
-## 1) Prepare candidates per iteration
-The optimizer writes configs under `runs/default/real_sims/<stage>/iter_<k>/cand_<i>/config.json`. If you generate them yourself, follow the same layout.
+## Required environment
 
-## 2) Single-submit flow (recommended)
+All paths must be absolute and visible with the same names on the controller and
+compute nodes:
 
-Run the thin wrapper; it calls `run_optimizer.jl --slurm`, which internally submits per-iteration arrays and waits:
 ```bash
-sbatch scripts/run_cmaes.slurm
+export JULIA_BIN=/path/to/julia
+export MOCOSSIM_LAUNCHER_DIR=/path/to/MocosSimLauncher
+export MOCOSSIM_ADVANCED_CLI="$MOCOSSIM_LAUNCHER_DIR/advanced_cli.jl"
+export MOCOSSIM_SEED_CONFIG=/path/to/saxony-seed.json
 ```
 
-Manual invocation on a Slurm node:
+## Submit the budgeted profile
+
 ```bash
-/home/mbodych/1.7.0-school_class/julia-1.7.0/bin/julia --project=. run_optimizer.jl --slurm
+sbatch scripts/run_cmaes.slurm optimizer_config.saxony.12m-pilot.json
 ```
 
-## 3) How array dispatch works (inside `run_optimizer.jl --slurm`)
-- For each iteration, candidates are written to `runs/default/real_sims/<stage>/iter_<k>/cand_##/config.json`.
-- A `candidate_list.txt` is created for that iteration.
-- A Slurm array is submitted via `scripts/score_candidates.sh <candidate_list.txt> <julia_bin> <project_dir> <advanced_cli.jl> <gt_dir>`.
-- The optimizer waits for the array to finish (polls `squeue`) before scoring and proceeding to the next iteration.
-- Each array task runs the sim (`advanced_cli.jl`), writes `output_daily.jld2`/`summary.jld2`, and generates `gt_vs_sim.png` in the candidate dir.
+The config argument is optional; the wrapper defaults to the 12-month pilot
+profile. It resolves the repository from its own location, instantiates both
+Julia environments, runs the no-launch preflight, and only then starts the
+optimizer controller. Do not reuse an output directory from a smoke or another
+scientific run.
 
-## 4) Helpers
-- `scripts/score_candidates.sh`: runs one candidate (sim + plot); accepts either a root dir or a candidate list file; used by the optimizer’s array dispatch.
-- Plots are written per candidate; you can collect them from `runs/default/real_sims/**/gt_vs_sim.png` (the wrapper also copies them into `runs/default/plots/candidates/` if desired).
+## Array dispatch
+
+For every iteration the controller writes candidate directories and a
+`candidate_list.txt`, submits one array task per candidate, and waits for
+terminal artifacts. Each task calls `scripts/score_candidates.sh` with the Julia
+binary, launcher project, `advanced_cli.jl`, ground truth directory, and adapter
+timeout from the selected optimizer config.
+
+Array resources are currently fixed in `submit_slurm_array` at 4 CPUs, 20 GB,
+and 75 minutes, with an adapter deadline of 55 minutes in the pilot profile.
+Confirm from smoke accounting that these limits fit the 12-month horizon before
+starting the pilot. The controller itself requests one CPU.
+
+The launcher and optimizer environments are instantiated once in the controller
+wrapper. Array tasks do not run `Pkg.instantiate` and do not mutate a shared
+Python virtual environment. Per-candidate plots are opt-in with
+`MOCOSSIM_PLOT_CANDIDATES=1`; install their Python dependencies before submission
+if plots are required.
