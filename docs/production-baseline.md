@@ -92,20 +92,30 @@ extra simulator budget.
 ### Why the individual metric weights are zero
 
 The pilot uses one coherent **joint weekly Negative-Binomial loss** for candidate
-ranking. Its configured likelihood dimensions are detections, deaths, and
-hospitalizations; each weekly observation from those three streams contributes
-once, using fixed dispersion values of 25, 10, and 15 respectively. The stored
+ranking. Its configured likelihood dimensions are detections and deaths; each
+weekly observation from those two streams contributes once, using explicit
+dispersion values of 25 and 10 respectively. Hospitalizations remain required as
+an output-integrity and diagnostic stream, but do not rank candidates because
+their nominal comparability is weaker. The stored
 `negative_binomial_log_likelihood` metric is the negative of that joint log
 likelihood, so minimizing it is equivalent to maximizing the probability of the
 observed counts under the model.
+
+In the mean/dispersion parameterization used here, a count with predicted mean
+`mu` and dispersion `r` has variance `mu + mu^2/r`. A larger `r` therefore means
+less assumed extra-Poisson noise and makes a discrepancy more informative; it is
+not a direct percentage importance weight. Thus `r=25` says detections are
+assumed less overdispersed than deaths at `r=10`. Deaths still contribute every
+week, but the model tolerates more relative count variability in that stream.
+These values are auditable pilot assumptions, not fitted truths.
 
 The individual daily, cumulative, blocked-cumulative, and `weekly_control`
 weights are zero because those values are retained as diagnostics. Giving them
 positive weights as well would count the same observations multiple times in
 incompatible units: once through the count likelihood, again through relative
-errors, and again through cumulative errors. `daily_student_detections` is also
-excluded from the ranking because it is sparse and is not one of the three
-declared required likelihood streams. It remains available for reporting.
+errors, and again through cumulative errors. Hospitalizations are excluded due
+to weaker nominal comparability, while `daily_student_detections` is excluded
+because it is sparse. Both remain available for reporting.
 
 The two nonzero values outside the likelihood are regularizers, not additional
 observation fits: `temporal_jump_weight = 0.5` discourages jagged adjacent monthly
@@ -118,8 +128,10 @@ negative weekly NB log likelihood
   + 0.1 × infection extrema penalty
 ```
 
-The explicit `validation.likelihood_metrics` list prevents optional age or
-student series present in `gt/` from silently entering the joint likelihood.
+The explicit `validation.likelihood_metrics` and `likelihood_dispersions`
+objects prevent hospitalization, optional age, or student series present in
+`gt/` from silently entering the joint likelihood and make its noise assumptions
+visible in the experiment configuration.
 
 After the local and Slurm smoke checks below pass, submit the budgeted profile:
 

@@ -29,7 +29,9 @@ const CONFIG = joinpath(REPO, "optimizer_config.saxony.12m-pilot.json")
     @test config["validation"]["iteration_timeout_seconds"] == 14400
     @test config["validation"]["current_minimum_archive_size"] == 5
     @test config["validation"]["likelihood_metrics"] ==
-        ["daily_detections", "daily_deaths", "daily_hospitalizations"]
+        ["daily_detections", "daily_deaths"]
+    @test config["validation"]["likelihood_dispersions"] ==
+        Dict("daily_detections" => 25.0, "daily_deaths" => 10.0)
     @test all(entry["mode"] == "normalize_to_bounds" for
               entry in values(config["scalar_preprocessing"]))
 
@@ -63,14 +65,22 @@ end
     ground_truth = Dict(metric => fill(1.0, 14) for metric in
         ("daily_detections", "daily_deaths", "daily_hospitalizations",
          "daily_student_detections"))
-    selected = ["daily_detections", "daily_deaths", "daily_hospitalizations"]
+    selected = ["daily_detections", "daily_deaths"]
     payload = O.vector_likelihood_payload(daily, ground_truth, 14;
-        family="negative_binomial_weekly", metric_names=selected)
+        family="negative_binomial_weekly", metric_names=selected,
+        dispersions=Dict("daily_detections" => 25.0, "daily_deaths" => 10.0))
     @test Set(row["metric"] for row in payload["dimensions"]) == Set(selected)
-    @test length(payload["dimensions"]) == 6
+    @test length(payload["dimensions"]) == 4
+    @test Set(row["dispersion"] for row in payload["dimensions"]
+              if row["metric"] == "daily_detections") == Set([25.0])
+    @test Set(row["dispersion"] for row in payload["dimensions"]
+              if row["metric"] == "daily_deaths") == Set([10.0])
     @test_throws ArgumentError O.vector_likelihood_payload(
         daily, ground_truth, 14; family="negative_binomial_weekly",
         metric_names=["misspelled_metric"])
+    @test_throws ArgumentError O.vector_likelihood_payload(
+        daily, ground_truth, 14; family="negative_binomial_weekly",
+        metric_names=["daily_deaths"], dispersions=Dict("daily_deaths" => 0.0))
 end
 
 @testset "completion threshold is loaded from config" begin

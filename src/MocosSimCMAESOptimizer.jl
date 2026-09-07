@@ -3114,6 +3114,7 @@ function vector_likelihood_payload(
     days::Int;
     family::String="diagonal_gaussian_weekly",
     metric_names::Union{Nothing,AbstractVector}=nothing,
+    dispersions::AbstractDict=Dict{String,Float64}(),
 )
     family in ("diagonal_gaussian_weekly", "negative_binomial_weekly") ||
         error("Unsupported vector likelihood family: $family")
@@ -3138,8 +3139,11 @@ function vector_likelihood_payload(
             residual = prediction - observation
             scale = max(abs(observation), 1.0)
             standardized_residual = residual / scale
-            dispersion = metric == "daily_deaths" ? 10.0 :
-                         metric == "daily_hospitalizations" ? 15.0 : 25.0
+            default_dispersion = metric == "daily_deaths" ? 10.0 :
+                                 metric == "daily_hospitalizations" ? 15.0 : 25.0
+            dispersion = Float64(get(dispersions, metric, default_dispersion))
+            isfinite(dispersion) && dispersion > 0 || throw(ArgumentError(
+                "likelihood dispersion for $metric must be positive and finite"))
             contribution = if family == "negative_binomial_weekly"
                 negative_binomial_loglikelihood(
                     round(Int, max(observation, 0.0)), max(prediction, 0.0), dispersion)
@@ -3180,6 +3184,20 @@ function likelihood_metric_names(cfg::OptimizerConfig)
     return names
 end
 
+function likelihood_dispersions(cfg::OptimizerConfig)
+    configured = get(cfg.validation, "likelihood_dispersions", Dict{String,Any}())
+    configured isa AbstractDict || throw(ArgumentError(
+        "validation.likelihood_dispersions must be an object"))
+    result = Dict{String,Float64}()
+    for (metric, value) in configured
+        dispersion = Float64(value)
+        isfinite(dispersion) && dispersion > 0 || throw(ArgumentError(
+            "validation.likelihood_dispersions.$metric must be positive and finite"))
+        result[String(metric)] = dispersion
+    end
+    return result
+end
+
 const OBJECTIVE_METRIC_DEFAULTS = Dict(
     "daily_detections" => 1.0,
     "daily_hospitalizations" => 0.0,
@@ -3217,7 +3235,8 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     training_days = Int(windows["train"]["end_day"])
     weekly_control = weekly_control_score(cfg, daily_path, gt, training_days)
     vector_likelihood = vector_likelihood_payload(daily_path, gt, training_days;
-        family=cfg.posterior.likelihood, metric_names=likelihood_metric_names(cfg))
+        family=cfg.posterior.likelihood, metric_names=likelihood_metric_names(cfg),
+        dispersions=likelihood_dispersions(cfg))
     # Validation carries structured diagnostics (window, retained indices,
     # and per-metric scores), so keep the score manifest heterogeneous.
     metrics = Dict{String,Any}()
@@ -3248,7 +3267,8 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int, c
     training_days = Int(windows["train"]["end_day"])
     weekly_control = weekly_control_score(cfg, daily_path, gt, training_days)
     vector_likelihood = vector_likelihood_payload(daily_path, gt, training_days;
-        family=cfg.posterior.likelihood, metric_names=likelihood_metric_names(cfg))
+        family=cfg.posterior.likelihood, metric_names=likelihood_metric_names(cfg),
+        dispersions=likelihood_dispersions(cfg))
     # The validation window is a structured diagnostic, not a scalar metric.
     # A heterogeneous payload prevents assigning it to a Float64-only dict.
     metrics = Dict{String,Any}()
@@ -3626,6 +3646,7 @@ function score_candidate(candidate::Dict{String,Any}, cfg::OptimizerConfig, days
                 daily_path, load_gt_series(cfg.external_sim.gt_dir), days;
                 family=cfg.posterior.likelihood,
                 metric_names=likelihood_metric_names(cfg),
+                dispersions=likelihood_dispersions(cfg),
             )
             result["weekly_absolute_errors"] = weekly_absolute_errors
             result["weekly_normalized_absolute_errors"] = weekly_normalized_absolute_errors
@@ -4241,7 +4262,8 @@ function run_stage(
                     household = household_readout(daily_path, days)
                     vector_likelihood = vector_likelihood_payload(
                         daily_path, gt, days; family=cfg.posterior.likelihood,
-                        metric_names=likelihood_metric_names(cfg)
+                        metric_names=likelihood_metric_names(cfg),
+                        dispersions=likelihood_dispersions(cfg)
                     )
                     for (metric, gtvals) in gt
                         weekly_errors = weekly_error_distributions(daily_path, metric, gtvals, days)

@@ -4,9 +4,12 @@
     "enabled": true,
     "likelihood_metrics": [
       "daily_detections",
-      "daily_deaths",
-      "daily_hospitalizations"
+      "daily_deaths"
     ],
+    "likelihood_dispersions": {
+      "daily_detections": 25.0,
+      "daily_deaths": 10.0
+    },
     "stage_validation_days": 28,
     "validation_days": 56,
     "test_days": 84,
