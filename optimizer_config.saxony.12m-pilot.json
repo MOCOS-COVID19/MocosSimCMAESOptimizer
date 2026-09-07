@@ -1,0 +1,172 @@
+{
+  "temporal_parameterization": "monthly",
+  "validation": {
+    "enabled": true,
+    "likelihood_metrics": [
+      "daily_detections",
+      "daily_deaths"
+    ],
+    "likelihood_dispersions": {
+      "daily_detections": 25.0,
+      "daily_deaths": 10.0
+    },
+    "stage_validation_days": 28,
+    "validation_days": 56,
+    "test_days": 84,
+    "train_end_day": 760,
+    "validation_start_day": 761,
+    "validation_end_day": 816,
+    "test_start_day": 817,
+    "test_end_day": 900,
+    "frozen_test": true,
+    "adapter_timeout_seconds": 3300,
+    "iteration_timeout_seconds": 14400,
+    "current_quality_band": {
+      "threshold": 1000000.0
+    },
+    "current_minimum_archive_size": 5,
+    "current_diversity_passed": true,
+    "allow_quality_band_reduction": true,
+    "seeds": [
+      42,
+      43,
+      44
+    ]
+  },
+  "seed_config": "${MOCOSSIM_SEED_CONFIG}",
+  "output_dir": "./runs/saxony-12m-pilot",
+  "monthly_days": 30,
+  "stages": [
+    {
+      "name": "horizon_3m",
+      "fit_months": 3,
+      "max_iterations": 4,
+      "population_size": 16,
+      "sigma": 0.12
+    },
+    {
+      "name": "horizon_6m",
+      "fit_months": 6,
+      "max_iterations": 4,
+      "population_size": 16,
+      "sigma": 0.12
+    },
+    {
+      "name": "horizon_9m",
+      "fit_months": 9,
+      "max_iterations": 4,
+      "population_size": 24,
+      "sigma": 0.12
+    },
+    {
+      "name": "horizon_12m",
+      "fit_months": 12,
+      "max_iterations": 5,
+      "population_size": 24,
+      "sigma": 0.12
+    }
+  ],
+  "scalar_bounds": {
+    "transmission_probabilities.school": [
+      0.05,
+      0.3
+    ],
+    "transmission_probabilities.class": [
+      0.1,
+      0.4
+    ],
+    "transmission_probabilities.age_coupling_param": [
+      0.59,
+      0.62
+    ]
+  },
+  "scalar_preprocessing": {
+    "transmission_probabilities.school": {
+      "mode": "normalize_to_bounds",
+      "min": 0.05,
+      "max": 0.3
+    },
+    "transmission_probabilities.class": {
+      "mode": "normalize_to_bounds",
+      "min": 0.1,
+      "max": 0.4
+    },
+    "transmission_probabilities.age_coupling_param": {
+      "mode": "normalize_to_bounds",
+      "min": 0.59,
+      "max": 0.62
+    }
+  },
+  "temporal_bounds": {
+    "infection_modulation.params.interval_values": [
+      0.0,
+      1.0
+    ],
+    "mild_detection_modulation.params.interval_values": [
+      0.0,
+      1.0
+    ],
+    "tracing_modulation.params.interval_values": [
+      0.0,
+      1.0
+    ]
+  },
+  "objective": {
+    "weights": {
+      "daily_detections": 0.0,
+      "daily_hospitalizations": 0.0,
+      "daily_deaths": 0.0,
+      "daily_student_detections": 0.0,
+      "daily_detections_cumulative": 0.0,
+      "daily_detections_cumulative_blocked": 0.0,
+      "daily_hospitalizations_cumulative": 0.0,
+      "daily_deaths_cumulative": 0.0,
+      "daily_deaths_cumulative_blocked": 0.0,
+      "daily_student_detections_cumulative": 0.0,
+      "weekly_control": 0.0,
+      "negative_binomial_log_likelihood": 1.0
+    },
+    "top_k": 5,
+    "min_completion_fraction": 1.0,
+    "finish_iter_delay": 0,
+    "temporal_jump_weight": 0.5,
+    "infection_extrema_weight": 0.1
+  },
+  "age_population_weights": {
+    "00_04": 0.043326963479,
+    "05_14": 0.092000943853,
+    "15_34": 0.191816378028,
+    "35_59": 0.33185415194,
+    "60_79": 0.248931116037,
+    "80_plus": 0.092070446663
+  },
+  "posterior": {
+    "enabled": false,
+    "likelihood": "negative_binomial_weekly",
+    "draws": 500,
+    "warmup": 250,
+    "max_depth": 8,
+    "step_size": 0.05,
+    "temperature": 1.0,
+    "transfer_covariance_inflation": 1.75,
+    "transfer_sigma_multiplier": 1.25,
+    "new_dimension_variance": 2.0,
+    "immigrant_fraction": 0.2
+  },
+  "gt_dir": "./gt",
+  "disable_compiled_modules": true,
+  "julia_bin": "${JULIA_BIN}",
+  "project_dir": "${MOCOSSIM_LAUNCHER_DIR}",
+  "advanced_cli": "${MOCOSSIM_ADVANCED_CLI}",
+  "data_protocol": {
+    "day_one": "2020-09-03",
+    "study_end_day": 900,
+    "required_metrics": [
+      "daily_detections",
+      "daily_deaths",
+      "daily_hospitalizations"
+    ],
+    "day_one_status": "provisional-confirm-against-source-metadata",
+    "timezone": "Europe/Berlin"
+  }
+}

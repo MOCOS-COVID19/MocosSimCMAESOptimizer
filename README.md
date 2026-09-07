@@ -28,7 +28,9 @@ The readiness fixture is intentionally no-launch: it must not invoke `advanced_c
 
 ## Configuration and local runs
 
-`pipeline_config.json` describes the staged pipeline; `optimizer_config.json` configures a direct optimizer run. Dependencies can be installed with:
+`pipeline_config.json` describes the staged pipeline; `optimizer_config.json` configures a direct optimizer run.
+
+Install the local dependencies before running either entry point:
 
 ```sh
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
@@ -41,6 +43,21 @@ julia --project=. run_optimizer.jl [path/to/optimizer_config.json]
 ```
 
 Results are written below the configured output directory. Do not interpret a fixture run as evidence of simulator validity.
+
+## Dynamic calibration roadmap
+
+For a detailed repository audit and prioritized implementation plan for
+automatic, dynamic calibration of the Saxony 2020--2022 data, including the
+P0--P2 gaps, target architecture, milestones, acceptance criteria, and backlog,
+see [`docs/dynamic-calibration-roadmap.md`](docs/dynamic-calibration-roadmap.md).
+
+Implementation of its first five backlog items has started with a portable
+Saxony profile, canonical data-quality protocol, leakage-resistant temporal
+split, Negative-Binomial observation likelihood, and full 3–30 month stage
+sequence. See [`docs/production-baseline.md`](docs/production-baseline.md) for
+required external inputs and the no-launch preflight procedure.
+The same guide documents the bounded two-candidate production smoke test,
+provenance manifest, and local/Slurm parity check.
 
 ## Explicitly deferred
 

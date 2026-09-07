@@ -5,7 +5,8 @@ const ADAPTER_FAILURE_CLASSES = (
 
 function _preflight_path(base::String, value, field::String)
     value isa AbstractString || throw(ArgumentError("$field must be a path string"))
-    p = isabspath(String(value)) ? String(value) : normpath(joinpath(base, String(value)))
+    expanded = _expand_environment_variables(value, field)
+    p = isabspath(expanded) ? expanded : normpath(joinpath(base, expanded))
     ispath(p) || throw(ArgumentError("$field does not exist: $p"))
     return p
 end
@@ -48,7 +49,8 @@ function _read_named_gt_csv(path::String)
     isempty(lines) && throw(ArgumentError("ground_truth.$(basename(path)) has no header"))
     header = lowercase.(strip.(split(lines[1], ',')))
     day_idx = findfirst(==("day"), header)
-    value_idx = findfirst(x -> x in ("value", "observed", "observations"), header)
+    value_idx = findfirst(x -> x in ("value", "observed", "observations",
+                                     "7t_hospitalisierung_faelle"), header)
     (day_idx !== nothing && value_idx !== nothing) ||
         throw(ArgumentError("ground_truth.$(basename(path)) has invalid day/value header"))
     rows = Tuple{Int,Float64}[]
@@ -63,6 +65,8 @@ function _read_named_gt_csv(path::String)
             throw(ArgumentError("ground_truth.$(basename(path)) invalid value at row $line_number"))
         end
         isfinite(value) || throw(ArgumentError("ground_truth.$(basename(path)) non-finite value at row $line_number"))
+        (value >= 0 || value == -1) || throw(ArgumentError(
+            "ground_truth.$(basename(path)) negative value at row $line_number"))
         push!(rows, (day, value))
     end
     isempty(rows) && throw(ArgumentError("ground_truth.$(basename(path)) has no parseable observations"))
@@ -339,6 +343,40 @@ function preflight_config(path::String; readiness::Bool=false)
         isdir(gt_dir) || throw(ArgumentError("gt_dir must be a directory"))
         paths["ground_truth"] = gt_dir
         gt_manifest = _validate_gt_dir(gt_dir)
+        if haskey(raw, "data_protocol")
+            protocol = raw["data_protocol"]
+            protocol isa AbstractDict || throw(ArgumentError("data_protocol must be an object"))
+            haskey(protocol, "day_one") || throw(ArgumentError("data_protocol.day_one is required"))
+            day_one = try Date(String(protocol["day_one"])) catch
+                throw(ArgumentError("data_protocol.day_one must use YYYY-MM-DD"))
+            end
+            required = String.(get(protocol, "required_metrics", [
+                "daily_detections", "daily_deaths", "daily_hospitalizations"]))
+            requested_end = haskey(protocol, "study_end_day") ? Int(protocol["study_end_day"]) : nothing
+            canonical = canonical_data_protocol(gt_dir, day_one;
+                required_metrics=required, study_end_day=requested_end)
+            validation = get(raw, "validation", Dict{String,Any}())
+            split = temporal_data_split(Int(canonical["study_end_day"]);
+                validation_days=Int(get(validation, "validation_days", 56)),
+                test_days=Int(get(validation, "test_days", 84)))
+            canonical["split"] = split
+            expected = Dict(
+                "train_end_day" => split["train"]["end_day"],
+                "validation_start_day" => split["validation"]["start_day"],
+                "validation_end_day" => split["validation"]["end_day"],
+                "test_start_day" => split["test"]["start_day"],
+                "test_end_day" => split["test"]["end_day"])
+            for (field, value) in expected
+                haskey(validation, field) && Int(validation[field]) != value &&
+                    throw(ArgumentError("validation.$field disagrees with the data protocol"))
+                validation[field] = value
+            end
+            canonical["stage_splits"] = Dict(
+                String(stage["name"]) => stage_data_split(
+                    Int(stage["fit_months"]) * monthly_days, validation)
+                for stage in stages)
+            gt_manifest["data_protocol"] = canonical
+        end
     else
         gt_manifest = Dict{String,Any}()
     end
@@ -353,8 +391,8 @@ function preflight_config(path::String; readiness::Bool=false)
     isfinite(total) && total > 0 || throw(ArgumentError("age_population_weights must have positive mass"))
     for field in ("output_dir",)
         haskey(raw, field) || throw(ArgumentError("missing path: $field"))
-        paths[field] = isabspath(String(raw[field])) ? String(raw[field]) :
-                       normpath(joinpath(base, String(raw[field])))
+        value = _expand_environment_variables(String(raw[field]), field)
+        paths[field] = isabspath(value) ? value : normpath(joinpath(base, value))
     end
     Dict{String,Any}(
         "valid"=>true, "config_path"=>config_path, "config_directory"=>base,
