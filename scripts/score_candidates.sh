@@ -51,19 +51,19 @@ FAILED_OK="$CAND_DIR/failed.ok"
 
 rm -f "$DONE_OK" "$FAILED_OK"
 
+if [ -z "$CAND_DIR" ] || [ ! -s "$CFG" ]; then
+  echo "[ERROR] Missing candidate config: $CFG" >&2
+  if [ -n "$CAND_DIR" ]; then
+    mkdir -p "$CAND_DIR"
+    touch "$FAILED_OK"
+  fi
+  exit 2
+fi
+
 echo "[$(date)] candidate=$CAND_DIR"
 
 export JULIA_PKG_PRECOMPILE_AUTO=0
 export JULIA_NUM_PRECOMPILE_TASKS=1
-
-echo "[$(date)] Instantiating MocosSimLauncher for this task (without auto-precompile)"
-"$JULIA_BIN" --project="$PROJECT_DIR" -e 'using Pkg; Pkg.instantiate(; allow_autoprecomp=false)'
-
-echo "[$(date)] Preparing uv environment for plotting"
-if command -v uv >/dev/null 2>&1; then
-  uv venv .venv >/dev/null 2>&1 || true
-  uv pip install matplotlib numpy h5py >/dev/null 2>&1 || true
-fi
 
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 COMMAND=("$JULIA_BIN" "--project=$PROJECT_DIR" "--compiled-modules=no" "--threads=4"
@@ -100,14 +100,14 @@ if [ "$EXIT_CODE" -ne 0 ]; then
   exit "$EXIT_CODE"
 fi
 
+if [ ! -s "$OUT_DAILY" ]; then
+  echo "[ERROR] Adapter succeeded but did not write $OUT_DAILY" >&2
+  touch "$FAILED_OK"
+  exit 3
+fi
+
 # Optional plotting per candidate (non-fatal on failure)
-if command -v uv >/dev/null 2>&1; then
-  uv run -- python drawing-utilities/plot_gt_vs_sim.py \
-    --output-dir "$CAND_DIR" \
-    --gt-dir "$GT_DIR" \
-    --daily "$OUT_DAILY" \
-    --out "$CAND_DIR/gt_vs_sim.png" || true
-else
+if [ "${MOCOSSIM_PLOT_CANDIDATES:-0}" = "1" ]; then
   python3 drawing-utilities/plot_gt_vs_sim.py \
     --output-dir "$CAND_DIR" \
     --gt-dir "$GT_DIR" \

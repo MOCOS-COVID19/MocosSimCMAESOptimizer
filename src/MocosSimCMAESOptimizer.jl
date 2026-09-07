@@ -1842,7 +1842,7 @@ function load_config(path::String)
     objective = ObjectiveConfig(
         Dict(k => float(v) for (k, v) in raw["objective"]["weights"]),
         Int(get(raw["objective"], "top_k", 1)),
-        0.9,
+        float(get(raw["objective"], "min_completion_fraction", 0.9)),
         Int(get(raw["objective"], "finish_iter_delay", 30)),
         String(get(raw["objective"], "search_policy", "baseline")),
         float(get(raw["objective"], "temporal_jump_weight", 0.2)),
@@ -3542,7 +3542,7 @@ function submit_slurm_array(cfg::OptimizerConfig, list_file::String)
     n = length(lines)
     n == 0 && return ""
     timeout_seconds = Float64(get(cfg.validation, "adapter_timeout_seconds", 3600.0))
-    cmd = `sbatch --parsable -c 4 -t 01:00:00 --mem=20G --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir) $timeout_seconds`
+    cmd = `sbatch --parsable -c 4 -t 01:15:00 --mem=20G --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir) $timeout_seconds`
     last_err = nothing
     for attempt in 1:5
         try
