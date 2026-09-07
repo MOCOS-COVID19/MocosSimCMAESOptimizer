@@ -89,6 +89,38 @@ on score/validation trends, failure rate, bound hits, and stability across the
 three final seeds. Increase iterations only after those artifacts justify the
 extra simulator budget.
 
+### Why the individual metric weights are zero
+
+The pilot uses one coherent **joint weekly Negative-Binomial loss** for candidate
+ranking. Its configured likelihood dimensions are detections, deaths, and
+hospitalizations; each weekly observation from those three streams contributes
+once, using fixed dispersion values of 25, 10, and 15 respectively. The stored
+`negative_binomial_log_likelihood` metric is the negative of that joint log
+likelihood, so minimizing it is equivalent to maximizing the probability of the
+observed counts under the model.
+
+The individual daily, cumulative, blocked-cumulative, and `weekly_control`
+weights are zero because those values are retained as diagnostics. Giving them
+positive weights as well would count the same observations multiple times in
+incompatible units: once through the count likelihood, again through relative
+errors, and again through cumulative errors. `daily_student_detections` is also
+excluded from the ranking because it is sparse and is not one of the three
+declared required likelihood streams. It remains available for reporting.
+
+The two nonzero values outside the likelihood are regularizers, not additional
+observation fits: `temporal_jump_weight = 0.5` discourages jagged adjacent monthly
+modulations, and `infection_extrema_weight = 0.1` weakly discourages excessive
+direction changes and boundary hits. Thus the effective objective is:
+
+```text
+negative weekly NB log likelihood
+  + 0.5 × temporal jump penalty
+  + 0.1 × infection extrema penalty
+```
+
+The explicit `validation.likelihood_metrics` list prevents optional age or
+student series present in `gt/` from silently entering the joint likelihood.
+
 After the local and Slurm smoke checks below pass, submit the budgeted profile:
 
 ```sh

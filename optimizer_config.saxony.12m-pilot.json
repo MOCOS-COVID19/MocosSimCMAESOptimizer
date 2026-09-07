@@ -2,6 +2,11 @@
   "temporal_parameterization": "monthly",
   "validation": {
     "enabled": true,
+    "likelihood_metrics": [
+      "daily_detections",
+      "daily_deaths",
+      "daily_hospitalizations"
+    ],
     "stage_validation_days": 28,
     "validation_days": 56,
     "test_days": 84,

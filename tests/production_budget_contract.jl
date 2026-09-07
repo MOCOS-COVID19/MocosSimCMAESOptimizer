@@ -1,5 +1,6 @@
 using Test
 using JSON
+using HDF5
 
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
 using MocosSimCMAESOptimizer
@@ -27,6 +28,8 @@ const CONFIG = joinpath(REPO, "optimizer_config.saxony.12m-pilot.json")
     @test config["validation"]["adapter_timeout_seconds"] == 3300
     @test config["validation"]["iteration_timeout_seconds"] == 14400
     @test config["validation"]["current_minimum_archive_size"] == 5
+    @test config["validation"]["likelihood_metrics"] ==
+        ["daily_detections", "daily_deaths", "daily_hospitalizations"]
     @test all(entry["mode"] == "normalize_to_bounds" for
               entry in values(config["scalar_preprocessing"]))
 
@@ -45,6 +48,29 @@ const CONFIG = joinpath(REPO, "optimizer_config.saxony.12m-pilot.json")
     @test !occursin("uv pip install", array_helper)
     @test occursin("MOCOSSIM_PLOT_CANDIDATES", array_helper)
     @test occursin("Adapter succeeded but did not write", array_helper)
+end
+
+@testset "joint likelihood uses only declared metrics" begin
+    root = mktempdir()
+    daily = joinpath(root, "daily.jld2")
+    h5open(daily, "w") do file
+        trajectory = create_group(file, "trajectory_1")
+        for metric in ("daily_detections", "daily_deaths",
+                       "daily_hospitalizations", "daily_student_detections")
+            write(trajectory, metric, ones(14))
+        end
+    end
+    ground_truth = Dict(metric => fill(1.0, 14) for metric in
+        ("daily_detections", "daily_deaths", "daily_hospitalizations",
+         "daily_student_detections"))
+    selected = ["daily_detections", "daily_deaths", "daily_hospitalizations"]
+    payload = O.vector_likelihood_payload(daily, ground_truth, 14;
+        family="negative_binomial_weekly", metric_names=selected)
+    @test Set(row["metric"] for row in payload["dimensions"]) == Set(selected)
+    @test length(payload["dimensions"]) == 6
+    @test_throws ArgumentError O.vector_likelihood_payload(
+        daily, ground_truth, 14; family="negative_binomial_weekly",
+        metric_names=["misspelled_metric"])
 end
 
 @testset "completion threshold is loaded from config" begin
