@@ -1842,7 +1842,7 @@ function load_config(path::String)
     objective = ObjectiveConfig(
         Dict(k => float(v) for (k, v) in raw["objective"]["weights"]),
         Int(get(raw["objective"], "top_k", 1)),
-        0.9,
+        float(get(raw["objective"], "min_completion_fraction", 0.9)),
         Int(get(raw["objective"], "finish_iter_delay", 30)),
         String(get(raw["objective"], "search_policy", "baseline")),
         float(get(raw["objective"], "temporal_jump_weight", 0.2)),
@@ -3113,12 +3113,20 @@ function vector_likelihood_payload(
     gt::AbstractDict,
     days::Int;
     family::String="diagonal_gaussian_weekly",
+    metric_names::Union{Nothing,AbstractVector}=nothing,
 )
     family in ("diagonal_gaussian_weekly", "negative_binomial_weekly") ||
         error("Unsupported vector likelihood family: $family")
     dimensions = Any[]
     log_likelihood = 0.0
-    for metric in sort!(collect(keys(gt)))
+    selected_metrics = metric_names === nothing ? String.(collect(keys(gt))) :
+        unique(String.(metric_names))
+    missing_metrics = [metric for metric in selected_metrics if !haskey(gt, metric)]
+    isempty(missing_metrics) || throw(ArgumentError(
+        "likelihood metrics missing from ground truth: $(join(missing_metrics, ", "))"))
+    isempty(selected_metrics) && throw(ArgumentError(
+        "likelihood metric selection must not be empty"))
+    for metric in sort!(unique(selected_metrics))
         errors = weekly_error_distributions(daily_path, metric, gt[metric], days)
         periods = errors["periods"]
         observations = errors["observations"]
@@ -3161,6 +3169,17 @@ function vector_likelihood_payload(
     )
 end
 
+function likelihood_metric_names(cfg::OptimizerConfig)
+    configured = get(cfg.validation, "likelihood_metrics", [
+        "daily_detections", "daily_deaths", "daily_hospitalizations"])
+    configured isa AbstractVector || throw(ArgumentError(
+        "validation.likelihood_metrics must be an array"))
+    names = String.(configured)
+    isempty(names) && throw(ArgumentError(
+        "validation.likelihood_metrics must not be empty"))
+    return names
+end
+
 const OBJECTIVE_METRIC_DEFAULTS = Dict(
     "daily_detections" => 1.0,
     "daily_hospitalizations" => 0.0,
@@ -3197,7 +3216,8 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     windows = stage_data_split(days, cfg.validation)
     training_days = Int(windows["train"]["end_day"])
     weekly_control = weekly_control_score(cfg, daily_path, gt, training_days)
-    vector_likelihood = vector_likelihood_payload(daily_path, gt, training_days; family=cfg.posterior.likelihood)
+    vector_likelihood = vector_likelihood_payload(daily_path, gt, training_days;
+        family=cfg.posterior.likelihood, metric_names=likelihood_metric_names(cfg))
     # Validation carries structured diagnostics (window, retained indices,
     # and per-metric scores), so keep the score manifest heterogeneous.
     metrics = Dict{String,Any}()
@@ -3227,7 +3247,8 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int, c
     windows = stage_data_split(days, cfg.validation)
     training_days = Int(windows["train"]["end_day"])
     weekly_control = weekly_control_score(cfg, daily_path, gt, training_days)
-    vector_likelihood = vector_likelihood_payload(daily_path, gt, training_days; family=cfg.posterior.likelihood)
+    vector_likelihood = vector_likelihood_payload(daily_path, gt, training_days;
+        family=cfg.posterior.likelihood, metric_names=likelihood_metric_names(cfg))
     # The validation window is a structured diagnostic, not a scalar metric.
     # A heterogeneous payload prevents assigning it to a Float64-only dict.
     metrics = Dict{String,Any}()
@@ -3542,7 +3563,7 @@ function submit_slurm_array(cfg::OptimizerConfig, list_file::String)
     n = length(lines)
     n == 0 && return ""
     timeout_seconds = Float64(get(cfg.validation, "adapter_timeout_seconds", 3600.0))
-    cmd = `sbatch --parsable -c 4 -t 01:00:00 --mem=20G --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir) $timeout_seconds`
+    cmd = `sbatch --parsable -c 4 -t 01:15:00 --mem=20G --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir) $timeout_seconds`
     last_err = nothing
     for attempt in 1:5
         try
@@ -3603,7 +3624,8 @@ function score_candidate(candidate::Dict{String,Any}, cfg::OptimizerConfig, days
             end
             result["vector_likelihood"] = vector_likelihood_payload(
                 daily_path, load_gt_series(cfg.external_sim.gt_dir), days;
-                family=cfg.posterior.likelihood
+                family=cfg.posterior.likelihood,
+                metric_names=likelihood_metric_names(cfg),
             )
             result["weekly_absolute_errors"] = weekly_absolute_errors
             result["weekly_normalized_absolute_errors"] = weekly_normalized_absolute_errors
@@ -4218,7 +4240,8 @@ function run_stage(
                     weekly_predictions = Dict{String,Any}()
                     household = household_readout(daily_path, days)
                     vector_likelihood = vector_likelihood_payload(
-                        daily_path, gt, days; family=cfg.posterior.likelihood
+                        daily_path, gt, days; family=cfg.posterior.likelihood,
+                        metric_names=likelihood_metric_names(cfg)
                     )
                     for (metric, gtvals) in gt
                         weekly_errors = weekly_error_distributions(daily_path, metric, gtvals, days)
