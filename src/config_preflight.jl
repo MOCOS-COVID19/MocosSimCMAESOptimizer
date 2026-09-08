@@ -85,6 +85,37 @@ function _gt_validation_error(err)
     return Dict{String,Any}("code"=>code, "message"=>message)
 end
 
+function _read_sax_scholars_source(path::String)
+    lines = readlines(path)
+    isempty(lines) && throw(ArgumentError("ground_truth.$(basename(path)) has no header"))
+    header = lowercase.(strip.(split(lines[1], ';')))
+    header == ["calendar_week_date", "students_infected_weekly"] ||
+        throw(ArgumentError("ground_truth.$(basename(path)) has invalid source header"))
+    rows = Tuple{Date,Float64}[]
+    for (offset, line) in enumerate(lines[2:end])
+        line_number = offset + 1
+        parts = split(line, ';')
+        length(parts) == 2 || throw(ArgumentError(
+            "ground_truth.$(basename(path)) malformed row $line_number"))
+        date = try Date(strip(parts[1])) catch
+            throw(ArgumentError("ground_truth.$(basename(path)) invalid date at row $line_number"))
+        end
+        value = try parse(Float64, strip(parts[2])) catch
+            throw(ArgumentError("ground_truth.$(basename(path)) invalid value at row $line_number"))
+        end
+        isfinite(value) && value >= 0 || throw(ArgumentError(
+            "ground_truth.$(basename(path)) invalid value at row $line_number"))
+        push!(rows, (date, value))
+    end
+    isempty(rows) && throw(ArgumentError("ground_truth.$(basename(path)) has no observations"))
+    dates = first.(rows)
+    length(unique(dates)) == length(dates) || throw(ArgumentError(
+        "ground_truth.$(basename(path)) has duplicate dates"))
+    issorted(dates) || throw(ArgumentError(
+        "ground_truth.$(basename(path)) dates must be strictly increasing"))
+    return rows
+end
+
 function _validate_gt_dir(gt_dir::String)
     optional_files = Dict(
         "daily_student_detections" => "sax-scholars-infections-normalized.csv",
@@ -110,6 +141,22 @@ function _validate_gt_dir(gt_dir::String)
     for file in readdir(gt_dir)
         endswith(lowercase(file), ".csv") || continue
         path = joinpath(gt_dir, file)
+        if file == "sax-scholars-infections.csv"
+            source_rows = _read_sax_scholars_source(path)
+            normalized_path = joinpath(gt_dir, "sax-scholars-infections-normalized.csv")
+            normalized_matches = nothing
+            if isfile(normalized_path)
+                normalized_rows = _read_named_gt_csv(normalized_path)
+                normalized_matches = last.(source_rows) == last.(normalized_rows)
+                normalized_matches || throw(ArgumentError(
+                    "ground_truth.$file values differ from sax-scholars-infections-normalized.csv"))
+            end
+            csvs[file] = Dict("path"=>path, "observations"=>length(source_rows),
+                              "valid"=>true, "schema"=>"calendar_date_semicolon_source",
+                              "normalized_values_match"=>normalized_matches,
+                              "sha256"=>_path_hash(path))
+            continue
+        end
         # Optional inputs are represented in optional_fields below.  Their
         # presence must not turn a malformed optional metric into a required
         # preflight failure.
