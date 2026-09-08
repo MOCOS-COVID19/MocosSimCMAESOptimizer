@@ -10,6 +10,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from modulation_plot_utils import modulation_series
+
 
 def load_gt(path: Path, days: int) -> np.ndarray:
     values = np.zeros(days)
@@ -58,10 +60,9 @@ def main():
     modulation = config["infection_modulation"]["params"]
     detection = config["mild_detection_modulation"]["params"]
     tracing = config["tracing_modulation"]["params"]
-    bucket_days = modulation["interval_times"][:26]
-    infection = modulation["interval_values"][:26]
-    detection_values = detection["interval_values"][:26]
-    tracing_values = tracing["interval_values"][:26]
+    infection = modulation_series(modulation)
+    detection_values = modulation_series(detection)
+    tracing_values = modulation_series(tracing)
 
     with h5py.File(candidate_dir / "output_daily.jld2", "r") as handle:
         trajectories = [
@@ -77,7 +78,7 @@ def main():
     fig, axes = plt.subplots(
         4, 1, figsize=(12, 12), gridspec_kw={"height_ratios": [1, 1, 1, 2]}
     )
-    for axis, values, title, color in [
+    for axis, (bucket_days, values), title, color in [
         (axes[0], infection, "Best infection_modulation", "#1976d2"),
         (axes[1], detection_values, "Best mild_detection_modulation", "#43a047"),
         (axes[2], tracing_values, "Best tracing_modulation", "#8e44ad"),
