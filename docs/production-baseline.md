@@ -72,7 +72,7 @@ provide a first go/no-go signal, not by themselves to establish convergence.
 
 | Setting | Pilot value | Reason |
 |---|---:|---|
-| Initial `sigma` | `0.12` | This is the implementation's maximum effective coordinate step; larger configured values are clamped to `0.12` and are therefore misleading. |
+| Initial `sigma` | `0.12` | This is the implementation's maximum sigma component. With an identity covariance it is a 12%-of-range marginal standard deviation; after covariance learning or transfer, the actual coordinate deviation is `sigma[i] * sqrt(covariance[i,i])`. Larger configured values are clamped and are therefore misleading. |
 | Scalar preprocessing | normalized to `[0, 1]` | Puts the three scalar ranges on the same coordinate scale as the temporal modulation bounds, so one `sigma` has a consistent interpretation. |
 | Population | `16/16/24/24` | Exceeds the usual small CMA population heuristic for the active 12/21/30/39-dimensional stages while remaining affordable. |
 | Iterations | `4/4/4/5` | Enough for a pilot trend and staged transfer check, but explicitly not a convergence claim. |
@@ -88,6 +88,43 @@ full 39-dimensional covariance reliably. The pilot should therefore be judged
 on score/validation trends, failure rate, bound hits, and stability across the
 three final seeds. Increase iterations only after those artifacts justify the
 extra simulator budget.
+
+### Sigma audit by horizon
+
+There is no defensible horizon-only formula for an “optimal” sigma. Sigma is an
+initial scale, while CMA adapts a vector of coordinate-wise scales and a full
+covariance from ranked candidates. Its appropriate value depends on the basin
+around the transferred mean, simulator noise, clipping, and the remaining
+generation budget—not on whether the observations cover 3, 6, 9, or 12 months.
+
+For the **currently budgeted** `4/4/4/5`-generation pilot, retain `0.12` at all
+four stages. This is a deliberate exploration-biased choice, not an estimate of
+the optimum:
+
+| Horizon | Active dimensions | Generations | Recommended configured sigma | Interpretation |
+|---|---:|---:|---:|---|
+| 3 months | 12 | 4 | `0.12` | Starts from the seed with the widest permitted normalized search. |
+| 6 months | 21 | 4 | `0.12` | Gives newly introduced temporal coordinates enough movement in a four-update stage. |
+| 9 months | 30 | 4 | `0.12` | Preserves exploration because four updates cannot reliably tune a 30-dimensional distribution. |
+| 12 months | 39 | 5 | `0.12` | Appropriate for a go/no-go exploration pass, but not evidence of convergence or optimal tuning. |
+
+These values must not be read as four independently applied marginal standard
+deviations. On a stage transition, inherited coordinates carry their learned
+sigma/covariance and are expanded by transition settings; new coordinates get
+transition uncertainty. The configured stage sigma participates in floors and
+initialization, and every sigma component is finally clamped to `[0.02, 0.12]`.
+Consequently, changing only the later-stage JSON values does not define the
+actual sampling radius.
+
+For the recommended corrected run of at least 20 generations, do not declare a
+single sigma in advance. Run a matched-seed, equal-candidate-budget tournament
+from the same effective predecessor state with initial scales `0.06`, `0.09`,
+and `0.12`. Select using rolling-origin validation loss (with a noise penalty),
+and report the actual marginal deviation, clipping/bound-hit rate, and diversity
+alongside sigma. A useful decision rule is to reject a scale that clips heavily
+in its first two generations, or one whose population spread collapses before
+validation loss improves. This experiment, rather than the corrupted historical
+run or horizon length alone, is what can identify a better initial scale.
 
 ### Why the individual metric weights are zero
 
@@ -197,3 +234,36 @@ keeps command construction, candidate terminal states, manifest persistence, and
 data. The additional Saxony run uses the real launcher whenever all four external
 input variables are present; only that data-dependent check is skipped when the
 external inputs are not supplied. Local/Slurm parity checks always run as well.
+
+## Corrected 6m–9m–12m tournament
+
+`optimizer_config.saxony.corrected.json` is a fresh-state rerun profile. Point
+`MOCOSSIM_SEED_CONFIG` at the accepted three-month effective candidate; never at
+a `stage_state.json` or reusable state from the affected run. Each stage searches
+only the three normalized scalars and the three newly introduced months for each
+of the three temporal series (12 dimensions total), while `vector_to_config`
+preserves the historical temporal prefix.
+
+Prepare three independent, equal-budget policies with:
+
+```bash
+julia --project=. scripts/run_corrected_tournament.jl \
+  optimizer_config.saxony.corrected.json --prepare-only
+```
+
+Remove `--prepare-only` to run locally, or add `--slurm`. The launcher refuses to
+reuse an existing policy output directory. Baseline and temporal-escape share
+optimizer seed 42; restart uses optimizer seed 1042, while all policies retain
+the identical simulator validation seeds. The stages have 10, 15, and 20 maximum
+generations and stop only after at least six generations when both best and
+median validation loss improve by less than 1% for three generations.
+
+Candidate ranking uses the rolling-origin validation loss; the training
+likelihood remains stored as `training_score`. Every generation re-evaluates the
+selection half of the population with seeds 43 and 44 and ranks it by mean
+validation loss plus one standard error; the initial evaluation uses the same
+seed for every candidate. Extension requires at least eight
+finite archive entries under the stage-relative validation threshold of 1.0 and
+a diversity pass. Final status is `validation_failed`, with `run_failed.json`,
+unless all three configured validation replicates are finite. Adapter rejection
+metadata retains `output_error` so an exit-zero invalid output is diagnosable.

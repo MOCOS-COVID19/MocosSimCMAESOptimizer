@@ -119,7 +119,14 @@ struct ParamSpec
     length::Int
     lower::Float64
     upper::Float64
+    offset::Int
 end
+
+ParamSpec(name::String, kind::Symbol, length::Int, lower::Real, upper::Real) =
+    ParamSpec(name, kind, length, Float64(lower), Float64(upper), 1)
+
+coordinate_names(specs::Vector{ParamSpec}) =
+    ["$(spec.name)[$i]" for spec in specs for i in spec.offset:(spec.offset + spec.length - 1)]
 
 struct CMAState
     mean::Vector{Float64}
@@ -177,7 +184,7 @@ function full_reusable_state_from_cma(stage::StageConfig, specs_stage::Vector{Pa
     result = Dict(
         "stage" => stage.name,
         "fit_months" => stage.fit_months,
-        "param_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
+        "param_names" => coordinate_names(specs_stage),
         "param_ranges" => [spec.kind == :temporal ? [spec.lower, spec.upper] : [spec.lower, spec.upper] for spec in specs_stage],
         "mean" => state.mean,
         "sigma" => state.sigma,
@@ -204,8 +211,8 @@ function stage_transition_state(
     cov = NEW_TEMPORAL_VARIANCE .* Matrix{Float64}(I, dim, dim)
     old_names = previous_specs === nothing ?
         ["state[$i]" for i in 1:old_dim] :
-        ["$(spec.name)[$i]" for spec in previous_specs for i in 1:spec.length]
-    new_names = ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
+        coordinate_names(previous_specs)
+    new_names = coordinate_names(specs_stage)
     length(unique(old_names)) == length(old_names) ||
         throw(ArgumentError("duplicate previous CMA parameter names"))
     length(unique(new_names)) == length(new_names) ||
@@ -445,7 +452,7 @@ function build_state_from_reusable(
     length(old_sigma) == length(old_mean) && all(isfinite, old_sigma) && all(>(0), old_sigma) ||
         throw(ArgumentError("reusable state sigma dimensions or values are invalid"))
 
-    new_names = ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
+    new_names = coordinate_names(specs_stage)
     new_mean = initial_vector(seed, specs_stage)
     dim = length(new_names)
     new_cov = new_dimension_variance .* Matrix{Float64}(I, dim, dim)
@@ -1250,7 +1257,7 @@ function archive_vector_for_stage(entry::AbstractDict, specs_stage::Vector{Param
     old_vector = get(entry, "evaluated_vector", nothing)
     old_vector isa AbstractVector || return copy(fallback)
     old_map = Dict(name => i for (i, name) in enumerate(old_names))
-    names = ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
+    names = coordinate_names(specs_stage)
     vector = copy(fallback)
     for (j, name) in enumerate(names)
         haskey(old_map, name) || continue
@@ -1519,7 +1526,7 @@ function effective_transition_report(seed::AbstractDict, cfg::AbstractDict,
                                     source_entry=nothing;
                                     candidate_class::String="new_dimension",
                                     limit::Float64=0.15)
-    names = ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
+    names = coordinate_names(specs_stage)
     values = if haskey(cfg, "values")
         Float64.(cfg["values"])
     else
@@ -1562,7 +1569,7 @@ function enforce_transition_policy(seed::AbstractDict, cfg::AbstractDict,
                                    policy::String="reject")
     policy in ("reject", "clip", "exception") ||
         throw(ArgumentError("unsupported transition policy: $policy"))
-    names = ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
+    names = coordinate_names(specs_stage)
     # A stage specification can expose only a monthly prefix of a much denser
     # temporal array in the simulator config.  Convert the effective config
     # back through the same stage-coordinate projection used to initialize
@@ -1632,7 +1639,7 @@ function enforce_posterior_reusable_state(
     state = deepcopy(posterior_state)
     names = String.(get(state, "param_names", String[]))
     mean = Float64.(get(state, "mean", Float64[]))
-    expected_names = ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
+    expected_names = coordinate_names(specs_stage)
     length(names) == length(mean) || throw(ArgumentError("posterior state name/mean dimensions disagree"))
     names == expected_names || throw(ArgumentError("posterior state coordinates do not match target stage"))
 
@@ -2104,7 +2111,11 @@ function stage_specs(seed::Dict{String,Any}, specs::Vector{ParamSpec}, cfg::Opti
         spec.name in freeze && continue
         if spec.kind == :temporal
             active_length = temporal_active_length(seed, spec, stage.fit_months, cfg)
-            push!(active_specs, ParamSpec(spec.name, spec.kind, max(active_length, 1), spec.lower, spec.upper))
+            tail = max(Int(get(cfg.validation, "active_temporal_tail_months", active_length)), 1)
+            selected_length = min(max(active_length, 1), tail)
+            offset = max(active_length - selected_length + 1, 1)
+            push!(active_specs, ParamSpec(spec.name, spec.kind, selected_length,
+                                         spec.lower, spec.upper, offset))
         else
             push!(active_specs, spec)
         end
@@ -2144,7 +2155,7 @@ function initial_vector(seed::Dict{String,Any}, specs::Vector{ParamSpec})
             if optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
                 interval_times = get_nested(seed, replace(spec.name, "interval_values" => "interval_times"))
                 validate_interval_times(interval_times)
-                for month in 1:spec.length
+                for month in spec.offset:(spec.offset + spec.length - 1)
                     idxs = [i for (i, day) in enumerate(interval_times)
                             if monthly_bucket(day, optcfg.monthly_days) == month]
                     source_idx = isempty(idxs) ? (isempty(current) ? 0 : min(month, length(current))) : last(idxs)
@@ -2153,10 +2164,11 @@ function initial_vector(seed::Dict{String,Any}, specs::Vector{ParamSpec})
             else
                 # A previous stage may contain fewer temporal buckets. Extend
                 # it continuously instead of indexing beyond the shorter trajectory.
-                available = min(spec.length, length(current))
-                append!(values, map(float, current[1:available]))
+                last_index = min(spec.offset + spec.length - 1, length(current))
+                available = max(last_index - spec.offset + 1, 0)
+                available > 0 && append!(values, map(float, current[spec.offset:last_index]))
                 if available < spec.length
-                    fill_value = available == 0 ? 0.5 : float(current[available])
+                    fill_value = available == 0 ? (isempty(current) ? 0.5 : float(current[end])) : float(current[last_index])
                     append!(values, fill(fill_value, spec.length - available))
                 end
             end
@@ -2247,23 +2259,23 @@ function vector_to_config(seed::Dict{String,Any}, specs::Vector{ParamSpec}, x::V
             idx += 1
         else
             current = map(float, get_nested(cfg, spec.name))
-            active = optcfg === nothing ? min(active_months, spec.length) : min(
-                spec.length,
-                temporal_active_length(seed, spec, active_months, optcfg),
-            )
+            active = if optcfg === nothing || spec.offset > 1
+                spec.length
+            else
+                min(spec.length, temporal_active_length(seed, spec, active_months, optcfg))
+            end
             if optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
                 interval_times = get_nested(seed, replace(spec.name, "interval_values" => "interval_times"))
                 isempty(interval_times) || validate_interval_times(interval_times)
                 active == 0 && (idx += spec.length; continue)
                 for i in 1:length(current)
                     isempty(interval_times) && break
-                    month = clamp(monthly_bucket(interval_times[min(i, length(interval_times))],
-                        optcfg.monthly_days), 1, active)
+                    month = monthly_bucket(interval_times[min(i, length(interval_times))],
+                        optcfg.monthly_days)
                     # Entries beyond the requested horizon are inactive seed
                     # suffixes.  Do not map them to the last active bucket.
-                    monthly_bucket(interval_times[min(i, length(interval_times))],
-                        optcfg.monthly_days) > active && continue
-                    idx_x = idx + month - 1
+                    (month < spec.offset || month >= spec.offset + active) && continue
+                    idx_x = idx + month - spec.offset
                     idx_x <= length(x) || continue
                     current[i] = x[idx_x]
                 end
@@ -2271,8 +2283,8 @@ function vector_to_config(seed::Dict{String,Any}, specs::Vector{ParamSpec}, x::V
                 # width, including inactive coordinates.
                 idx += spec.length
             else
-                for i in 1:active
-                    idx <= length(x) && (current[i] = x[idx])
+                for i in spec.offset:(spec.offset + active - 1)
+                    i <= length(current) && idx <= length(x) && (current[i] = x[idx])
                     idx += 1
                 end
                 for _ in active+1:spec.length
@@ -2308,7 +2320,7 @@ function inject_temporal_prefix_locks!(
         optcfg = CURRENT_OPTIMIZER_CONFIG[]
         if optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
             interval_times = get_nested(seed, replace(spec.name, "interval_values" => "interval_times"))
-            old_days = spec.length * optcfg.monthly_days
+            old_days = (spec.offset + spec.length - 1) * optcfg.monthly_days
             for i in 1:min(length(interval_times), length(locked), length(old_values))
                 float(interval_times[i]) <= old_days || continue
                 locked[i] = old_values[i]
@@ -3358,7 +3370,13 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     # deterministic configuration/data error.
     gt = load_gt_series(cfg.external_sim.gt_dir)
     sim_ok, daily_path = run_external_sim(cfg, candidate, days; workdir=workdir)
-    sim_ok || return Inf, Dict("sim_failed" => true)
+    if !sim_ok
+        execution_path = joinpath(workdir, "adapter_execution.json")
+        execution = isfile(execution_path) ? load_json(execution_path) : Dict{String,Any}()
+        return Inf, Dict("sim_failed" => true,
+                         "output_error" => get(execution, "output_error", "adapter_failed_without_valid_output"),
+                         "adapter_execution" => execution)
+    end
     windows = stage_data_split(days, cfg.validation)
     training_days = Int(windows["train"]["end_day"])
     weekly_control = weekly_control_score(cfg, daily_path, gt, training_days)
@@ -3579,6 +3597,69 @@ function validation_score_from_daily(cfg::OptimizerConfig, daily_path::String, d
         "count" => length(retained),
         "mean_error" => isempty(metric_scores) ? Inf : mean(collect(values(metric_scores))),
     )
+end
+
+"""Choose the CMA ranking loss without discarding the training objective."""
+function candidate_selection_score(cfg::OptimizerConfig, training_score::Real, metrics::AbstractDict)
+    Bool(get(cfg.validation, "rank_on_validation", false)) || return Float64(training_score)
+    score = try Float64(get(metrics, "validation_mean_error", Inf)) catch; Inf end
+    return isfinite(score) ? score : Inf
+end
+
+function plateau_reached(iter_log, validation::AbstractDict)
+    patience = Int(get(validation, "plateau_patience", 0))
+    patience > 0 || return false
+    minimum_iterations = Int(get(validation, "plateau_min_iterations", patience + 1))
+    length(iter_log) >= max(minimum_iterations, patience + 1) || return false
+    tolerance = Float64(get(validation, "plateau_relative_tolerance", 0.0))
+    window = iter_log[end-patience:end]
+    first_best = Float64(window[1]["best_score"])
+    first_median = Float64(window[1]["median_score"])
+    best_gain = (first_best - minimum(Float64(row["best_score"]) for row in window[2:end])) /
+                max(abs(first_best), eps())
+    median_gain = (first_median - minimum(Float64(row["median_score"]) for row in window[2:end])) /
+                  max(abs(first_median), eps())
+    return best_gain < tolerance && median_gain < tolerance
+end
+
+function replicate_selection_cutoff!(cfg::OptimizerConfig, ranked, entries, stage_root::String,
+                                     iteration::Int, days::Int)
+    seeds = Int.(get(cfg.validation, "selection_replicate_seeds", Int[]))
+    isempty(seeds) && return ranked
+    cfg.external_sim === nothing && return ranked
+    sort!(ranked, by=first)
+    μ = max(2, length(ranked) ÷ 2)
+    selected = ranked[1:min(μ, length(ranked))]
+    penalty = Float64(get(cfg.validation, "selection_standard_error_penalty", 1.0))
+    for entry in entries
+        vector = Float64.(get(entry, "evaluated_vector", Float64[]))
+        position = findfirst(row -> row[2] == vector, selected)
+        position === nothing && continue
+        scores = Float64[selected[position][1]]
+        replicate_rows = Any[]
+        for seed in seeds
+            candidate = deepcopy(entry["config"])
+            candidate["params_seed"] = seed
+            workdir = joinpath(stage_root, "iter_$(iteration)",
+                               @sprintf("cand_%02d", Int(entry["candidate"])),
+                               "selection_seed_$(seed)")
+            result = score_candidate(candidate, cfg, days; workdir=workdir)
+            replicate_score = get(result, "status", "failed") == "completed" ?
+                candidate_selection_score(cfg, result["score"], result["metrics"]) : Inf
+            push!(scores, replicate_score)
+            push!(replicate_rows, Dict("seed" => seed, "score" => replicate_score,
+                                       "status" => result["status"],
+                                       "output_error" => get(result["metrics"], "output_error", nothing)))
+        end
+        aggregate = all(isfinite, scores) ? mean(scores) +
+            penalty * (length(scores) < 2 ? 0.0 : std(scores) / sqrt(length(scores))) : Inf
+        entry["selection_replicates"] = replicate_rows
+        entry["selection_score"] = aggregate
+        old = selected[position]
+        selected[position] = (aggregate, old[2], old[3])
+    end
+    ranked[1:length(selected)] = selected
+    return ranked
 end
 
 function top_k_entries(entries, k::Int)
@@ -3827,12 +3908,16 @@ function run_validation_replicates(
         for result in results
         if get(result, "status", "") == "completed" && isfinite(Float64(result["score"]))
     ]
+    required = Int(get(cfg.validation, "require_finite_validation_replicates", 0))
     return Dict{String,Any}(
         "enabled" => true,
         "seeds" => seeds,
         "results" => results,
         "mean_score" => isempty(finite_scores) ? Inf : mean(finite_scores),
         "std_score" => length(finite_scores) < 2 ? 0.0 : std(finite_scores),
+        "finite_count" => length(finite_scores),
+        "required_finite_count" => required,
+        "status" => length(finite_scores) >= required ? "passed" : "failed",
     )
 end
 
@@ -4099,7 +4184,7 @@ function run_long_horizon(cfg_path::String; days::Int=730, output_dir::Union{Not
     stage = StageConfig(stage_name, ceil(Int, days / max(cfg.monthly_days, 1)), 1, 1, 0.0)
     specset = load_param_specs(seed, cfg, stage)
     state = nothing
-    rng = MersenneTwister(42)
+    rng = MersenneTwister(Int(get(cfg.validation, "optimizer_seed", 42)))
     result, _ = run_stage(rng, seed, specset, cfg, stage, state; use_slurm=false, resume_from=0)
     safe_save_json(joinpath(root, "long_horizon_summary.json"), Dict(
         "days" => days,
@@ -4217,7 +4302,7 @@ function run_stage(
         "fit_months" => active_months,
         "monthly_days" => cfg.monthly_days,
         "simulation_days" => days,
-        "parameter_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
+        "parameter_names" => coordinate_names(specs_stage),
         "population_size" => stage.population_size,
         "max_iterations" => stage.max_iterations,
         "early_stop" => Dict(
@@ -4298,7 +4383,7 @@ function run_stage(
         safe_save_json(joinpath(iter_root, "cma_sampling_state.json"), Dict(
             "stage" => stage.name,
             "iteration" => iter,
-            "param_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
+            "param_names" => coordinate_names(specs_stage),
             "mean" => state.mean,
             "sigma" => state.sigma,
             "covariance" => state.covariance,
@@ -4484,12 +4569,16 @@ function run_stage(
                     safe_save_json(joinpath(cand_dir, "metrics.json"), metrics_payload; label="candidate_metrics")
                     Dict("score" => Inf, "metrics" => Dict(), "simulated" => "real_missing", "status" => "failed")
                 end
-                score = metrics["score"]
+                training_score = metrics["score"]
+                score = get(metrics, "status", "completed") == "completed" ?
+                    candidate_selection_score(cfg, training_score, get(metrics, "metrics", Dict{String,Any}())) : Inf
+                metrics["training_score"] = training_score
+                metrics["score"] = score
                 if get(metrics, "status", "completed") == "completed" && isfinite(Float64(score))
                     append_cma_candidate_record(
                         iter_root, stage, iter, ci, cand, x, zs[ci], clip_info,
                         state, score, metrics, joinpath(cand_dir, "metrics.json"),
-                        ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
+                        coordinate_names(specs_stage),
                         transition_report
                     )
                 end
@@ -4530,7 +4619,7 @@ function run_stage(
                     "score" => score,
                     "status" => get(metrics, "status", "unknown"),
                     "evaluated_vector" => copy(x),
-                    "parameter_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
+                    "parameter_names" => coordinate_names(specs_stage),
                     "config" => deepcopy(cand_cfg),
                     "metrics" => metrics,
                     "transition_delta_report" => transition_report,
@@ -4620,12 +4709,16 @@ function run_stage(
                             nothing : get(metrics, "failure_class", "adapter_failure"),
                         details=Dict("stage" => stage.name, "iteration" => iter, "candidate" => ci))
                 end
-                score = metrics["score"]
+                training_score = metrics["score"]
+                score = get(metrics, "status", "completed") == "completed" ?
+                    candidate_selection_score(cfg, training_score, get(metrics, "metrics", Dict{String,Any}())) : Inf
+                metrics["training_score"] = training_score
+                metrics["score"] = score
                 if get(metrics, "status", "completed") == "completed" && isfinite(Float64(score))
                     append_cma_candidate_record(
                         iter_root, stage, iter, ci, cand, x, zs[ci], clip_info,
                         state, score, metrics, joinpath(cand_dir, "metrics.json"),
-                        ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
+                        coordinate_names(specs_stage),
                         transition_report
                     )
                 end
@@ -4649,7 +4742,7 @@ function run_stage(
                     "status" => get(metrics, "status", "unknown"),
                     "config" => deepcopy(candidate_cfg),
                     "evaluated_vector" => copy(x),
-                    "parameter_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
+                    "parameter_names" => coordinate_names(specs_stage),
                     "metrics" => metrics,
                     "transition_delta_report" => transition_report,
                     "provenance" => Dict{String,Any}(
@@ -4695,21 +4788,24 @@ function run_stage(
             end
         end
         isempty(ranked) && error("No completed candidates available for stage $(stage.name) iteration $(iter). Increase max wait or completion fraction.")
+        replicate_selection_cutoff!(cfg, ranked, iteration_top_candidates,
+                                    stage_root, iter, days)
         sort!(ranked, by=first)
         @info "Updating CMA state" stage=stage.name iteration=iter completed_candidates=length(ranked) best_iteration_score=ranked[1][1]
         state = update_state(state, ranked)
         push!(iter_log, Dict(
             "stage" => stage.name,
             "iteration" => iter,
-            "param_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
+            "param_names" => coordinate_names(specs_stage),
             "search_policy" => policy.name,
             "best_score" => best_score,
+            "median_score" => median(first.(ranked)),
             "sigma" => state.sigma,
             "covariance_trace" => tr(state.covariance),
         ))
         stage_transition_report = effective_transition_report(seed, Dict(
             "values" => state.mean,
-            "param_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
+            "param_names" => coordinate_names(specs_stage),
         ), specs_stage, isempty(transfer_archive) ? nothing : transfer_archive[1];
             candidate_class=isempty(transfer_archive) ? "new_dimension" : "archive_transfer")
         # The fitted trajectory handed to the next horizon is the best
@@ -4717,7 +4813,7 @@ function run_stage(
         # diverse survivor happens to appear first in the archive.  The latter
         # two are search-state inputs only and may have a worse objective.
         trusted_values = Float64.(best_vector)
-        trusted_names = ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
+        trusted_names = coordinate_names(specs_stage)
         trusted_trajectory = Dict{String,Any}(
             "identity" => bytes2hex(SHA.sha256("production-trusted-trajectory-v1")),
             "values" => trusted_values,
@@ -4735,7 +4831,7 @@ function run_stage(
         safe_save_json(joinpath(stage_root, "stage_state.json"), Dict(
             "stage" => stage.name,
             "iteration" => iter,
-            "param_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
+            "param_names" => coordinate_names(specs_stage),
             "search_policy" => policy.name,
             "fit_months" => active_months,
             "best_score" => best_score,
@@ -4833,6 +4929,16 @@ function run_stage(
             "artifact_integrity_digest" => artifact_digest,
         ); label="iteration_commit")
         @info "Finished iteration" stage=stage.name iteration=iter best_score=best_score sigma=state.sigma top_candidates_written=length(iteration_top_candidates)
+        if plateau_reached(iter_log, cfg.validation)
+            safe_save_json(joinpath(stage_root, "plateau_stop.json"), Dict(
+                "stage" => stage.name, "iteration" => iter,
+                "patience" => Int(get(cfg.validation, "plateau_patience", 0)),
+                "relative_tolerance" => Float64(get(cfg.validation, "plateau_relative_tolerance", 0.0)),
+                "reason" => "best_and_median_below_material_improvement",
+            ); label="plateau_stop")
+            @info "Stopping stage at declared plateau" stage=stage.name iteration=iter
+            break
+        end
     end
 
     @info "Finished stage run" stage=stage.name best_score=best_score iterations_run=(start_iter > stage.max_iterations ? 0 : stage.max_iterations - start_iter + 1)
@@ -4862,7 +4968,7 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
     CURRENT_OPTIMIZER_CONFIG[] = cfg
     seed = isempty(cfg.runtime_seed) ? load_json(cfg.seed_config) : deepcopy(cfg.runtime_seed)
     specs = build_specs(seed, cfg)
-    rng = MersenneTwister(42)
+    rng = MersenneTwister(Int(get(cfg.validation, "optimizer_seed", 42)))
 
     stage_outputs = Any[]
     all_history = Any[]
@@ -5096,7 +5202,17 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
         "entries" => leaderboard_entries,
     )
     safe_save_json(joinpath(cfg.output_dir, "policy_leaderboard.json"), leaderboard; label="policy_leaderboard")
+    run_status = get(validation_replicates, "status", "passed") == "failed" ?
+        "validation_failed" : "completed"
+    if run_status != "completed"
+        safe_save_json(joinpath(cfg.output_dir, "run_failed.json"), Dict(
+            "status" => run_status,
+            "reason" => "insufficient_finite_validation_replicates",
+            "validation_replicates" => validation_replicates,
+        ); label="run_failed")
+    end
     return Dict(
+        "status" => run_status,
         "stage_summary" => stage_outputs,
         "output_dir" => cfg.output_dir,
         "top_k" => cfg.objective.top_k,
