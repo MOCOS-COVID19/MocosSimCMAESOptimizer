@@ -286,7 +286,11 @@ function transition_delta_report(previous::AbstractDict, current::AbstractDict;
         klass = coordinate_classes !== nothing && i <= length(coordinate_classes) ?
             String(coordinate_classes[i]) :
             (has_old ? (abs(delta) <= 1e-12 ? "locked" : "archive_transfer") : "new_dimension")
-        outcome = if !has_old || abs(delta) <= limit
+        # The jump limit protects coordinates inherited from an archive.  A
+        # fresh/immigrant coordinate is deliberately sampled independently
+        # and must not be rejected merely because it is far from the seed.
+        transition_controlled = klass == "archive_transfer"
+        outcome = if !transition_controlled || !has_old || abs(delta) <= limit
             "accepted"
         elseif policy == "clip"
             "clipped"
@@ -1525,7 +1529,9 @@ function enforce_transition_policy(seed::AbstractDict, cfg::AbstractDict,
     old_map = Dict(name => i for (i, name) in enumerate(old_names))
     effective = copy(values)
     over_limit = false
+    transition_controlled = candidate_class == "archive_transfer"
     for (i, name) in enumerate(names)
+        transition_controlled || continue
         haskey(old_map, name) && old_map[name] <= length(old_values) || continue
         delta = effective[i] - old_values[old_map[name]]
         abs(delta) <= limit && continue
@@ -3615,11 +3621,23 @@ function wait_for_iteration_outputs(list_file::String; poll::Float64=10.0,
     end
 end
 
+"""Remove artifacts from an uncommitted iteration before regenerating candidates."""
+function reset_iteration_candidate_artifacts!(iter_root::String)
+    isdir(iter_root) || return
+    for entry in readdir(iter_root)
+        path = joinpath(iter_root, entry)
+        if entry == "candidate_list.txt" ||
+           (isdir(path) && occursin(r"^cand_[0-9]+$", entry))
+            rm(path; recursive=true, force=true)
+        end
+    end
+end
+
 function submit_slurm_array(cfg::OptimizerConfig, list_file::String)
     simcfg = cfg.external_sim
     lines = readlines(list_file)
     n = length(lines)
-    n == 0 && return ""
+    n == 0 && throw(ArgumentError("cannot submit an empty Slurm candidate array"))
     timeout_seconds = Float64(get(cfg.validation, "adapter_timeout_seconds", 3600.0))
     cmd = `sbatch --parsable -c 4 -t 01:15:00 --mem=20G --array=0-$(n-1) scripts/score_candidates.sh $list_file $(simcfg.julia_bin) $(simcfg.project_dir) $(simcfg.advanced_cli) $(simcfg.gt_dir) $timeout_seconds`
     last_err = nothing
@@ -4188,6 +4206,10 @@ function run_stage(
         end
         iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
         mkpath(iter_root)
+        # An incomplete iteration is regenerated from its saved CMA state.  Do
+        # not let terminal markers or adapter outputs from an earlier attempt
+        # make the newly sampled candidates appear to have already finished.
+        reset_iteration_candidate_artifacts!(iter_root)
         safe_save_json(joinpath(iter_root, "cma_sampling_state.json"), Dict(
             "stage" => stage.name,
             "iteration" => iter,
@@ -4240,8 +4262,13 @@ function run_stage(
                     end
                 end
             end
-            jobid = submit_slurm_array(cfg, list_file)
-            @info "Submitted Slurm array" stage=stage.name iteration=iter jobid=jobid
+            eligible_count = length(readlines(list_file))
+            jobid = eligible_count == 0 ? nothing : submit_slurm_array(cfg, list_file)
+            if jobid === nothing
+                @warn "No candidates eligible for Slurm submission" stage=stage.name iteration=iter
+            else
+                @info "Submitted Slurm array" stage=stage.name iteration=iter jobid=jobid
+            end
             wait_result = wait_for_iteration_outputs(
                 list_file;
                 poll=10.0,
@@ -4251,10 +4278,10 @@ function run_stage(
                                      get(cfg.validation, "adapter_timeout_seconds", 3600.0) + 300.0)),
             )
             @info "Iteration wait result" stage=stage.name iteration=iter jobid=jobid completed_count=wait_result["done"] failed_count=wait_result["failed"] pending_count=wait_result["pending_count"] threshold_reached=wait_result["threshold_reached"] iteration_truncated=wait_result["iteration_truncated"]
-            if get(wait_result, "iteration_truncated", false)
+            if jobid !== nothing && get(wait_result, "iteration_truncated", false)
                 cancel_slurm_array(jobid)
             end
-            @info "Slurm array finished" stage=stage.name iteration=iter jobid=jobid
+            jobid !== nothing && @info "Slurm array finished" stage=stage.name iteration=iter jobid=jobid
 
             # collect scores from generated output_daily.jld2
             for (ci, cand) in enumerate(candidates)

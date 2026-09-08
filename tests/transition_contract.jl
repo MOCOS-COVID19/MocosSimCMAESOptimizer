@@ -129,6 +129,22 @@ const O = MocosSimCMAESOptimizer
     @test length(prefix_transition["report"]["coordinates"]) == 2
     @test prefix_transition["config"]["curve"]["interval_values"] == [0.2, 0.2, 0.9]
     @test !haskey(prefix_transition["config"], "stop_simulation_time")
+
+    # Transition jump limits constrain archive reuse, not independently
+    # sampled immigrants.  A smoke-stage population with no archive must be
+    # allowed to explore the configured bounds even when it is far from seed.
+    immigrant_cfg = Dict{String,Any}("curve" => Dict{String,Any}(
+        "interval_values" => [0.9, 0.4, 0.9],
+        "interval_times" => [1, 31, 61],
+    ))
+    immigrant_transition = O.enforce_transition_policy(seed2, immigrant_cfg, specs2;
+        candidate_class="immigrant/escape", limit=0.1, policy="reject")
+    @test immigrant_transition["status"] == "accepted"
+    @test immigrant_transition["report"]["policy_outcome"] == "accepted"
+    @test immigrant_transition["report"]["max_abs_delta"] == 0.0
+    @test all(row["policy_outcome"] == "accepted"
+              for row in immigrant_transition["report"]["coordinates"])
+    @test immigrant_transition["config"]["curve"]["interval_values"] == [0.9, 0.4, 0.9]
     a = O.build_state_from_reusable(seed2, specs2, reusable; rng=MersenneTwister(8))
     b = O.build_state_from_reusable(seed2, specs2, reusable; rng=MersenneTwister(8))
     @test a.mean == b.mean
