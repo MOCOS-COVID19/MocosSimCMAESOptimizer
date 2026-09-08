@@ -100,6 +100,13 @@ end
     @test any(occursin("daily_deaths", error) for error in invalid["errors"])
 end
 
+@testset "JSON nulls in legacy resume state use finite fallbacks" begin
+    @test O.finite_resume_scalar(nothing, Inf) == Inf
+    @test O.finite_resume_scalar(0.25, Inf) == 0.25
+    @test O.finite_resume_vector([0.1, nothing], [0.3, 0.4]) == [0.3, 0.4]
+    @test O.finite_resume_vector(nothing, [0.3, 0.4]) == [0.3, 0.4]
+end
+
 @testset "hermetic production smoke exercises the Julia adapter" begin
     root, config = hermetic_smoke_fixture()
     manifest = O.run_production_smoke(config; use_slurm=false)
@@ -113,6 +120,11 @@ end
     @test all(candidate["adapter_invocation"]["success"] for
               candidate in manifest["candidates"])
     @test isfile(joinpath(root, "output", "production_smoke_manifest.json"))
+
+    resumed_manifest = O.run_production_smoke(config; use_slurm=false)
+    @test resumed_manifest["status"] == "passed"
+    @test resumed_manifest["optimizer_result"]["stage_summary"][1]["best_score"] ==
+          manifest["optimizer_result"]["stage_summary"][1]["best_score"]
 end
 
 function parity_manifest(mode, input_hash="same"; trajectories=1)

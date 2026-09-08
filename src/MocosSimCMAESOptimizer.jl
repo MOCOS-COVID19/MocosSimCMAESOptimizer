@@ -629,6 +629,27 @@ function load_stage_state(stage_root::String)
     return load_json(path)
 end
 
+function finite_resume_scalar(value, fallback::Float64)
+    value === nothing && return fallback
+    parsed = try
+        Float64(value)
+    catch
+        return fallback
+    end
+    return isfinite(parsed) ? parsed : fallback
+end
+
+function finite_resume_vector(value, fallback::Vector{Float64})
+    value isa AbstractVector || return copy(fallback)
+    length(value) == length(fallback) || return copy(fallback)
+    parsed = try
+        Float64.(value)
+    catch
+        return copy(fallback)
+    end
+    return all(isfinite, parsed) ? parsed : copy(fallback)
+end
+
 """Load the only trusted source for a fresh-process stage extension.
 
 The in-process `run_optimizer` path already carries `state` and the archive
@@ -4160,8 +4181,9 @@ function run_stage(
     iter_log = Any[]
     top_candidates = Dict{String,Dict{String,Any}}()
     best_score_raw = resume_state === nothing ? Inf : get(resume_state, "best_score", Inf)
-    best_score = best_score_raw === nothing ? Inf : Float64(best_score_raw)
-    best_vector = resume_state !== nothing && haskey(resume_state, "best_vector") ? Float64.(resume_state["best_vector"]) : copy(state.mean)
+    best_score = finite_resume_scalar(best_score_raw, Inf)
+    best_vector = resume_state === nothing ? copy(state.mean) :
+        finite_resume_vector(get(resume_state, "best_vector", nothing), state.mean)
     best_candidate = deepcopy(seed)
     archive_path = joinpath(stage_root, "survivor_archive.json")
     survivor_archive = isfile(archive_path) ? load_json(archive_path) : Any[]
@@ -4169,11 +4191,12 @@ function run_stage(
     transfer_archive = received_prior ? deepcopy(predecessor_archive) : Any[]
     if resume_state !== nothing && haskey(resume_state, "best_vector")
         sigma_raw = get(resume_state, "sigma", state.sigma)
+        sigma_fallback = copy(state.sigma)
         sigma_resume = sigma_raw isa AbstractVector ?
-            Float64.(sigma_raw) :
-            fill(Float64(sigma_raw), dim)
-        p_c = haskey(resume_state, "p_c") ? Float64.(resume_state["p_c"]) : zeros(dim)
-        p_sigma = haskey(resume_state, "p_sigma") ? Float64.(resume_state["p_sigma"]) : zeros(dim)
+            finite_resume_vector(sigma_raw, sigma_fallback) :
+            fill(finite_resume_scalar(sigma_raw, first(sigma_fallback)), dim)
+        p_c = finite_resume_vector(get(resume_state, "p_c", nothing), zeros(dim))
+        p_sigma = finite_resume_vector(get(resume_state, "p_sigma", nothing), zeros(dim))
         state = CMAState(copy(best_vector), sigma_resume, state.covariance, p_c, p_sigma)
     end
     start_iter = max(1, resume_from + 1)
