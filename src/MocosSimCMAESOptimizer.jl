@@ -864,13 +864,18 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
         score_by_id[identity] = Float64(get(row, "score", Inf))
         identity[1] == stage || push!(contradictions, "iter_metrics stage mismatch: $identity")
     end
-    function check_entry(entry, label)
+    function check_entry(entry, label; require_current_iteration::Bool=true)
         entry isa AbstractDict || (push!(contradictions, "$label is not an object"); return nothing)
         identity = (String(get(entry, "stage", "")), Int(get(entry, "iteration", 0)),
             candidate_int(get(entry, "candidate", 0)))
         identity in identities || push!(contradictions, "$label orphan identity: $identity")
         identity[1] == stage || push!(contradictions, "$label stage mismatch: $identity")
-        identity[2] == iteration || push!(contradictions, "$label iteration mismatch: $identity")
+        if require_current_iteration
+            identity[2] == iteration || push!(contradictions, "$label iteration mismatch: $identity")
+        else
+            identity[2] <= iteration ||
+                push!(contradictions, "$label iteration is newer than committed state: $identity")
+        end
         get(entry, "parameter_names", names) == names ||
             push!(contradictions, "$label parameter_names mismatch")
         haskey(status_by_id, identity) && String(get(entry, "status", "")) != status_by_id[identity] &&
@@ -886,7 +891,11 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
     end
     archive_ids = Tuple{String,Int,Int}[]
     for entry in archive
-        id = check_entry(entry, "survivor_archive")
+        # Unlike top_candidates, the survivor archive is cumulative by design:
+        # candidates admitted by earlier iterations remain eligible for stage
+        # transfer.  They must join to the metrics log, but need not belong to
+        # the final committed iteration.
+        id = check_entry(entry, "survivor_archive"; require_current_iteration=false)
         id === nothing || push!(archive_ids, id)
     end
     best_id = get(stage_state, "best_candidate_id", nothing)
