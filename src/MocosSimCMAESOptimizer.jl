@@ -2315,6 +2315,10 @@ function run_external_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, day
     save_json(config_path, candidate)
     daily_path = joinpath(workdir, "output_daily.jld2")
     summary_path = joinpath(workdir, "summary.jld2")
+    # `workdir` identifies exactly one candidate (or one validation seed).
+    # Reset only that invocation's two generated files; outputs in sibling
+    # candidates, earlier iterations, and earlier stages are not touched.
+    reset_external_sim_outputs!(workdir)
 
     cmd_args = String[
         simcfg.julia_bin,
@@ -2356,15 +2360,40 @@ function run_external_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, day
             end
         end
     end
+    output_error = success ? hdf5_output_error(daily_path) : nothing
+    if success && output_error !== nothing
+        @warn "External simulation produced an invalid daily output" path=daily_path err=output_error
+        success = false
+    end
     invocation = Dict{String,Any}(
         "schema_version" => "adapter-invocation-v1", "command" => cmd_args,
         "working_directory" => workdir, "started_at" => string(started),
         "finished_at" => string(now(UTC)), "timeout_seconds" => timeout_seconds,
         "timed_out" => timed_out, "exit_code" => process === nothing ? nothing : process.exitcode,
-        "success" => success, "stdout" => stdout_path, "stderr" => stderr_path)
+        "success" => success, "output_error" => output_error,
+        "stdout" => stdout_path, "stderr" => stderr_path)
     safe_save_json(joinpath(workdir, "adapter_invocation.json"), invocation;
                    label="adapter_invocation")
     return success, daily_path
+end
+
+"""Remove only the generated simulator outputs belonging to one invocation directory."""
+function reset_external_sim_outputs!(workdir::String)
+    rm(joinpath(workdir, "output_daily.jld2"); force=true)
+    rm(joinpath(workdir, "summary.jld2"); force=true)
+    return nothing
+end
+
+"""Return `nothing` when `path` is a nonempty, readable HDF5 file, otherwise an error."""
+function hdf5_output_error(path::String)
+    isfile(path) || return "daily output file was not created"
+    filesize(path) > 0 || return "daily output file is empty"
+    try
+        h5open(path, "r") do _ end
+    catch err
+        return "daily output is not readable HDF5: $(sprint(showerror, err))"
+    end
+    return nothing
 end
 
 function load_gt_series(gt_dir::String)
