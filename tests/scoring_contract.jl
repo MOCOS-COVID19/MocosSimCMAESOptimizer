@@ -5,6 +5,26 @@ using MocosSimCMAESOptimizer
 
 const O = MocosSimCMAESOptimizer
 
+@testset "temporal jump penalty supports second differences on Julia 1.7" begin
+    objective = O.ObjectiveConfig(Dict{String,Float64}(),
+        1, 1.0, 1, "baseline", 1.0, 0.0)
+    posterior = O.PosteriorConfig(false, "diagonal_gaussian_weekly", 1, 1, 1,
+        0.05, 1.0, 1.0, 1.0, 1.0, 0.0)
+    cfg = O.OptimizerConfig("seed", "out", 30, O.StageConfig[],
+        Dict{String,Tuple{Float64,Float64}}(),
+        Dict("infection_modulation.params.interval_values" => (0.0, 1.0)),
+        Dict{String,Dict{String,Any}}(), "monthly", Dict{String,Float64}(),
+        Dict{String,Any}(), objective, nothing, Dict{String,Vector{String}}(),
+        nothing, posterior)
+    candidate = Dict{String,Any}(
+        "infection_modulation" => Dict{String,Any}(
+            "params" => Dict{String,Any}("interval_values" => [0.0, 1.0, 4.0]),
+        ),
+    )
+
+    @test O.temporal_jump_penalty(cfg, candidate) == 4.0
+end
+
 @testset "paired scoring retains original indices" begin
     gt = Union{Missing,Float64}[1.0, missing, 3.0, 4.0]
     sim = [1.0, 99.0, 3.0]
