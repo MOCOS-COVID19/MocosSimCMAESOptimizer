@@ -155,3 +155,19 @@ end
     @test first != second
     @test isdir(first) && isdir(second)
 end
+
+@testset "retrying an incomplete iteration removes stale candidate artifacts" begin
+    root = mktempdir()
+    candidate = joinpath(root, "cand_01")
+    mkpath(candidate)
+    touch(joinpath(candidate, "failed.ok"))
+    touch(joinpath(root, "candidate_list.txt"))
+    keep = joinpath(root, "cma_sampling_state.json")
+    write(keep, "{}")
+
+    O.reset_iteration_candidate_artifacts!(root)
+
+    @test !ispath(candidate)
+    @test !ispath(joinpath(root, "candidate_list.txt"))
+    @test isfile(keep)
+end
