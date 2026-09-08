@@ -5,7 +5,12 @@
 #SBATCH -J cmaes-real
 #SBATCH -o cmaes-real-%j.out
 #SBATCH -e cmaes-real-%j.err
-#SBATCH -c 1
+# The controller performs the final validation replicates in-process after the
+# candidate arrays finish.  Match the four-thread, 20 GiB resources used by
+# each candidate array task so a 12-month validation run is not constrained by
+# the controller's smaller default allocation.
+#SBATCH -c 4
+#SBATCH --mem=20G
 #SBATCH -t 24:00:00
 
 set -euo pipefail
