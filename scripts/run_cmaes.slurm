@@ -10,7 +10,21 @@
 
 set -euo pipefail
 
-REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+if [[ -n "${REPO:-}" ]]; then
+  REPO=$(cd "$REPO" && pwd)
+elif [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+  SUBMIT_DIR=$(cd "$SLURM_SUBMIT_DIR" && pwd)
+  if [[ -f "$SUBMIT_DIR/Project.toml" ]]; then
+    REPO="$SUBMIT_DIR"
+  elif [[ -f "$SUBMIT_DIR/../Project.toml" ]]; then
+    REPO=$(cd "$SUBMIT_DIR/.." && pwd)
+  else
+    echo "[ERROR] Cannot locate optimizer Project.toml from SLURM_SUBMIT_DIR=$SUBMIT_DIR" >&2
+    exit 2
+  fi
+else
+  REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+fi
 CONFIG="${1:-optimizer_config.saxony.12m-pilot.json}"
 : "${JULIA_BIN:?export JULIA_BIN before submitting}"
 : "${MOCOSSIM_LAUNCHER_DIR:?export MOCOSSIM_LAUNCHER_DIR before submitting}"
@@ -25,6 +39,14 @@ done
 
 cd "$REPO"
 [[ "$CONFIG" = /* ]] || CONFIG="$REPO/$CONFIG"
+[[ -f "$REPO/Project.toml" ]] || {
+  echo "[ERROR] Optimizer project not found under REPO=$REPO" >&2
+  exit 2
+}
+[[ -f "$MOCOSSIM_LAUNCHER_DIR/Project.toml" ]] || {
+  echo "[ERROR] Launcher project not found under MOCOSSIM_LAUNCHER_DIR=$MOCOSSIM_LAUNCHER_DIR" >&2
+  exit 2
+}
 
 export JULIA_PKG_PRECOMPILE_AUTO=0
 
