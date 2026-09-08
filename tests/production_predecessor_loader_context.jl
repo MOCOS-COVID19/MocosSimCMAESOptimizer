@@ -34,6 +34,12 @@ function write_production_predecessor(root)
     mkpath(iter_root)
     names = ["x[1]", "x[2]"]
     values = [0.2, 0.4]
+    # Deliberately differs from the archive entry so the loader contract proves
+    # that the fitted best candidate, rather than archive ordering, owns the
+    # next stage's locked prefix.
+    best_config = Dict("infection_modulation" => Dict("params" => Dict(
+        "interval_times" => [30, 60], "interval_values" => values)))
+    best_config_hash = bytes2hex(SHA.sha256(JSON.json(best_config)))
     trajectory = Dict("identity" => "trajectory-production-fixture",
                       "values" => values, "prefix_values" => values)
     prefix_hash = bytes2hex(SHA.sha256(JSON.json(values)))
@@ -63,12 +69,16 @@ function write_production_predecessor(root)
         "completed_count" => 1, "failed_count" => 0, "skipped_count" => 0, "pending_count" => 0,
         "historical_trajectory" => trajectory, "trajectory_identity" => trajectory["identity"],
         "prefix_hash" => prefix_hash, "locked_intervals" => locks, "cma_state" => cma,
+        "best_vector" => values, "best_candidate_config" => best_config,
+        "best_candidate_config_hash" => best_config_hash,
         "archive_ids" => ["1"], "transfer_archive_ids" => ["1"])
     reusable = Dict{String,Any}(
         "stage" => "short", "param_names" => names, "mean" => values, "sigma" => [0.1, 0.1],
         "covariance" => [1.0 0.0; 0.0 1.0], "p_c" => [0.0, 0.0], "p_sigma" => [0.0, 0.0],
         "historical_trajectory" => trajectory, "trajectory_identity" => trajectory["identity"],
         "prefix_hash" => prefix_hash, "locked_intervals" => locks, "cma_state" => cma,
+        "best_vector" => values, "best_candidate_config" => best_config,
+        "best_candidate_config_hash" => best_config_hash,
         "archive_ids" => ["1"], "selected_archive_ids" => ["1"],
         "archive_lineage" => Dict("canonical_archive_path" => abspath(joinpath(stage_root, "survivor_archive.json")),
                                   "archive_ids" => ["1"]))
@@ -98,6 +108,7 @@ end
     @test loaded["stage_state"]["trajectory_identity"] == "trajectory-production-fixture"
     @test loaded["reusable_state"]["archive_ids"] == ["1"]
     @test loaded["archive"][1]["candidate"] == "1"
+    @test loaded["best_candidate_config"] == loaded["stage_state"]["best_candidate_config"]
 
     commit_path = joinpath(stage_root, "iter_1", "iteration_commit.json")
     commit = O.load_json(commit_path)
@@ -110,6 +121,13 @@ end
     state_path = joinpath(stage_root, "stage_state.json")
     state = O.load_json(state_path)
     delete!(state, "historical_trajectory")
+    O.safe_save_json(state_path, state)
+    @test_throws ArgumentError O.load_immediate_predecessor_state(cfg, cfg.stages[2])
+
+    write_production_predecessor(cfg.output_dir)
+    state_path = joinpath(stage_root, "stage_state.json")
+    state = O.load_json(state_path)
+    state["historical_trajectory"]["prefix_values"] = [0.9, 0.9]
     O.safe_save_json(state_path, state)
     @test_throws ArgumentError O.load_immediate_predecessor_state(cfg, cfg.stages[2])
 

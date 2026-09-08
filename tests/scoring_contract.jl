@@ -5,6 +5,50 @@ using MocosSimCMAESOptimizer
 
 const O = MocosSimCMAESOptimizer
 
+@testset "simulator output reset is scoped to one candidate" begin
+    root = mktempdir()
+    current = joinpath(root, "stage_04", "iter_1", "cand_01")
+    sibling = joinpath(root, "stage_04", "iter_1", "cand_02")
+    previous_stage = joinpath(root, "stage_03", "iter_1", "cand_01")
+    for directory in (current, sibling, previous_stage)
+        mkpath(directory)
+        write(joinpath(directory, "output_daily.jld2"), "existing daily output")
+        write(joinpath(directory, "summary.jld2"), "existing summary output")
+        write(joinpath(directory, "config.json"), "candidate config")
+    end
+
+    O.reset_external_sim_outputs!(current)
+
+    @test !isfile(joinpath(current, "output_daily.jld2"))
+    @test !isfile(joinpath(current, "summary.jld2"))
+    @test isfile(joinpath(current, "config.json"))
+    @test isfile(joinpath(sibling, "output_daily.jld2"))
+    @test isfile(joinpath(sibling, "summary.jld2"))
+    @test isfile(joinpath(previous_stage, "output_daily.jld2"))
+    @test isfile(joinpath(previous_stage, "summary.jld2"))
+end
+
+@testset "daily output HDF5 readability" begin
+    root = mktempdir()
+    missing = joinpath(root, "missing.jld2")
+    @test O.hdf5_output_error(missing) == "daily output file was not created"
+
+    empty = joinpath(root, "empty.jld2")
+    touch(empty)
+    @test O.hdf5_output_error(empty) == "daily output file is empty"
+
+    invalid = joinpath(root, "invalid.jld2")
+    write(invalid, "not an HDF5 file")
+    @test startswith(O.hdf5_output_error(invalid),
+                     "daily output is not readable HDF5:")
+
+    valid = joinpath(root, "valid.jld2")
+    h5open(valid, "w") do file
+        write(file, "probe", [1.0])
+    end
+    @test O.hdf5_output_error(valid) === nothing
+end
+
 @testset "temporal jump penalty supports second differences on Julia 1.7" begin
     objective = O.ObjectiveConfig(Dict{String,Float64}(),
         1, 1.0, 1, "baseline", 1.0, 0.0)
