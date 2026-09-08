@@ -699,6 +699,26 @@ function load_immediate_predecessor_state(cfg::OptimizerConfig, stage::StageConf
     locked isa AbstractVector && reusable_locked isa AbstractVector &&
         locked == reusable_locked ||
         throw(ArgumentError("trusted predecessor prefix locks missing or mismatched"))
+    best_config = get(prior_state, "best_candidate_config", nothing)
+    reusable_best_config = get(reusable, "best_candidate_config", nothing)
+    best_config isa AbstractDict && reusable_best_config isa AbstractDict ||
+        throw(ArgumentError("trusted predecessor best candidate config missing"))
+    best_config == reusable_best_config ||
+        throw(ArgumentError("trusted predecessor best candidate config mismatch"))
+    best_config_hash = get(prior_state, "best_candidate_config_hash", nothing)
+    reusable_best_config_hash = get(reusable, "best_candidate_config_hash", nothing)
+    best_config_hash isa AbstractString && !isempty(best_config_hash) &&
+        best_config_hash == reusable_best_config_hash ||
+        throw(ArgumentError("trusted predecessor best candidate config hash missing or mismatched"))
+    bytes2hex(SHA.sha256(JSON.json(best_config))) == best_config_hash ||
+        throw(ArgumentError("trusted predecessor best candidate config hash content mismatch"))
+    best_vector = get(prior_state, "best_vector", nothing)
+    reusable_best_vector = get(reusable, "best_vector", nothing)
+    best_vector isa AbstractVector && reusable_best_vector isa AbstractVector &&
+        best_vector == reusable_best_vector ||
+        throw(ArgumentError("trusted predecessor best vector missing or mismatched"))
+    Float64.(historical["prefix_values"]) == Float64.(best_vector) ||
+        throw(ArgumentError("trusted predecessor locked trajectory is not the best vector"))
     state_cma = get(prior_state, "cma_state", nothing)
     reusable_cma = get(reusable, "cma_state", nothing)
     state_cma isa AbstractDict && reusable_cma isa AbstractDict ||
@@ -741,6 +761,7 @@ function load_immediate_predecessor_state(cfg::OptimizerConfig, stage::StageConf
         "stage_state" => prior_state,
         "reusable_state" => reusable,
         "archive" => archive,
+        "best_candidate_config" => deepcopy(best_config),
         "root" => root,
     )
 end
@@ -4126,9 +4147,7 @@ function run_stage(
             # a predecessor existing on disk makes the initial seed invalid as
             # an extension source in a fresh process.
             predecessor_archive = trusted_predecessor["archive"]
-            trusted_seed = archive_entry_config(predecessor_archive)
-            trusted_seed === nothing && throw(ArgumentError(
-                "trusted predecessor archive has no reusable candidate configuration"))
+            trusted_seed = deepcopy(trusted_predecessor["best_candidate_config"])
             seed = trusted_seed
             reusable = trusted_predecessor["reusable_state"]
             state = build_state_from_reusable(
@@ -4222,7 +4241,8 @@ function run_stage(
     best_score = finite_resume_scalar(best_score_raw, Inf)
     best_vector = resume_state === nothing ? copy(state.mean) :
         finite_resume_vector(get(resume_state, "best_vector", nothing), state.mean)
-    best_candidate = deepcopy(seed)
+    best_candidate = resume_state === nothing ? deepcopy(seed) :
+        deepcopy(get(resume_state, "best_candidate_config", seed))
     archive_path = joinpath(stage_root, "survivor_archive.json")
     survivor_archive = isfile(archive_path) ? load_json(archive_path) : Any[]
     survivor_archive isa AbstractVector || (survivor_archive = Any[])
@@ -4692,7 +4712,11 @@ function run_stage(
             "param_names" => ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length],
         ), specs_stage, isempty(transfer_archive) ? nothing : transfer_archive[1];
             candidate_class=isempty(transfer_archive) ? "new_dimension" : "archive_transfer")
-        trusted_values = Float64.(state.mean)
+        # The fitted trajectory handed to the next horizon is the best
+        # effective candidate, not the CMA population mean and not whichever
+        # diverse survivor happens to appear first in the archive.  The latter
+        # two are search-state inputs only and may have a worse objective.
+        trusted_values = Float64.(best_vector)
         trusted_names = ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
         trusted_trajectory = Dict{String,Any}(
             "identity" => bytes2hex(SHA.sha256("production-trusted-trajectory-v1")),
@@ -4722,6 +4746,8 @@ function run_stage(
             "p_sigma" => state.p_sigma,
             "cma_diagnostics" => cma_diagnostics(state),
             "best_vector" => best_vector,
+            "best_candidate_config" => best_candidate,
+            "best_candidate_config_hash" => bytes2hex(SHA.sha256(JSON.json(best_candidate))),
             "rng_state" => rng_snapshot(rng),
             "transition_delta_report" => stage_transition_report,
             "historical_trajectory" => trusted_trajectory,
@@ -4758,6 +4784,10 @@ function run_stage(
         reusable_payload["prefix_hash"] = trusted_prefix_hash
         reusable_payload["locked_intervals"] = trusted_locks
         reusable_payload["cma_state"] = nested_cma
+        reusable_payload["best_vector"] = best_vector
+        reusable_payload["best_candidate_config"] = best_candidate
+        reusable_payload["best_candidate_config_hash"] =
+            bytes2hex(SHA.sha256(JSON.json(best_candidate)))
         reusable_payload["archive_ids"] = archive_ids
         reusable_payload["selected_archive_ids"] = archive_ids
         reusable_payload["archive_lineage"] = Dict(
@@ -4982,10 +5012,10 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
                 expected_manifest_path=predecessor_manifest_path,
                 stage_order=[s.name for s in cfg.stages],
             )
-            archive_seed = archive_entry_config(predecessor_archive)
-            # The admitted predecessor archive owns the trusted prefix.  The
-            # scalar best remains reporting-only and cannot become the next seed.
-            archive_seed !== nothing && (current_seed = archive_seed)
+            # Survivor entries still seed protected diversity slots, but the
+            # immediate predecessor's best effective candidate owns every
+            # locked historical coordinate in the next stage.
+            current_seed = deepcopy(result["best_candidate"])
         end
         previous_specs = stage_specs(current_seed, specs, cfg, stage)
         update_stage_freeze!(cfg, stage, result["history"], specs)

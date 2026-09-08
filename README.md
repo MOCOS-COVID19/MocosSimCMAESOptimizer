@@ -59,6 +59,27 @@ required external inputs and the no-launch preflight procedure.
 The same guide documents the bounded two-candidate production smoke test,
 provenance manifest, and local/Slurm parity check.
 
+## Parameter-evolution audit
+
+`drawing-utilities/build_parameter_evolution_audit.py` joins the candidate
+identity and score in `optimizer_history.json` to each candidate's effective
+`config.json`, then writes a self-contained interactive HTML report. The report
+has 6-, 9-, and 12-month stage filters, independent scalar toggles for
+`school`, `class`, and `age_coupling_param`, and a selector for the infection,
+mild-detection, and tracing modulation vectors.
+It also audits each 6m→9m and 9m→12m handoff against the preceding stage's
+actual best scored candidate and lists any reverted prefix buckets.
+
+```sh
+python3 drawing-utilities/build_parameter_evolution_audit.py \
+  --history /path/to/optimizer_history.json \
+  --config-root /path/to/real_sims \
+  --output /path/to/parameter_evolution_audit.html
+```
+
+The candidate configs are required because the history artifact itself records
+scores and candidate coordinates, but does not embed parameter snapshots.
+
 ## Explicitly deferred
 
 The following are **DEFERRED** and are not claimed by the reliable pipeline:

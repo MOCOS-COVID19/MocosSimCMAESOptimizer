@@ -63,6 +63,57 @@ Additional findings:
    confounding, or projection bias. Bound-hit rates need to be reported per
    coordinate before interpreting CMA step sizes.
 
+## Parameter-evolution audit
+
+The 6-, 9-, and 12-month portion of `optimizer_history.json` contains 280
+candidate rows. Five 12-month rows have no finite score, leaving 275 scored
+candidate configurations (64, 96, and 115 by stage). Because history contains
+candidate identity and scores but not parameter snapshots, this analysis joins
+each row to `real_sims/<stage>/iter_<n>/cand_<nn>/config.json`. The repository's
+`build_parameter_evolution_audit.py` utility makes that join explicit and
+produces an interactive report rather than implying that values came directly
+from the history JSON.
+
+Population medians moved as follows from the first to final generation:
+
+| Stage | `school` | `class` | `age_coupling_param` |
+|---|---:|---:|---:|
+| 6 months | 0.0568 → 0.0637 | 0.2482 → 0.3121 | 0.5985 → 0.5993 |
+| 9 months | 0.1309 → 0.1956 | 0.3069 → 0.3204 | 0.6050 → 0.6116 |
+| 12 months | 0.2009 → 0.2321 | 0.2836 → 0.2483 | 0.6114 → 0.6082 |
+
+The strongest systematic scalar movement is therefore in `school`, while age
+coupling stays in a narrow band. `class` changes direction in the 12-month
+stage. The best candidates do not simply equal the final population medians:
+their `(school, class, age_coupling_param)` values are respectively
+`(0.2602, 0.3070, 0.6172)`, `(0.1959, 0.2927, 0.6117)`, and
+`(0.2572, 0.2607, 0.6054)` for 6, 9, and 12 months. This is consistent with an
+actively moving, weakly identified population—not evidence of scalar
+convergence.
+
+All three modulation configs retain fifteen monthly values. The handoff is
+wrong for every modulation vector. The six-month winner is iteration 4,
+candidate 9, but buckets 4–6 in the first nine-month configuration do not match
+that winner. The nine-month winner is iteration 4, candidate 20, but buckets
+7–9 in the first twelve-month configuration do not match it either. In each
+case the values reverted to an older trajectory. Thus the later stages did not
+start from all improvements fitted by their immediate predecessor.
+
+The root cause is distinct from the sampled/evaluated-vector defect: stage
+handoff selected the first diversity-archive entry as the prefix seed, while
+the persisted `historical_trajectory` was the CMA population mean. Neither is
+necessarily the best scored effective candidate. The corrective implementation
+now makes the immediate predecessor's best effective configuration and vector
+the sole owner of locked historical coordinates. Survivor archive entries are
+still useful as protected diversity candidates, but cannot define the locked
+prefix. Fresh-process loading verifies matching best-config hashes and rejects
+a trajectory that differs from the best vector. Existing state from this run
+does not contain that new proof and must not be resumed.
+
+Use the report's handoff-integrity table to see the exact mismatching bucket
+indices, its vector selector to inspect infection, mild-detection, and tracing
+separately, and its stage filters to avoid joining lines across horizon changes.
+
 ## Recommended next run
 
 Do not immediately replace CMA-ES. First make the experiment capable of giving
