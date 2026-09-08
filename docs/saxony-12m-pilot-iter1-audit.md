@@ -127,9 +127,10 @@ CMA-ES a fair, measurable test:
    historical prefix fixed and an **active search space containing only the
    three scalar parameters and nine new temporal values**. Avoid carrying 27
    locked temporal coordinates in CMA's dimension.
-3. Use at least 20 generations for the corrected pilot, with a plateau rule
-   such as no material improvement in the best and median score for five
-   generations. Five generations cannot establish a plateau.
+3. Use maximum budgets of 10, 15, and 20 generations for the corrected 6-, 9-,
+   and 12-month stages, with no material improvement in both best and median
+   validation score for three generations as the plateau rule. Require at least
+   six completed generations before that rule is eligible to stop a stage.
 4. Spend the first fixed budget on a small policy tournament: independent
    baseline, temporal-escape, and one restart run, using identical simulator
    seeds and candidate budgets. Select on rolling-origin validation loss, not
@@ -144,6 +145,26 @@ CMA-ES a fair, measurable test:
 7. Repair final validation and require three finite replicate scores before the
    run can be called successful. Preserve a precise output error in the result
    artifact whenever an exit-zero adapter run is rejected.
+
+### Initial-sigma conclusion
+
+The affected run cannot identify an optimal sigma: its CMA updates used vectors
+that did not match the evaluated configurations, and the run contains only one
+initial-sigma policy. There is therefore no valid counterfactual showing that
+`0.12` beats a narrower scale.
+
+For an unchanged `4/4/4/5`-generation exploratory rerun, keep configured sigma
+at `0.12` for 3, 6, 9, and 12 months. With so few updates, reducing the initial
+scale would spend more of the run expanding a distribution that already lacks a
+convergence budget. This recommendation is conditional on monitoring projection
+and bound hits; `0.12` is the implementation ceiling, not a measured optimum.
+
+For the corrected 20-or-more-generation experiment, compare `0.06`, `0.09`, and
+`0.12` from identical predecessor state and simulator seeds. Rank the policies
+on rolling-origin validation, use the same total candidate count, and record
+actual marginal deviations (`sigma[i] * sqrt(covariance[i,i])`). Do not assign
+different values merely from horizon length: later stages inherit coordinate
+uncertainty, so their configured scalar is not the complete sampling scale.
 
 ## If corrected CMA-ES is still too expensive
 
