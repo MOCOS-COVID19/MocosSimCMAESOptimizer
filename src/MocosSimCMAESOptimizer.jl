@@ -4369,6 +4369,12 @@ function run_stage(
                     candidate_class=candidate_class, policy="reject")
                 transition_report = transition["report"]
                 cand_cfg = transition["config"]
+                # Ranking and CMA adaptation must use the parameter vector that
+                # actually produced the simulation. Prefix locking and the
+                # transition policy can overwrite sampled temporal values; if
+                # we retain `x` here CMA learns from unevaluated (phantom)
+                # coordinates and corrupts its mean/covariance after transfer.
+                x = initial_vector(cand_cfg, specs_stage)
                 transition_rejected = transition["status"] == "rejected"
                 skipped = isfile(joinpath(cand_dir, "skipped.ok"))
                 metrics = if transition_rejected
@@ -4556,6 +4562,9 @@ function run_stage(
                     candidate_class=candidate_class, policy="reject")
                 transition_report = transition["report"]
                 candidate_cfg = transition["config"]
+                # Keep the optimizer state, archive, and provenance aligned
+                # with the effective configuration passed to the simulator.
+                x = initial_vector(candidate_cfg, specs_stage)
                 existing_terminal = candidate_terminal_status(cand_dir)
                 # A caller-created skipped marker is authoritative.  In
                 # particular, local scoring must not turn an explicitly
