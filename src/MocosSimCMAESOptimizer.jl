@@ -2961,7 +2961,11 @@ function temporal_jump_penalty(cfg::OptimizerConfig, candidate::AbstractDict)
         end
         length(values) < 2 && continue
         first_difference = mean(abs.(diff(values)))
-        second_difference = length(values) < 3 ? 0.0 : mean(abs.(diff(values, 2)))
+        # Julia 1.7 only supports the dimension as a keyword and does not
+        # interpret a second positional argument as the difference order.
+        # Apply `diff` twice to calculate the second finite difference on all
+        # supported Julia versions.
+        second_difference = length(values) < 3 ? 0.0 : mean(abs.(diff(diff(values))))
         push!(penalties, first_difference + second_difference)
     end
     return isempty(penalties) ? 0.0 : mean(penalties)
