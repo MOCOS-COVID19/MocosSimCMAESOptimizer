@@ -154,6 +154,12 @@ end
     @test [bytes2hex(open(sha256, p)) for p in sources] == hashes
     @test !isdir(joinpath(dirname(path), "out"))
 
+    # IntervalsModulations also supports N interval values separated by N - 1
+    # boundary times, which is the schema used by the production seed.
+    _, boundary_path, _ = model_schema_fixture(interval_times=[30, 60],
+                                                interval_values=[0.2, 0.3, 0.4])
+    @test O.preflight_config(boundary_path; readiness=true)["valid"]
+
     _, missing_path, _ = model_schema_fixture(missing_key=:covimod)
     err = try O.preflight_config(missing_path) catch e; e end
     @test err isa ArgumentError

@@ -240,7 +240,12 @@ function _validate_seed_model_inputs(seed::AbstractDict, seed_path::String,
         values isa AbstractVector || throw(ArgumentError("seed.$path must be a vector"))
         times_path = replace(path, r"\.interval_values$" => ".interval_times")
         times = _seed_nested(seed, times_path)
-        times isa AbstractVector && length(times) == length(values) ||
+        # IntervalsModulations accepts both timestamped values (one value per
+        # time) and boundary times (one fewer boundary than interval values).
+        # The production seed uses the latter representation: N values define
+        # N intervals separated by N - 1 boundary times.
+        times isa AbstractVector &&
+            length(times) in (length(values), length(values) - 1) ||
             throw(ArgumentError("seed.$path and $times_path dimensions disagree"))
         isempty(times) && throw(ArgumentError("seed.$path interval schema is empty"))
         all(x -> x isa Number && isfinite(Float64(x)) && Float64(x) > 0, times) ||
