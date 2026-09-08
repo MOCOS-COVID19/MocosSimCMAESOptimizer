@@ -154,6 +154,25 @@ end
     @test [bytes2hex(open(sha256, p)) for p in sources] == hashes
     @test !isdir(joinpath(dirname(path), "out"))
 
+    # The raw Saxony scholars source has its own date/semicolon schema. It is
+    # validated as provenance and checked against the normalized input.
+    gt = joinpath(dirname(path), "gt")
+    write(joinpath(gt, "sax-scholars-infections.csv"),
+          "calendar_week_date;students_infected_weekly\n2020-11-12;198\n2020-11-18;145\n")
+    write(joinpath(gt, "sax-scholars-infections-normalized.csv"),
+          "day,value\n72,198\n78,145\n")
+    manifest_with_source = O.preflight_config(path; readiness=true)
+    @test manifest_with_source["valid"]
+    source_entry = manifest_with_source["ground_truth"]["sax-scholars-infections.csv"]
+    @test source_entry["schema"] == "calendar_date_semicolon_source"
+    @test source_entry["normalized_values_match"]
+
+    write(joinpath(gt, "sax-scholars-infections-normalized.csv"),
+          "day,value\n72,999\n78,145\n")
+    err = try O.preflight_config(path; readiness=true) catch e; e end
+    @test err isa ArgumentError
+    @test occursin("values differ", sprint(showerror, err))
+
     # IntervalsModulations also supports N interval values separated by N - 1
     # boundary times, which is the schema used by the production seed.
     _, boundary_path, _ = model_schema_fixture(interval_times=[30, 60],
