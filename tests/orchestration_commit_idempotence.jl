@@ -174,6 +174,52 @@ end
               for c in report["contradictions"])
 end
 
+@testset "committed validation accepts cumulative survivor archive" begin
+    root = mktempdir()
+    stage_root, _ = write_committed_fixture(root)
+
+    names = ["beta[1]", "beta[2]"]
+    previous = Dict("stage"=>"stage_short", "iteration"=>1, "candidate"=>7,
+                    "status"=>"completed", "score"=>0.05,
+                    "parameter_names"=>names)
+    current = Dict("stage"=>"stage_short", "iteration"=>2, "candidate"=>1,
+                   "status"=>"completed", "score"=>0.1,
+                   "parameter_names"=>names)
+    open(joinpath(stage_root, "iter_metrics.jsonl"), "w") do io
+        for row in (previous, current)
+            JSON.print(io, row); print(io, '\n')
+        end
+    end
+    O.safe_save_json(joinpath(stage_root, "stage_state.json"),
+        Dict("stage"=>"stage_short", "iteration"=>2, "best_candidate_id"=>1,
+             "best_score"=>0.1, "param_names"=>names))
+    O.safe_save_json(joinpath(stage_root, "top_candidates.json"), [current])
+    O.safe_save_json(joinpath(stage_root, "survivor_archive.json"), [previous, current])
+    reusable = O.load_json(joinpath(stage_root, "full_reusable_state.json"))
+    reusable["iteration"] = 2
+    reusable["archive_ids"] = [7, 1]
+    O.safe_save_json(joinpath(stage_root, "full_reusable_state.json"), reusable)
+
+    rm(joinpath(stage_root, "iter_1"); recursive=true)
+    commit_path = joinpath(stage_root, "iter_2", "iteration_commit.json")
+    mkpath(dirname(commit_path))
+    committed = ["stage_state.json", "iter_metrics.jsonl", "top_candidates.json",
+        "survivor_archive.json", "full_reusable_state.json"]
+    hashes = Dict(name => bytes2hex(SHA.sha256(read(joinpath(stage_root, name))))
+                  for name in committed)
+    digest = bytes2hex(SHA.sha256(JSON.json(hashes)))
+    O.safe_save_json(commit_path, Dict("status"=>"committed", "stage"=>"stage_short",
+        "iteration"=>2, "schema_version"=>"fixture-v1", "artifact_hashes"=>hashes,
+        "artifact_key_set"=>committed, "artifact_hash_manifest"=>digest,
+        "artifact_integrity_digest"=>digest))
+
+    report = O.validate_committed_artifacts(stage_root, "fixture-v1")
+    @test report["valid"]
+    @test isempty(report["contradictions"])
+    @test report["archive_candidate_ids"] == [("stage_short", 1, 7),
+                                                ("stage_short", 2, 1)]
+end
+
 @testset "committed artifact manifest rejects extras and tampering" begin
     root = mktempdir()
     stage_root, _ = write_committed_fixture(root)
