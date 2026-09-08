@@ -1401,6 +1401,64 @@ function archive_entry_config(archive)
     return nothing
 end
 
+function stage_vector_from_config(seed::AbstractDict, cfg::AbstractDict,
+                                  specs_stage::Vector{ParamSpec})
+    projected = deepcopy(cfg isa Dict{String,Any} ? cfg : Dict{String,Any}(cfg))
+    if CURRENT_OPTIMIZER_CONFIG[] !== nothing &&
+       CURRENT_OPTIMIZER_CONFIG[].temporal_parameterization == "monthly"
+        for spec in specs_stage
+            spec.kind == :temporal || continue
+            times_path = replace(spec.name, "interval_values" => "interval_times")
+            try
+                get_nested(projected, times_path)
+            catch
+                seed_dict = seed isa Dict{String,Any} ? seed : Dict{String,Any}(seed)
+                set_nested!(projected, times_path, deepcopy(get_nested(seed_dict, times_path)))
+            end
+        end
+    end
+    return initial_vector(projected, specs_stage)
+end
+
+function stage_vector_to_config(seed::AbstractDict, cfg::AbstractDict,
+                                specs_stage::Vector{ParamSpec}, values::Vector{Float64})
+    effective_cfg = deepcopy(cfg isa Dict{String,Any} ? cfg : Dict{String,Any}(cfg))
+    seed_dict = seed isa Dict{String,Any} ? seed : Dict{String,Any}(seed)
+    optcfg = CURRENT_OPTIMIZER_CONFIG[]
+    idx = 1
+    for spec in specs_stage
+        if spec.kind == :scalar
+            value = optcfg === nothing ? values[idx] :
+                decode_scalar_value(optcfg, seed_dict, spec, values[idx])
+            set_nested!(effective_cfg, spec.name, value)
+            idx += 1
+        else
+            current = collect(Float64.(get_nested(effective_cfg, spec.name)))
+            if optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
+                times_path = replace(spec.name, "interval_values" => "interval_times")
+                interval_times = try get_nested(effective_cfg, times_path) catch
+                    get_nested(seed_dict, times_path)
+                end
+                for i in eachindex(current)
+                    isempty(interval_times) && break
+                    month = monthly_bucket(interval_times[min(i, length(interval_times))],
+                                           optcfg.monthly_days)
+                    month <= spec.length && (current[i] = values[idx + month - 1])
+                end
+                idx += spec.length
+            else
+                for i in 1:min(spec.length, length(current))
+                    current[i] = values[idx]
+                    idx += 1
+                end
+                idx += max(0, spec.length - length(current))
+            end
+            set_nested!(effective_cfg, spec.name, current)
+        end
+    end
+    return effective_cfg
+end
+
 function effective_transition_report(seed::AbstractDict, cfg::AbstractDict,
                                     specs_stage::Vector{ParamSpec},
                                     source_entry=nothing;
@@ -1410,15 +1468,7 @@ function effective_transition_report(seed::AbstractDict, cfg::AbstractDict,
     values = if haskey(cfg, "values")
         Float64.(cfg["values"])
     else
-        collected = Float64[]
-        for spec in specs_stage
-            raw = try get_nested(cfg, spec.name) catch; Any[] end
-            raw isa AbstractVector || (raw = [raw])
-            for value in raw
-                value isa Number && push!(collected, Float64(value))
-            end
-        end
-        collected
+        stage_vector_from_config(seed, cfg, specs_stage)
     end
     prior = if source_entry isa AbstractDict
         Dict{String,Any}(
@@ -1458,12 +1508,12 @@ function enforce_transition_policy(seed::AbstractDict, cfg::AbstractDict,
     policy in ("reject", "clip", "exception") ||
         throw(ArgumentError("unsupported transition policy: $policy"))
     names = ["$(spec.name)[$i]" for spec in specs_stage for i in 1:spec.length]
-    values = Float64[]
-    for spec in specs_stage
-        raw = try get_nested(cfg, spec.name) catch; Any[] end
-        raw isa AbstractVector || (raw = [raw])
-        append!(values, Float64.(raw))
-    end
+    # A stage specification can expose only a monthly prefix of a much denser
+    # temporal array in the simulator config.  Convert the effective config
+    # back through the same stage-coordinate projection used to initialize
+    # CMA-ES rather than treating every simulator interval as a coordinate.
+    cfg_dict = cfg isa Dict{String,Any} ? cfg : Dict{String,Any}(cfg)
+    values = stage_vector_from_config(seed, cfg_dict, specs_stage)
     length(values) == length(names) ||
         throw(ArgumentError("candidate coordinate count does not match stage specification"))
     prior = source_entry isa AbstractDict ?
@@ -1484,21 +1534,9 @@ function enforce_transition_policy(seed::AbstractDict, cfg::AbstractDict,
             effective[i] = old_values[old_map[name]] + sign(delta) * limit
         end
     end
-    effective_cfg = deepcopy(cfg)
-    idx = 1
-    for spec in specs_stage
-        if spec.kind == :scalar
-            set_nested!(effective_cfg, spec.name, effective[idx])
-            idx += 1
-        else
-            current = collect(Float64.(get_nested(effective_cfg, spec.name)))
-            for j in 1:min(spec.length, length(current))
-                current[j] = effective[idx]
-                idx += 1
-            end
-            set_nested!(effective_cfg, spec.name, current)
-        end
-    end
+    # Expand clipped monthly coordinates onto the simulator interval grid
+    # without changing unrelated configuration fields or the stage horizon.
+    effective_cfg = stage_vector_to_config(seed, cfg_dict, specs_stage, effective)
     report = effective_transition_report(seed, effective_cfg, specs_stage, source_entry;
         candidate_class=candidate_class, limit=limit)
     for (i, row) in enumerate(report["coordinates"])

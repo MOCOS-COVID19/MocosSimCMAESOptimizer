@@ -114,6 +114,21 @@ const O = MocosSimCMAESOptimizer
     @test clipped["status"] == "accepted"
     @test clipped["report"]["policy_outcome"] == "clipped"
     @test clipped["config"]["curve"]["interval_values"] == [0.2, 0.2, 0.2]
+
+    # The simulator array may be denser/longer than the active stage's monthly
+    # coordinate vector.  Inactive suffix values must not cause a dimension
+    # mismatch or participate in transition enforcement.
+    prefix_specs = [O.ParamSpec("curve.interval_values", :temporal, 2, 0.0, 1.0)]
+    dense_candidate = Dict{String,Any}("curve" => Dict{String,Any}(
+        "interval_values" => [0.2, 0.2, 0.9],
+        "interval_times" => [1, 30, 61],
+    ))
+    prefix_transition = O.enforce_transition_policy(seed2, dense_candidate, prefix_specs;
+        candidate_class="immigrant/escape", limit=0.15, policy="reject")
+    @test prefix_transition["status"] == "accepted"
+    @test length(prefix_transition["report"]["coordinates"]) == 2
+    @test prefix_transition["config"]["curve"]["interval_values"] == [0.2, 0.2, 0.9]
+    @test !haskey(prefix_transition["config"], "stop_simulation_time")
     a = O.build_state_from_reusable(seed2, specs2, reusable; rng=MersenneTwister(8))
     b = O.build_state_from_reusable(seed2, specs2, reusable; rng=MersenneTwister(8))
     @test a.mean == b.mean
