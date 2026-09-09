@@ -101,6 +101,9 @@ Both configurations rank by a normalized composite of 40% rolling validation
 RMAE, 30% training-window cumulative detection error, and 30% training-window
 cumulative death error. Phase 1 freezes modulation vectors and fits the three
 scalars; Phase 2 consumes that result, freezes the scalars, and fits modulation.
+The rolling validation term covers total detections/deaths plus detections and
+deaths for all six age groups. Totals receive 25% each; each family of age-group
+metrics receives 25%, distributed by the configured population shares.
 
 ## Explicitly deferred
 

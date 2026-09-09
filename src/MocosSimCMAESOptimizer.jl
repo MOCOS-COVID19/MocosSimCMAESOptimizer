@@ -3572,11 +3572,36 @@ function validation_score_from_daily(cfg::OptimizerConfig, daily_path::String, d
     holdout_days = requested_end - requested_start + 1
     gt = load_gt_series(cfg.external_sim === nothing ? joinpath(MANAGER_ROOT, "gt") : cfg.external_sim.gt_dir)
     metric_scores = Dict{String,Float64}()
+    configured_weights = get(cfg.validation, "validation_metric_weights", nothing)
+    metric_weights = configured_weights === nothing ? Dict{String,Float64}(
+        "daily_detections" => 1.0,
+        "daily_deaths" => 1.0,
+        "daily_age_05_14_detections" => 1.0,
+    ) : begin
+        configured_weights isa AbstractDict || throw(ArgumentError(
+            "validation.validation_metric_weights must be an object"))
+        Dict{String,Float64}(String(name) => Float64(weight)
+            for (name, weight) in configured_weights)
+    end
+    isempty(metric_weights) && throw(ArgumentError(
+        "validation.validation_metric_weights must not be empty"))
+    any(weight -> !isfinite(weight) || weight < 0.0, values(metric_weights)) &&
+        throw(ArgumentError("validation metric weights must be nonnegative and finite"))
+    sum(values(metric_weights)) > 0.0 || throw(ArgumentError(
+        "validation.validation_metric_weights must contain a positive weight"))
     retained = Int[]
-    for metric in ("daily_detections", "daily_deaths", "daily_age_05_14_detections")
-        haskey(gt, metric) || continue
+    missing_metrics = String[]
+    for metric in sort!(collect(keys(metric_weights)))
+        metric_weights[metric] == 0.0 && continue
+        if !haskey(gt, metric)
+            push!(missing_metrics, metric)
+            continue
+        end
         trajs = read_daily_metric(daily_path, metric)
-        trajs === nothing && continue
+        if trajs === nothing
+            push!(missing_metrics, metric)
+            continue
+        end
         scores = Float64[]
         for traj in trajs
             requested_start > min(requested_end, length(gt[metric]), length(traj)) && continue
@@ -3598,9 +3623,12 @@ function validation_score_from_daily(cfg::OptimizerConfig, daily_path::String, d
         "requested_start_day" => requested_start, "holdout_days" => holdout_days,
         "split_mode" => windows["mode"],
         "seeds" => get(cfg.validation, "seeds", [42, 43, 44]),
-        "metrics" => metric_scores, "retained_indices" => retained,
+        "metrics" => metric_scores, "metric_weights" => metric_weights,
+        "missing_metrics" => missing_metrics, "retained_indices" => retained,
         "count" => length(retained),
-        "mean_error" => isempty(metric_scores) ? Inf : mean(collect(values(metric_scores))),
+        "mean_error" => isempty(metric_scores) || !isempty(missing_metrics) ? Inf :
+            sum(metric_weights[name] * value for (name, value) in metric_scores) /
+            sum(metric_weights[name] for name in keys(metric_scores)),
     )
 end
 

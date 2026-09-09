@@ -45,6 +45,22 @@
       "validation_mean_error": 0.4,
       "daily_detections_cumulative": 0.3,
       "daily_deaths_cumulative": 0.3
+    },
+    "validation_metric_weights": {
+      "daily_detections": 0.25,
+      "daily_deaths": 0.25,
+      "daily_age_00_04_detections": 0.01083174086975,
+      "daily_age_00_04_deaths": 0.01083174086975,
+      "daily_age_05_14_detections": 0.02300023596325,
+      "daily_age_05_14_deaths": 0.02300023596325,
+      "daily_age_15_34_detections": 0.047954094507,
+      "daily_age_15_34_deaths": 0.047954094507,
+      "daily_age_35_59_detections": 0.082963537985,
+      "daily_age_35_59_deaths": 0.082963537985,
+      "daily_age_60_79_detections": 0.06223277900925,
+      "daily_age_60_79_deaths": 0.06223277900925,
+      "daily_age_80_plus_detections": 0.02301761166575,
+      "daily_age_80_plus_deaths": 0.02301761166575
     }
   },
   "seed_config": "./runs/saxony-corrected-phase1-scalars/final_best_candidate.json",

@@ -26,6 +26,8 @@ end
     @test p2["seed_config"] == "./runs/saxony-corrected-phase1-scalars/final_best_candidate.json"
     @test p1["validation"]["selection_objective_weights"] == p2["validation"]["selection_objective_weights"]
     @test isempty(p1["validation"]["selection_replicate_seeds"])
+    @test length(p1["validation"]["validation_metric_weights"]) == 14
+    @test sum(values(p1["validation"]["validation_metric_weights"])) ≈ 1.0
 end
 
 @testset "tail-only temporal coordinates preserve prefix" begin
