@@ -11,10 +11,16 @@ training loss and is not a full-horizon goodness-of-fit percentage. Because
 absolute errors (RMAEs) over days 153--180. Candidate 5/23 has validation RMAEs
 of `0.300306` for detections, `0.300199` for deaths, and `0.513314` for
 age-5--14 detections; their mean is exactly `0.371273`.
+Only these three dimensions appeared because the legacy validation scorer
+hard-coded that tuple; the other age-stratified series were calculated as
+training diagnostics but were not included in candidate selection. The Phase 1
+and Phase 2 configurations replace that legacy set with explicit weighted total,
+age-stratified detection, and age-stratified death dimensions.
 
-The same candidate is a poor six-month calibration: full-horizon RMAE is
-`0.823826` for detections and `0.819735` for deaths, while cumulative relative
-errors are `0.823769` and `0.810301`. Its predicted/observed totals
+The same candidate is a poor calibration: training-window (days 1--152) RMAE
+is `0.823826` for detections and `0.819735` for deaths, while training-window
+cumulative relative errors are `0.823769` and `0.810301`. Its independent
+full-stage predicted/observed totals
 (`41,416/190,633` detections and `2,014/8,347` deaths) are consistent with
 those errors. Selection has optimized the last 28 days at the expense of the
 preceding 152 days.
@@ -23,10 +29,10 @@ preceding 152 days.
 
 All 192 completed candidates (24 candidates in each of eight iterations) were
 read from `optimizer_history.json`. The table reports the minimum and median
-selection score and the full-horizon cumulative errors of the candidate with
+selection score and the training-window cumulative errors of the candidate with
 the minimum selection score in each iteration.
 
-| Iteration | Best candidate | Selection min | Selection median | Detection cumulative error | Death cumulative error | Training NB NLL |
+| Iteration | Best candidate | Selection min | Selection median | Training detection cumulative error | Training death cumulative error | Training NB NLL |
 |---:|---:|---:|---:|---:|---:|---:|
 | 1 | 17 | 0.506936 | 0.688963 | 0.886240 | 0.910377 | 4276.103 |
 | 2 | 4  | 0.472611 | 0.677808 | 0.874080 | 0.883605 | 3527.416 |
@@ -38,7 +44,7 @@ the minimum selection score in each iteration.
 | 8 | 15 | 0.407346 | 0.486624 | 0.851436 | 0.868180 | 2838.649 |
 
 The selection objective improved through iteration 5, then plateaued. The
-full-horizon errors did not converge to an acceptable level. Across all
+training-window errors did not converge to an acceptable level. Across all
 candidates, Pearson correlations between selection score and detection/death
 cumulative errors are `-0.771` and `-0.753`: lower validation scores generally
 correspond to *worse* cumulative fit. The best mean cumulative-error candidate
@@ -88,7 +94,7 @@ three modulation vectors.
 Use the following sequence:
 
 1. **Repair selection first.** Rank on a declared composite containing
-   full-horizon detection/death cumulative error plus rolling-window shape
+   training-window detection/death cumulative error plus rolling-window shape
    error. Report every component and reject candidates whose total ratios fall
    outside a declared calibration band (a starting diagnostic band of
    `0.5--2.0`, not a final scientific threshold).

@@ -263,11 +263,16 @@ end
         cfg = O.OptimizerConfig("seed", root, 30, O.StageConfig[],
             Dict{String,Tuple{Float64,Float64}}(), Dict{String,Tuple{Float64,Float64}}(),
             Dict{String,Dict{String,Any}}(), "monthly", Dict{String,Float64}(),
-            Dict{String,Any}("enabled" => true, "holdout_days" => 2),
+            Dict{String,Any}("enabled" => true, "holdout_days" => 2,
+                "validation_metric_weights" => Dict(
+                    "daily_detections" => 0.25, "daily_deaths" => 0.75)),
             objective, ext, Dict{String,Vector{String}}(), nothing, posterior)
         score, payload = O.score_from_daily(cfg, daily, 3)
         @test isfinite(score)
         @test payload["validation_window"] isa Dict{String,Any}
+        @test payload["validation_window"]["metric_weights"] ==
+            Dict("daily_detections" => 0.25, "daily_deaths" => 0.75)
+        @test isempty(payload["validation_window"]["missing_metrics"])
         @test payload["effective_metric_manifest"] isa Dict{String,Any}
         @test payload["effective_metric_manifest"]["weekly_control"]["weight"] == 0.0
     end
