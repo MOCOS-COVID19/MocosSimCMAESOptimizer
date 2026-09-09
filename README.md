@@ -105,6 +105,11 @@ The rolling validation term covers total detections/deaths plus detections and
 deaths for all six age groups. Totals receive 25% each; each family of age-group
 metrics receives 25%, distributed by the configured population shares.
 
+Both phases start with normalized sigma `0.20` (20% of each
+parameter range); the optimizer ceiling is also `0.20`, so this value is not
+silently clamped back to the former `0.12` limit. Incumbent preservation keeps
+the wider initial search from discarding the best configuration already found.
+
 ## Explicitly deferred
 
 The following are **DEFERRED** and are not claimed by the reliable pipeline:

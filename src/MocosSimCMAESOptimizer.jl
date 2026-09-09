@@ -13,7 +13,7 @@ using SHA
 const MANAGER_ROOT = abspath(joinpath(@__DIR__, ".."))
 const CURRENT_OPTIMIZER_CONFIG = Ref{Any}(nothing)
 const CMA_SIGMA_MIN = 0.02
-const CMA_SIGMA_MAX = 0.12
+const CMA_SIGMA_MAX = 0.20
 const NEW_TEMPORAL_VARIANCE = 0.04
 
 export main, run_optimizer, run_long_horizon, run_nuts_from_archive,
@@ -22,6 +22,7 @@ export main, run_optimizer, run_long_horizon, run_nuts_from_archive,
        persist_archive_transfer_manifest, preflight_config, create_candidate_root,
        adapter_failure, candidate_terminal_status, wait_for_iteration_outputs,
        stage_resume_info, materialize_terminal_candidate!, normalized_iteration_result,
+       preserve_incumbent!,
        atomic_save_json, validate_committed_artifacts, load_immediate_predecessor_state,
        canonical_data_protocol, temporal_data_split,
        stage_data_split, negative_binomial_loglikelihood,
@@ -34,6 +35,24 @@ struct ExternalSimConfig
     project_dir::String
     advanced_cli::String
     disable_compiled_modules::Bool
+end
+
+"""Reserve one population slot for the best configuration evaluated so far.
+
+CMA-ES is not elitist: sampling only from its distribution can omit (and, at a
+stage boundary, never evaluate) the incumbent.  The returned index identifies
+the protected slot so callers can record truthful provenance rather than
+mistaking it for an archive transfer or random immigrant.
+"""
+function preserve_incumbent!(candidates, zs, incumbent::AbstractVector)
+    isempty(candidates) && throw(ArgumentError("cannot preserve an incumbent in an empty population"))
+    length(candidates) == length(zs) || throw(ArgumentError("candidate and step populations differ"))
+    slot = length(candidates)
+    length(candidates[slot]) == length(incumbent) ||
+        throw(ArgumentError("incumbent dimension does not match population"))
+    candidates[slot] = Float64.(incumbent)
+    zs[slot] = zeros(Float64, length(incumbent))
+    return slot
 end
 
 struct StageConfig
@@ -4444,6 +4463,12 @@ function run_stage(
                 end
             end
         end
+        # CMA-ES is non-elitist.  Always evaluate the effective incumbent in a
+        # protected slot, including iteration one where this is the phase seed.
+        # This makes a phase transition monotone under the phase's declared
+        # selection objective instead of silently discarding the predecessor.
+        incumbent_vector = initial_vector(best_candidate, specs_stage)
+        incumbent_candidate_id = preserve_incumbent!(candidates, zs, incumbent_vector)
         iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
         mkpath(iter_root)
         # An incomplete iteration is regenerated from its saved CMA state.  Do
@@ -4474,14 +4499,16 @@ function run_stage(
                     candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
                     inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
                     inject_temporal_prefix_locks!(candidate_cfg, seed, previous_specs)
-                    transfer_entry = ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
-                    candidate_class = transfer_entry === nothing ? "immigrant/escape" : "archive_transfer"
+                    is_incumbent = ci == incumbent_candidate_id
+                    transfer_entry = !is_incumbent && ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
+                    candidate_class = is_incumbent ? "stage_incumbent" :
+                        (transfer_entry === nothing ? "immigrant/escape" : "archive_transfer")
                     if transfer_entry !== nothing
                         x = archive_vector_for_stage(transfer_entry, specs_stage, x)
                         x, clip_info = clip_candidate(x, specs_stage)
-                        cand_cfg = vector_to_config(seed, specs_stage, x, active_months)
-                        inject_frozen!(cand_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
-                        inject_temporal_prefix_locks!(cand_cfg, seed, previous_specs)
+                        candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
+                        inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
+                        inject_temporal_prefix_locks!(candidate_cfg, seed, previous_specs)
                     end
                     transition = enforce_transition_policy(seed, candidate_cfg, specs_stage, transfer_entry;
                         candidate_class=candidate_class, policy="reject")
@@ -4531,8 +4558,10 @@ function run_stage(
                 cand_cfg = vector_to_config(seed, specs_stage, x, active_months)
                 inject_frozen!(cand_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
                 inject_temporal_prefix_locks!(cand_cfg, seed, previous_specs)
-                transfer_entry = ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
-                candidate_class = transfer_entry === nothing ? "immigrant/escape" : "archive_transfer"
+                is_incumbent = ci == incumbent_candidate_id
+                transfer_entry = !is_incumbent && ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
+                candidate_class = is_incumbent ? "stage_incumbent" :
+                    (transfer_entry === nothing ? "immigrant/escape" : "archive_transfer")
                 if transfer_entry !== nothing
                     x = archive_vector_for_stage(transfer_entry, specs_stage, x)
                     x, clip_info = clip_candidate(x, specs_stage)
@@ -4694,7 +4723,8 @@ function run_stage(
                     "metrics" => metrics,
                     "transition_delta_report" => transition_report,
                     "provenance" => Dict{String,Any}(
-                        "source" => transfer_entry === nothing ? "cma_population" : "predecessor_archive",
+                        "source" => is_incumbent ? "stage_incumbent" :
+                            (transfer_entry === nothing ? "cma_population" : "predecessor_archive"),
                         "predecessor_archive_entry" => transfer_entry === nothing ? nothing : get(transfer_entry, "candidate", nothing),
                         "candidate_class" => candidate_class,
                     ),
@@ -4728,14 +4758,16 @@ function run_stage(
                 candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
                 inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
                 inject_temporal_prefix_locks!(candidate_cfg, seed, previous_specs)
-                transfer_entry = ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
-                candidate_class = transfer_entry === nothing ? "immigrant/escape" : "archive_transfer"
+                is_incumbent = ci == incumbent_candidate_id
+                transfer_entry = !is_incumbent && ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
+                candidate_class = is_incumbent ? "stage_incumbent" :
+                    (transfer_entry === nothing ? "immigrant/escape" : "archive_transfer")
                 if transfer_entry !== nothing
                     x = archive_vector_for_stage(transfer_entry, specs_stage, x)
                     x, clip_info = clip_candidate(x, specs_stage)
-                    cand_cfg = vector_to_config(seed, specs_stage, x, active_months)
-                    inject_frozen!(cand_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
-                    inject_temporal_prefix_locks!(cand_cfg, seed, previous_specs)
+                    candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
+                    inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
+                    inject_temporal_prefix_locks!(candidate_cfg, seed, previous_specs)
                 end
                 transition = enforce_transition_policy(seed, candidate_cfg, specs_stage, transfer_entry;
                     candidate_class=candidate_class, policy="reject")
@@ -4816,7 +4848,8 @@ function run_stage(
                     "metrics" => metrics,
                     "transition_delta_report" => transition_report,
                     "provenance" => Dict{String,Any}(
-                        "source" => transfer_entry === nothing ? "cma_population" : "predecessor_archive",
+                        "source" => is_incumbent ? "stage_incumbent" :
+                            (transfer_entry === nothing ? "cma_population" : "predecessor_archive"),
                         "predecessor_archive_entry" => transfer_entry === nothing ? nothing : get(transfer_entry, "candidate", nothing),
                         "candidate_class" => candidate_class,
                     ),

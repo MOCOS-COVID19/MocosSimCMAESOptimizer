@@ -72,7 +72,7 @@
       "fit_months": 6,
       "max_iterations": 10,
       "population_size": 24,
-      "sigma": 0.12
+      "sigma": 0.2
     }
   ],
   "scalar_bounds": {
