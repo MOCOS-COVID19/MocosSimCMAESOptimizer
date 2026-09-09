@@ -80,6 +80,28 @@ python3 drawing-utilities/build_parameter_evolution_audit.py \
 The candidate configs are required because the history artifact itself records
 scores and candidate coordinates, but does not embed parameter snapshots.
 
+The focused [six-month corrected-run audit](docs/saxony-corrected-6m-audit.md)
+explains why the reported `0.371273` validation score coexists with severe
+full-horizon underprediction and proposes a scalar-profile, conditional-vector,
+then joint-refinement experiment instead of a global sigma increase.
+
+## Two-phase corrected calibration
+
+Run the first two calibration phases as separate Slurm jobs. Phase 2 points to
+Phase 1's final candidate and therefore intentionally fails preflight until
+Phase 1 has completed:
+
+```sh
+sbatch scripts/run_cmaes.slurm optimizer_config.saxony.phase1-scalars.json
+# Wait for runs/saxony-corrected-phase1-scalars/final_best_candidate.json.
+sbatch scripts/run_cmaes.slurm optimizer_config.saxony.phase2-vectors.json
+```
+
+Both configurations rank by a normalized composite of 40% rolling validation
+RMAE, 30% training-window cumulative detection error, and 30% training-window
+cumulative death error. Phase 1 freezes modulation vectors and fits the three
+scalars; Phase 2 consumes that result, freezes the scalars, and fits modulation.
+
 ## Explicitly deferred
 
 The following are **DEFERRED** and are not claimed by the reliable pipeline:
