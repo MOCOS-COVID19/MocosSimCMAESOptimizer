@@ -157,7 +157,9 @@ For an unchanged `4/4/4/5`-generation exploratory rerun, keep configured sigma
 at `0.12` for 3, 6, 9, and 12 months. With so few updates, reducing the initial
 scale would spend more of the run expanding a distribution that already lacks a
 convergence budget. This recommendation is conditional on monitoring projection
-and bound hits; `0.12` is the implementation ceiling, not a measured optimum.
+and bound hits; `0.12` was the pilot setting, not a measured optimum. The
+implementation now permits `0.20`, while this historical pilot remains at
+`0.12` for reproducibility.
 
 For the corrected 20-or-more-generation experiment, compare `0.06`, `0.09`, and
 `0.12` from identical predecessor state and simulator seeds. Rank the policies

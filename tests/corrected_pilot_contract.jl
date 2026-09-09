@@ -24,6 +24,9 @@ end
     @test sort(p1["stage_freeze"]["phase1_scalar_6m"]) == sort(collect(keys(p1["temporal_bounds"])))
     @test sort(p2["stage_freeze"]["phase2_vector_6m"]) == sort(collect(keys(p2["scalar_bounds"])))
     @test p2["seed_config"] == "./runs/saxony-corrected-phase1-scalars/final_best_candidate.json"
+    @test p1["stages"][1]["sigma"] == 0.2
+    @test p2["stages"][1]["sigma"] == 0.2
+    @test O.CMA_SIGMA_MAX == 0.2
     @test p1["validation"]["selection_objective_weights"] == p2["validation"]["selection_objective_weights"]
     @test isempty(p1["validation"]["selection_replicate_seeds"])
     @test length(p1["validation"]["validation_metric_weights"]) == 14
