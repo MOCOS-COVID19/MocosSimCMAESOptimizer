@@ -5,6 +5,40 @@ using MocosSimCMAESOptimizer
 
 const O = MocosSimCMAESOptimizer
 
+function selection_test_config(validation)
+    objective = O.ObjectiveConfig(Dict{String,Float64}(),
+        1, 1.0, 1, "baseline", 0.0, 0.0)
+    posterior = O.PosteriorConfig(false, "diagonal_gaussian_weekly", 1, 1, 1,
+        0.05, 1.0, 1.0, 1.0, 1.0, 0.0)
+    return O.OptimizerConfig("seed", "out", 30, O.StageConfig[],
+        Dict{String,Tuple{Float64,Float64}}(),
+        Dict{String,Tuple{Float64,Float64}}(),
+        Dict{String,Dict{String,Any}}(), "monthly", Dict{String,Float64}(),
+        validation, objective, nothing, Dict{String,Vector{String}}(),
+        nothing, posterior)
+end
+
+@testset "selection objective combines validation and cumulative fit" begin
+    validation = Dict{String,Any}(
+        "rank_on_validation" => true,
+        "selection_objective_weights" => Dict(
+            "validation_mean_error" => 0.4,
+            "daily_detections_cumulative" => 0.3,
+            "daily_deaths_cumulative" => 0.3,
+        ),
+    )
+    cfg = selection_test_config(validation)
+    metrics = Dict{String,Any}(
+        "validation_mean_error" => 0.4,
+        "daily_detections_cumulative" => 0.2,
+        "daily_deaths_cumulative" => 0.6,
+    )
+    @test O.candidate_selection_score(cfg, 99.0, metrics) ≈ 0.4
+    @test length(metrics["selection_score_components"]) == 3
+    delete!(metrics, "daily_deaths_cumulative")
+    @test O.candidate_selection_score(cfg, 99.0, metrics) == Inf
+end
+
 @testset "simulator output reset is scoped to one candidate" begin
     root = mktempdir()
     current = joinpath(root, "stage_04", "iter_1", "cand_01")
@@ -229,11 +263,16 @@ end
         cfg = O.OptimizerConfig("seed", root, 30, O.StageConfig[],
             Dict{String,Tuple{Float64,Float64}}(), Dict{String,Tuple{Float64,Float64}}(),
             Dict{String,Dict{String,Any}}(), "monthly", Dict{String,Float64}(),
-            Dict{String,Any}("enabled" => true, "holdout_days" => 2),
+            Dict{String,Any}("enabled" => true, "holdout_days" => 2,
+                "validation_metric_weights" => Dict(
+                    "daily_detections" => 0.25, "daily_deaths" => 0.75)),
             objective, ext, Dict{String,Vector{String}}(), nothing, posterior)
         score, payload = O.score_from_daily(cfg, daily, 3)
         @test isfinite(score)
         @test payload["validation_window"] isa Dict{String,Any}
+        @test payload["validation_window"]["metric_weights"] ==
+            Dict("daily_detections" => 0.25, "daily_deaths" => 0.75)
+        @test isempty(payload["validation_window"]["missing_metrics"])
         @test payload["effective_metric_manifest"] isa Dict{String,Any}
         @test payload["effective_metric_manifest"]["weekly_control"]["weight"] == 0.0
     end

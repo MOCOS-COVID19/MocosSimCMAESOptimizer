@@ -851,15 +851,20 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
                     push!(contradictions, "artifact hash manifest has missing or extra artifact key")
                 all(isfile(joinpath(stage_root, relative)) for relative in keys_manifest) ||
                     push!(contradictions, "artifact hash manifest contains unknown artifact key")
-                if haskey(commit, "artifact_hash_manifest")
-                    digest = bytes2hex(SHA.sha256(JSON.json(hashes)))
-                    String(commit["artifact_hash_manifest"]) == digest ||
+                digest_version = get(commit, "artifact_hash_digest_version", nothing)
+                if digest_version == "canonical-v1"
+                    digest = artifact_hash_digest(hashes)
+                    haskey(commit, "artifact_hash_manifest") &&
+                        String(commit["artifact_hash_manifest"]) != digest &&
                         push!(contradictions, "artifact hash manifest integrity mismatch")
+                elseif digest_version !== nothing
+                    push!(contradictions, "unknown artifact hash digest version")
                 end
                 haskey(commit, "artifact_integrity_digest") ||
                     push!(contradictions, "committed artifact integrity digest is missing")
-                if haskey(commit, "artifact_integrity_digest")
-                    digest = bytes2hex(SHA.sha256(JSON.json(hashes)))
+                if haskey(commit, "artifact_integrity_digest") &&
+                   digest_version == "canonical-v1"
+                    digest = artifact_hash_digest(hashes)
                     String(commit["artifact_integrity_digest"]) == digest ||
                         push!(contradictions, "committed artifact integrity digest mismatch")
                 end
@@ -3567,11 +3572,36 @@ function validation_score_from_daily(cfg::OptimizerConfig, daily_path::String, d
     holdout_days = requested_end - requested_start + 1
     gt = load_gt_series(cfg.external_sim === nothing ? joinpath(MANAGER_ROOT, "gt") : cfg.external_sim.gt_dir)
     metric_scores = Dict{String,Float64}()
+    configured_weights = get(cfg.validation, "validation_metric_weights", nothing)
+    metric_weights = configured_weights === nothing ? Dict{String,Float64}(
+        "daily_detections" => 1.0,
+        "daily_deaths" => 1.0,
+        "daily_age_05_14_detections" => 1.0,
+    ) : begin
+        configured_weights isa AbstractDict || throw(ArgumentError(
+            "validation.validation_metric_weights must be an object"))
+        Dict{String,Float64}(String(name) => Float64(weight)
+            for (name, weight) in configured_weights)
+    end
+    isempty(metric_weights) && throw(ArgumentError(
+        "validation.validation_metric_weights must not be empty"))
+    any(weight -> !isfinite(weight) || weight < 0.0, values(metric_weights)) &&
+        throw(ArgumentError("validation metric weights must be nonnegative and finite"))
+    sum(values(metric_weights)) > 0.0 || throw(ArgumentError(
+        "validation.validation_metric_weights must contain a positive weight"))
     retained = Int[]
-    for metric in ("daily_detections", "daily_deaths", "daily_age_05_14_detections")
-        haskey(gt, metric) || continue
+    missing_metrics = String[]
+    for metric in sort!(collect(keys(metric_weights)))
+        metric_weights[metric] == 0.0 && continue
+        if !haskey(gt, metric)
+            push!(missing_metrics, metric)
+            continue
+        end
         trajs = read_daily_metric(daily_path, metric)
-        trajs === nothing && continue
+        if trajs === nothing
+            push!(missing_metrics, metric)
+            continue
+        end
         scores = Float64[]
         for traj in trajs
             requested_start > min(requested_end, length(gt[metric]), length(traj)) && continue
@@ -3593,15 +3623,46 @@ function validation_score_from_daily(cfg::OptimizerConfig, daily_path::String, d
         "requested_start_day" => requested_start, "holdout_days" => holdout_days,
         "split_mode" => windows["mode"],
         "seeds" => get(cfg.validation, "seeds", [42, 43, 44]),
-        "metrics" => metric_scores, "retained_indices" => retained,
+        "metrics" => metric_scores, "metric_weights" => metric_weights,
+        "missing_metrics" => missing_metrics, "retained_indices" => retained,
         "count" => length(retained),
-        "mean_error" => isempty(metric_scores) ? Inf : mean(collect(values(metric_scores))),
+        "mean_error" => isempty(metric_scores) || !isempty(missing_metrics) ? Inf :
+            sum(metric_weights[name] * value for (name, value) in metric_scores) /
+            sum(metric_weights[name] for name in keys(metric_scores)),
     )
 end
 
 """Choose the CMA ranking loss without discarding the training objective."""
 function candidate_selection_score(cfg::OptimizerConfig, training_score::Real, metrics::AbstractDict)
     Bool(get(cfg.validation, "rank_on_validation", false)) || return Float64(training_score)
+    configured = get(cfg.validation, "selection_objective_weights", nothing)
+    if configured !== nothing
+        configured isa AbstractDict || throw(ArgumentError(
+            "validation.selection_objective_weights must be an object"))
+        isempty(configured) && throw(ArgumentError(
+            "validation.selection_objective_weights must not be empty"))
+        weighted_total = 0.0
+        total_weight = 0.0
+        components = Dict{String,Any}()
+        for (raw_name, raw_weight) in configured
+            name = String(raw_name)
+            weight = Float64(raw_weight)
+            isfinite(weight) && weight >= 0.0 || throw(ArgumentError(
+                "validation.selection_objective_weights.$name must be nonnegative and finite"))
+            weight == 0.0 && continue
+            value = try Float64(get(metrics, name, Inf)) catch; Inf end
+            isfinite(value) || return Inf
+            weighted_total += weight * value
+            total_weight += weight
+            components[name] = Dict("weight" => weight, "value" => value,
+                                    "contribution" => weight * value)
+        end
+        total_weight > 0.0 || throw(ArgumentError(
+            "validation.selection_objective_weights must contain a positive weight"))
+        score = weighted_total / total_weight
+        metrics isa Dict{String,Any} && (metrics["selection_score_components"] = components)
+        return score
+    end
     score = try Float64(get(metrics, "validation_mean_error", Inf)) catch; Inf end
     return isfinite(score) ? score : Inf
 end
@@ -4059,6 +4120,15 @@ function atomic_save_json(path::String, value; label::String=path)
         rethrow(err)
     end
     return path
+end
+
+"""Hash an artifact manifest independently of `Dict` iteration order."""
+function artifact_hash_digest(hashes::AbstractDict)
+    canonical_entries = [
+        [String(key), String(hashes[key])]
+        for key in sort!(collect(keys(hashes)), by=String)
+    ]
+    return bytes2hex(SHA.sha256(JSON.json(canonical_entries)))
 end
 
 """Persist terminal posterior rejection evidence and invalidate stale state.
@@ -4917,10 +4987,11 @@ function run_stage(
             relative => bytes2hex(SHA.sha256(read(joinpath(stage_root, relative))))
             for relative in committed_artifacts
         )
-        artifact_digest = bytes2hex(SHA.sha256(JSON.json(artifact_hashes)))
+        artifact_digest = artifact_hash_digest(artifact_hashes)
         atomic_save_json(joinpath(iter_root, "iteration_commit.json"), Dict(
             "status" => "committed",
             "schema_version" => "production-v1",
+            "artifact_hash_digest_version" => "canonical-v1",
             "stage" => stage.name,
             "iteration" => iter,
             "artifact_key_set" => committed_artifacts,
@@ -4976,6 +5047,7 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
     previous_specs = nothing
     current_seed = deepcopy(seed)
     predecessor_archive = Any[]
+    last_executed_stage = nothing
 
     for (stage_index, stage) in enumerate(cfg.stages)
         stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
@@ -5012,6 +5084,7 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             previous_specs=previous_specs,
             predecessor_archive=predecessor_archive,
         )
+        last_executed_stage = stage
         if stage_index < length(cfg.stages)
             archive_summary = get(result, "archive_summary", nothing)
             archive_values = get(result, "survivor_archive", Any[])
@@ -5037,10 +5110,17 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
                 safe_save_json(joinpath(stage_root, "stage_blocked.json"), blocked;
                     label="stage_blocked")
                 push!(stage_outputs, Dict(
-                    "stage" => result["stage"], "best_score" => result["best_score"],
+                    "stage" => result["stage"],
+                    "search_policy" => result["search_policy"],
+                    "fit_months" => result["fit_months"],
+                    "best_score" => result["best_score"],
+                    "top_k" => length(result["top_candidates"]),
+                    "sigma" => result["sigma"],
+                    "posterior_samples" => nothing,
                     "archive_count" => length(archive_values), "extension_gate" => gate,
                 ))
                 append!(all_history, result["history"])
+                current_seed = deepcopy(result["best_candidate"])
                 break
             end
         end
@@ -5121,8 +5201,8 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             # Survivor entries still seed protected diversity slots, but the
             # immediate predecessor's best effective candidate owns every
             # locked historical coordinate in the next stage.
-            current_seed = deepcopy(result["best_candidate"])
         end
+        current_seed = deepcopy(result["best_candidate"])
         previous_specs = stage_specs(current_seed, specs, cfg, stage)
         update_stage_freeze!(cfg, stage, result["history"], specs)
         push!(stage_outputs, Dict(
@@ -5154,8 +5234,8 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
     safe_save_json(joinpath(cfg.output_dir, "stage_summary.json"), stage_outputs; label="stage_summary")
     safe_save_json(joinpath(cfg.output_dir, "final_best_candidate.json"), current_seed; label="final_best_candidate")
     validation_replicates = Dict{String,Any}("enabled" => false)
-    if cfg.external_sim !== nothing && !isempty(cfg.stages)
-        validation_days = cfg.stages[end].fit_months * cfg.monthly_days
+    if cfg.external_sim !== nothing && last_executed_stage !== nothing
+        validation_days = last_executed_stage.fit_months * cfg.monthly_days
         validation_replicates = run_validation_replicates(
             cfg,
             current_seed,
@@ -5168,12 +5248,12 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             label="validation_replicates",
         )
     end
-    if cfg.external_sim !== nothing && !isempty(cfg.stages)
+    if cfg.external_sim !== nothing && last_executed_stage !== nothing
         plot_script = joinpath(MANAGER_ROOT, "scripts", "plot_best_modulation_detections.py")
         if isfile(plot_script)
             try
                 python_bin = get(ENV, "PYTHON_BIN", "python3")
-                stage_dir = joinpath(cfg.output_dir, "real_sims", cfg.stages[end].name)
+                stage_dir = joinpath(cfg.output_dir, "real_sims", last_executed_stage.name)
                 plot_output = joinpath(cfg.output_dir, "infection_modulation_best.png")
                 run(`$python_bin $plot_script --stage-dir $stage_dir --gt-dir $(cfg.external_sim.gt_dir) --out $plot_output`)
             catch err

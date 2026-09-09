@@ -18,6 +18,18 @@ const ROOT = normpath(joinpath(@__DIR__, ".."))
     @test raw["validation"]["current_quality_band"]["threshold"] < 1_000_000
 end
 
+@testset "two-phase calibration configuration" begin
+    p1 = JSON.parsefile(joinpath(ROOT, "optimizer_config.saxony.phase1-scalars.json"))
+    p2 = JSON.parsefile(joinpath(ROOT, "optimizer_config.saxony.phase2-vectors.json"))
+    @test sort(p1["stage_freeze"]["phase1_scalar_6m"]) == sort(collect(keys(p1["temporal_bounds"])))
+    @test sort(p2["stage_freeze"]["phase2_vector_6m"]) == sort(collect(keys(p2["scalar_bounds"])))
+    @test p2["seed_config"] == "./runs/saxony-corrected-phase1-scalars/final_best_candidate.json"
+    @test p1["validation"]["selection_objective_weights"] == p2["validation"]["selection_objective_weights"]
+    @test isempty(p1["validation"]["selection_replicate_seeds"])
+    @test length(p1["validation"]["validation_metric_weights"]) == 14
+    @test sum(values(p1["validation"]["validation_metric_weights"])) ≈ 1.0
+end
+
 @testset "tail-only temporal coordinates preserve prefix" begin
     cfg = withenv(
         "MOCOSSIM_SEED_CONFIG" => joinpath(ROOT, "seed", "config2.json"),
