@@ -138,6 +138,16 @@ function snapshot(paths)
     Dict(path => bytes2hex(SHA.sha256(read(path))) for path in paths)
 end
 
+@testset "canonical artifact digest survives JSON key reordering" begin
+    hashes = Dict{String,Any}("z.json" => "last", "a.json" => "first")
+    digest = O.artifact_hash_digest(hashes)
+    reparsed = JSON.parse(JSON.json(hashes))
+    @test O.artifact_hash_digest(reparsed) == digest
+
+    reparsed["a.json"] = "tampered"
+    @test O.artifact_hash_digest(reparsed) != digest
+end
+
 @testset "committed stage rerun is idempotent" begin
     root = mktempdir()
     stage_root, first_write = write_committed_fixture(root)
