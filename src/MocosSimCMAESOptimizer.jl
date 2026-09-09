@@ -4976,6 +4976,7 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
     previous_specs = nothing
     current_seed = deepcopy(seed)
     predecessor_archive = Any[]
+    last_executed_stage = nothing
 
     for (stage_index, stage) in enumerate(cfg.stages)
         stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
@@ -5012,6 +5013,7 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             previous_specs=previous_specs,
             predecessor_archive=predecessor_archive,
         )
+        last_executed_stage = stage
         if stage_index < length(cfg.stages)
             archive_summary = get(result, "archive_summary", nothing)
             archive_values = get(result, "survivor_archive", Any[])
@@ -5037,10 +5039,17 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
                 safe_save_json(joinpath(stage_root, "stage_blocked.json"), blocked;
                     label="stage_blocked")
                 push!(stage_outputs, Dict(
-                    "stage" => result["stage"], "best_score" => result["best_score"],
+                    "stage" => result["stage"],
+                    "search_policy" => result["search_policy"],
+                    "fit_months" => result["fit_months"],
+                    "best_score" => result["best_score"],
+                    "top_k" => length(result["top_candidates"]),
+                    "sigma" => result["sigma"],
+                    "posterior_samples" => nothing,
                     "archive_count" => length(archive_values), "extension_gate" => gate,
                 ))
                 append!(all_history, result["history"])
+                current_seed = deepcopy(result["best_candidate"])
                 break
             end
         end
@@ -5154,8 +5163,8 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
     safe_save_json(joinpath(cfg.output_dir, "stage_summary.json"), stage_outputs; label="stage_summary")
     safe_save_json(joinpath(cfg.output_dir, "final_best_candidate.json"), current_seed; label="final_best_candidate")
     validation_replicates = Dict{String,Any}("enabled" => false)
-    if cfg.external_sim !== nothing && !isempty(cfg.stages)
-        validation_days = cfg.stages[end].fit_months * cfg.monthly_days
+    if cfg.external_sim !== nothing && last_executed_stage !== nothing
+        validation_days = last_executed_stage.fit_months * cfg.monthly_days
         validation_replicates = run_validation_replicates(
             cfg,
             current_seed,
@@ -5168,12 +5177,12 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             label="validation_replicates",
         )
     end
-    if cfg.external_sim !== nothing && !isempty(cfg.stages)
+    if cfg.external_sim !== nothing && last_executed_stage !== nothing
         plot_script = joinpath(MANAGER_ROOT, "scripts", "plot_best_modulation_detections.py")
         if isfile(plot_script)
             try
                 python_bin = get(ENV, "PYTHON_BIN", "python3")
-                stage_dir = joinpath(cfg.output_dir, "real_sims", cfg.stages[end].name)
+                stage_dir = joinpath(cfg.output_dir, "real_sims", last_executed_stage.name)
                 plot_output = joinpath(cfg.output_dir, "infection_modulation_best.png")
                 run(`$python_bin $plot_script --stage-dir $stage_dir --gt-dir $(cfg.external_sim.gt_dir) --out $plot_output`)
             catch err
