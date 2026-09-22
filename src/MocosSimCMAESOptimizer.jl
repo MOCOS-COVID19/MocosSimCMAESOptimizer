@@ -85,6 +85,7 @@ struct OptimizerConfig
     initial_state::Union{Nothing,Dict{String,Any}}
     posterior::PosteriorConfig
     runtime_seed::Dict{String,Any}
+    event_calendar::Dict{String,Any}
 end
 
 # Backwards-compatible constructor for fixture/config callers that do not
@@ -99,6 +100,16 @@ OptimizerConfig(seed_config, output_dir, monthly_days, stages, scalar_bounds,
                     stage_freeze, initial_state, posterior,
                     Dict{String,Any}())
 
+OptimizerConfig(seed_config, output_dir, monthly_days, stages, scalar_bounds,
+                temporal_bounds, scalar_preprocessing, temporal_parameterization,
+                age_population_weights, validation, objective, external_sim,
+                stage_freeze, initial_state, posterior, runtime_seed) =
+    OptimizerConfig(seed_config, output_dir, monthly_days, stages, scalar_bounds,
+                    temporal_bounds, scalar_preprocessing, temporal_parameterization,
+                    age_population_weights, validation, objective, external_sim,
+                    stage_freeze, initial_state, posterior, runtime_seed,
+                    Dict{String,Any}())
+
 const DEFAULT_AGE_POPULATION_WEIGHTS = Dict{String,Float64}(
     "00_04" => 0.043326963479,
     "05_14" => 0.092000943853,
@@ -110,8 +121,11 @@ const DEFAULT_AGE_POPULATION_WEIGHTS = Dict{String,Float64}(
 
 include("posterior_sampler.jl")
 include("data_protocol.jl")
+include("reconstruction_scoring.jl")
+include("observation_contract.jl")
 include("config_preflight.jl")
 include("production_smoke.jl")
+include("event_calendar.jl")
 
 struct ParamSpec
     name::String
@@ -695,7 +709,7 @@ function load_immediate_predecessor_state(cfg::OptimizerConfig, stage::StageConf
         expected_fit_months=predecessor.fit_months,
         expected_manifest_path=joinpath(root, "archive_transfer_manifest.json"),
         stage_order=[s.name for s in cfg.stages])
-    archive_ids = [String(get(x, "candidate", get(x, "id", ""))) for x in archive]
+    archive_ids = [archive_entry_id(x) for x in archive]
     prior_ids = get(prior_state, "archive_ids", nothing)
     reusable_ids = get(reusable, "archive_ids", nothing)
     selected_ids = get(reusable, "selected_archive_ids", nothing)
@@ -782,6 +796,12 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
                     joinpath("iter_$(iteration)", "cma_sampling_state.json"),
                     joinpath("iter_$(iteration)", "top_candidates.json"),
                 ]
+                if haskey(stage_state, "family_ledger_schema")
+                    stage_state["family_ledger_schema"] == "accepted-families-v1" ||
+                        push!(contradictions, "unknown family ledger schema")
+                    push!(production_keys, "accepted_families.json")
+                    append!(contradictions, validate_family_ledger_artifacts(stage_root))
+                end
                 fixture_keys = sort(collect(keys(paths)))
                 schema = get(commit, "schema_version", nothing)
                 expected_schema in ("production-v1", "fixture-v1") ||
@@ -798,15 +818,16 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
                     push!(contradictions, "artifact hash manifest has missing or extra artifact key")
                 all(isfile(joinpath(stage_root, relative)) for relative in keys_manifest) ||
                     push!(contradictions, "artifact hash manifest contains unknown artifact key")
+                hash_scheme = get(commit, "artifact_hash_scheme", "legacy-json-v1")
+                digest = try artifact_manifest_digest(hashes, hash_scheme) catch
+                    push!(contradictions, "unknown artifact hash scheme"); "" end
                 if haskey(commit, "artifact_hash_manifest")
-                    digest = bytes2hex(SHA.sha256(JSON.json(hashes)))
                     String(commit["artifact_hash_manifest"]) == digest ||
                         push!(contradictions, "artifact hash manifest integrity mismatch")
                 end
                 haskey(commit, "artifact_integrity_digest") ||
                     push!(contradictions, "committed artifact integrity digest is missing")
                 if haskey(commit, "artifact_integrity_digest")
-                    digest = bytes2hex(SHA.sha256(JSON.json(hashes)))
                     String(commit["artifact_integrity_digest"]) == digest ||
                         push!(contradictions, "committed artifact integrity digest mismatch")
                 end
@@ -829,6 +850,17 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
     status_by_id = Dict{Tuple{String,Int,Int},String}()
     score_by_id = Dict{Tuple{String,Int,Int},Float64}()
     candidate_int(value) = value isa Integer ? Int(value) : parse(Int, string(value))
+    function recorded_score(value, status, label)
+        # Nonfinite failed/skipped scores are encoded as JSON null. They are
+        # valid terminal evidence, but may never become completed candidates.
+        if value === nothing && status in ("failed", "skipped", "pending")
+            return Inf
+        end
+        parsed = try Float64(value) catch; Inf end
+        (!isfinite(parsed) && status == "completed") &&
+            push!(contradictions, "$label completed score is nonfinite")
+        return parsed
+    end
     for row in metrics
         row isa AbstractDict || (push!(contradictions, "non-object iter_metrics row"); continue)
         identity = (String(get(row, "stage", "")), Int(get(row, "iteration", 0)),
@@ -836,21 +868,23 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
         identity in identities && push!(contradictions, "duplicate iter_metrics identity: $identity")
         push!(identities, identity)
         status_by_id[identity] = String(get(row, "status", ""))
-        score_by_id[identity] = Float64(get(row, "score", Inf))
+        score_by_id[identity] = recorded_score(get(row, "score", nothing), status_by_id[identity], "iter_metrics")
         identity[1] == stage || push!(contradictions, "iter_metrics stage mismatch: $identity")
     end
-    function check_entry(entry, label)
+    function check_entry(entry, label; latest_iteration::Bool=true)
         entry isa AbstractDict || (push!(contradictions, "$label is not an object"); return nothing)
         identity = (String(get(entry, "stage", "")), Int(get(entry, "iteration", 0)),
             candidate_int(get(entry, "candidate", 0)))
         identity in identities || push!(contradictions, "$label orphan identity: $identity")
         identity[1] == stage || push!(contradictions, "$label stage mismatch: $identity")
-        identity[2] == iteration || push!(contradictions, "$label iteration mismatch: $identity")
+        (latest_iteration ? identity[2] == iteration : 1 <= identity[2] <= iteration) ||
+            push!(contradictions, "$label iteration mismatch: $identity")
         get(entry, "parameter_names", names) == names ||
             push!(contradictions, "$label parameter_names mismatch")
         haskey(status_by_id, identity) && String(get(entry, "status", "")) != status_by_id[identity] &&
             push!(contradictions, "$label status mismatch: $identity")
-        haskey(score_by_id, identity) && Float64(get(entry, "score", Inf)) != score_by_id[identity] &&
+        haskey(score_by_id, identity) &&
+            recorded_score(get(entry, "score", nothing), String(get(entry, "status", "")), label) != score_by_id[identity] &&
             push!(contradictions, "$label score mismatch: $identity")
         identity
     end
@@ -861,7 +895,7 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
     end
     archive_ids = Tuple{String,Int,Int}[]
     for entry in archive
-        id = check_entry(entry, "survivor_archive")
+        id = check_entry(entry, "survivor_archive"; latest_iteration=false)
         id === nothing || push!(archive_ids, id)
     end
     best_id = get(stage_state, "best_candidate_id", nothing)
@@ -872,7 +906,7 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
     admitted = get(reusable, "archive_ids", Any[])
     admitted isa AbstractVector || push!(contradictions, "reusable state archive_ids is not an array")
     for id in admitted
-        any(string(get(e, "candidate", get(e, "id", ""))) == string(id) for e in archive) ||
+        any(archive_entry_id(e) == string(id) for e in archive) ||
             push!(contradictions, "reusable state references non-admitted archive id: $id")
     end
     counts = Dict("completed" => 0, "failed" => 0, "skipped" => 0, "pending" => 0)
@@ -997,6 +1031,26 @@ function _archive_normalized_distance(a::AbstractDict, b::AbstractDict, bounds)
     return norm((xa .- xb) ./ scales) / sqrt(max(length(xa), 1))
 end
 
+"""Stable archive identity, with unchanged IDs when reading legacy artifacts.
+
+Candidate numbers are population slots reused every iteration. Qualify them
+when admitting evaluations, while preserving the slot itself for diagnostics
+and the stage/iteration/candidate joins used by committed-run validation.
+"""
+function archive_entry_id(entry::AbstractDict; qualify::Bool=false)
+    haskey(entry, "archive_entry_id") && return string(entry["archive_entry_id"])
+    candidate = get(entry, "candidate", get(entry, "id", ""))
+    stage = get(entry, "stage", nothing)
+    iteration = get(entry, "iteration", nothing)
+    if qualify && stage isa AbstractString && !isempty(stage) &&
+       iteration isa Integer && !(iteration isa Bool) && !isempty(string(candidate))
+        # JSON encoding avoids collisions when a stage or legacy ID contains
+        # separators. This identity is scoped to the run's archive directory.
+        return "evaluation:" * JSON.json([stage, iteration, string(candidate)])
+    end
+    return string(candidate)
+end
+
 function _archive_rejection_reason(entry::AbstractDict; current_stage=nothing, current_fit_months=nothing)
     status = String(get(entry, "status", ""))
     current_stage !== nothing && status != "completed" && return "status"
@@ -1052,13 +1106,15 @@ function survivor_archive_update(existing, entries;
         reason = _archive_rejection_reason(entry;
             current_stage=current_stage, current_fit_months=current_fit_months)
         reason !== nothing && (rejected[reason] = get(rejected, reason, 0) + 1; continue)
-        id = string(get(entry, "candidate", get(entry, "id", "")))
+        id = archive_entry_id(entry; qualify=true)
         if !isempty(id) && id in seen
             rejected["duplicate"] = get(rejected, "duplicate", 0) + 1
             continue
         end
         !isempty(id) && push!(seen, id)
-        push!(pool, deepcopy(entry))
+        admitted_entry = deepcopy(entry)
+        !isempty(id) && (admitted_entry["archive_entry_id"] = id)
+        push!(pool, admitted_entry)
     end
     isempty(pool) && return return_report ? Dict{String,Any}(
         "archive" => Any[], "archive_count" => 0, "configured_target" => target_size,
@@ -1089,7 +1145,7 @@ function survivor_archive_update(existing, entries;
         push!(pareto, entry)
     end
     isempty(pareto) && (pareto = [first(quality_pool)])
-    sort!(pareto, by = x -> (Float64(x["score"]), string(get(x, "candidate", ""))))
+    sort!(pareto, by = x -> (Float64(x["score"]), archive_entry_id(x)))
 
     selected = Any[]
     desired = min(max_size, max(target_size, 1))
@@ -1190,6 +1246,8 @@ function archive_quality_gate(archive; current_stage=nothing, current_fit_months
     )
 end
 
+include("family_ledger.jl")
+
 function archive_vector_for_stage(entry::AbstractDict, specs_stage::Vector{ParamSpec}, fallback::Vector{Float64})
     old_names = [String(x) for x in get(entry, "parameter_names", String[])]
     old_vector = get(entry, "evaluated_vector", nothing)
@@ -1214,10 +1272,11 @@ end
 function persist_archive_transfer_manifest(stage_root::String, archive;
                                            archive_path::String=joinpath(stage_root, "survivor_archive.json"),
                                            stage::Union{Nothing,String}=nothing,
-                                           fit_months::Union{Nothing,Int}=nothing)
+                                           fit_months::Union{Nothing,Int}=nothing,
+                                           hash_scheme::String="legacy-json-v1")
     values = archive isa AbstractVector ? collect(archive) : Any[]
-    ids = [string(get(x, "candidate", get(x, "id", ""))) for x in values if x isa AbstractDict]
-    payload_hash = _archive_payload_hash(values)
+    ids = [archive_entry_id(x) for x in values if x isa AbstractDict]
+    payload_hash = artifact_manifest_digest(values, hash_scheme)
     source = stage === nothing ? basename(stage_root) : stage
     manifest = Dict{String,Any}(
         "schema_version" => "archive-transfer-v2",
@@ -1227,6 +1286,7 @@ function persist_archive_transfer_manifest(stage_root::String, archive;
         "horizon" => fit_months,
         "archive_id" => string(source, ":", fit_months === nothing ? "unknown" : fit_months, ":", payload_hash),
         "archive_hash" => payload_hash,
+        "archive_hash_scheme" => hash_scheme,
         "admitted_ids" => ids,
         "admitted_order" => ids,
         "archive_count" => length(ids),
@@ -1369,13 +1429,19 @@ function load_transfer_survivor_archive(output_dir::String, current_stage::Strin
             id = haskey(x, "candidate") ? x["candidate"] : x["id"]
             (id isa AbstractString || id isa Integer) || return reject("archive_id_invalid")
             id isa AbstractString && isempty(id) && return reject("archive_id_invalid")
-            push!(payload_ids, String(id))
+            if haskey(x, "archive_entry_id")
+                x["archive_entry_id"] isa AbstractString && !isempty(x["archive_entry_id"]) ||
+                    return reject("archive_id_invalid")
+            end
+            push!(payload_ids, archive_entry_id(x))
         end
         payload_ids == admitted_ids || return reject("archive_payload_order_mismatch")
         manifest["archive_count"] == length(admitted_ids) ||
             return reject("archive_count_mismatch")
         length(values) == manifest["archive_count"] || return reject("archive_count_mismatch")
-        payload_hash = _archive_payload_hash(values)
+        payload_hash = try artifact_manifest_digest(values,
+            get(manifest, "archive_hash_scheme", "legacy-json-v1")) catch
+            return reject("archive_hash_scheme_invalid") end
         manifest["archive_hash"] == payload_hash || return reject("archive_hash_mismatch")
         archive_id = string(source_stage, ":", manifest["horizon"], ":", payload_hash)
         manifest["archive_id"] == archive_id || return reject("archive_id_mismatch")
@@ -1575,7 +1641,7 @@ function enforce_posterior_reusable_state(
     report["active_months"] = active_months
     report["source_provenance"] = source_entry isa AbstractDict ?
         Dict{String,Any}(
-            "archive_entry_id" => get(source_entry, "candidate", nothing),
+            "archive_entry_id" => archive_entry_id(source_entry),
             "source_stage" => get(source_entry, "stage", nothing),
             "source_fit_months" => get(source_entry, "fit_months", nothing),
         ) :
@@ -1867,6 +1933,11 @@ function load_config(path::String)
     gt_dir = gt_value !== nothing ?
         (isabspath(gt_value) ? gt_value : normpath(joinpath(config_dir, gt_value))) :
         nothing
+    observation_contract = observation_contract_report(raw, gt_dir)
+    if observation_contract !== nothing
+        raw["validation"]["observation_alignment"] = observation_contract["mode"]
+        raw["validation"]["observation_contract_report"] = observation_contract
+    end
     external_sim = gt_dir !== nothing && haskey(raw, "julia_bin") && haskey(raw, "project_dir") && haskey(raw, "advanced_cli") ?
         ExternalSimConfig(
             gt_dir,
@@ -1893,11 +1964,13 @@ function load_config(path::String)
         Dict(String(k) => v for (k, v) in raw["validation"]) :
         Dict{String,Any}("enabled" => true, "holdout_days" => 28, "seeds" => [42, 43, 44])
     temporal_parameterization = String(get(raw, "temporal_parameterization", "monthly"))
-    temporal_parameterization in ("weekly", "monthly") ||
+    temporal_parameterization in ("weekly", "monthly", "events") ||
         error("Unsupported temporal_parameterization: $(temporal_parameterization)")
     runtime_seed = load_json(raw["seed_config"])
     _normalize_seed_paths!(runtime_seed, dirname(raw["seed_config"]))
-    return OptimizerConfig(raw["seed_config"], raw["output_dir"], Int(raw["monthly_days"]), stages, scalar_bounds, temporal_bounds, scalar_preprocessing, temporal_parameterization, age_population_weights, validation, objective, external_sim, stage_freeze, initial_state, posterior, runtime_seed)
+    event_calendar = load_event_calendar(raw, config_dir)
+    isempty(event_calendar) || apply_event_calendar!(runtime_seed, event_calendar)
+    return OptimizerConfig(raw["seed_config"], raw["output_dir"], Int(raw["monthly_days"]), stages, scalar_bounds, temporal_bounds, scalar_preprocessing, temporal_parameterization, age_population_weights, validation, objective, external_sim, stage_freeze, initial_state, posterior, runtime_seed, event_calendar)
 end
 
 function scalar_preprocessing_entry(cfg::OptimizerConfig, spec::ParamSpec)
@@ -1997,7 +2070,8 @@ function build_specs(seed::Dict{String,Any}, cfg::OptimizerConfig)
     end
     for (name, (lo, hi)) in sort(collect(cfg.temporal_bounds), by=first)
         arr = get_nested(seed, name)
-        push!(specs, ParamSpec(name, :temporal, length(arr), lo, hi))
+        width = cfg.temporal_parameterization == "events" ? length(event_interval_times(cfg, name)) + 1 : length(arr)
+        push!(specs, ParamSpec(name, :temporal, width, lo, hi))
     end
     return specs
 end
@@ -2046,7 +2120,10 @@ function initial_vector(seed::Dict{String,Any}, specs::Vector{ParamSpec})
             val = optcfg === nothing ? float(current) : encode_scalar_value(optcfg, seed, spec, current)
             push!(values, val)
         else
-            if optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
+            if optcfg !== nothing && optcfg.temporal_parameterization == "events"
+                starts = vcat([0], event_interval_times(optcfg, spec.name))
+                append!(values, event_seed_values(seed, spec.name, starts[1:spec.length]))
+            elseif optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
                 interval_times = get_nested(seed, replace(spec.name, "interval_values" => "interval_times"))
                 validate_interval_times(interval_times)
                 for month in 1:spec.length
@@ -2098,6 +2175,11 @@ function clip!(x::Vector{Float64}, specs::Vector{ParamSpec})
 end
 
 function temporal_active_length(seed::Dict{String,Any}, spec::ParamSpec, active_months::Int, cfg::OptimizerConfig)
+    if cfg.temporal_parameterization == "events"
+        active_months <= 0 && return 0
+        return min(spec.length, 1 + count(t -> t < active_months * cfg.monthly_days,
+                                          event_interval_times(cfg, spec.name)))
+    end
     if cfg.temporal_parameterization == "monthly"
         return min(active_months, spec.length)
     end
@@ -2116,6 +2198,14 @@ end
 
 function temporal_bucket_day_ranges(seed::Dict{String,Any}, spec::ParamSpec, active_months::Int, cfg::OptimizerConfig)
     active_days = active_months * cfg.monthly_days
+    if cfg.temporal_parameterization == "events"
+        active_days <= 0 && return Tuple{Int,Int}[]
+        times = event_interval_times(cfg, spec.name)
+        starts = vcat([0], times)
+        n = min(spec.length, 1 + count(t -> t < active_days, times))
+        return [(starts[i] + 1, min(i <= length(times) ? times[i] : active_days, active_days))
+                for i in 1:n]
+    end
     if cfg.temporal_parameterization == "monthly"
         return [
             ((month - 1) * cfg.monthly_days + 1, min(month * cfg.monthly_days, active_days))
@@ -2142,6 +2232,9 @@ function vector_to_config(seed::Dict{String,Any}, specs::Vector{ParamSpec}, x::V
     # A zero-month conversion is an explicit empty-horizon policy: preserve
     # every seed coordinate and emit only the effective stop time.
     active_months == 0 && return cfg
+    if optcfg !== nothing && optcfg.temporal_parameterization == "events"
+        apply_event_calendar!(cfg, optcfg.event_calendar)
+    end
     idx = 1
     for spec in specs
         if spec.kind == :scalar
@@ -2191,9 +2284,16 @@ function vector_to_config(seed::Dict{String,Any}, specs::Vector{ParamSpec}, x::V
 end
 
 function inject_frozen!(cfg_out::Dict{String,Any}, seed::Dict{String,Any}, specs::Vector{ParamSpec}, frozen_names::Vector{String})
+    optcfg = CURRENT_OPTIMIZER_CONFIG[]
     for spec in specs
         spec.name in frozen_names || continue
-        set_nested!(cfg_out, spec.name, get_nested(seed, spec.name))
+        if spec.kind == :temporal && optcfg !== nothing && optcfg.temporal_parameterization == "events"
+            times = event_interval_times(optcfg, spec.name)
+            set_nested!(cfg_out, spec.name, event_seed_values(seed, spec.name, vcat([0], times)))
+            set_nested!(cfg_out, replace(spec.name, "interval_values" => "interval_times"), times)
+        else
+            set_nested!(cfg_out, spec.name, get_nested(seed, spec.name))
+        end
     end
 end
 
@@ -2232,13 +2332,31 @@ end
 # External simulation hook (single-run) invoking manager/MocosSimLauncher
 # ─────────────────────────────────────────────────────────────────────────────
 
+function validation_rng_provenance_matches(provenance::AbstractDict, candidate::AbstractDict)
+    return get(provenance, "schema_version", nothing) == "simulation-rng-v1" &&
+           get(provenance, "rng_seed_policy", nothing) == "mersenne_twister_seed_and_trajectory_u64_v1" &&
+           get(provenance, "trajectory_seed", nothing) == get(candidate, "trajectory_seed", nothing) &&
+           get(provenance, "params_seed", nothing) == get(candidate, "params_seed", 0) &&
+           get(provenance, "num_trajectories", nothing) == get(candidate, "num_trajectories", 1) &&
+           haskey(provenance, "resumed_checkpoint") && provenance["resumed_checkpoint"] === nothing
+end
+
 function run_external_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, days::Int; workdir::String)
     cfg.external_sim === nothing && error("External simulation config not provided")
     simcfg = cfg.external_sim
     mkpath(workdir)
     # write candidate config
     config_path = joinpath(workdir, "config_candidate.json")
-    save_json(config_path, candidate)
+    config_for_sim = copy(candidate)
+    rng_provenance_path = nothing
+    if haskey(candidate, "trajectory_seed")
+        rng_provenance_path = abspath(joinpath(workdir, "rng_provenance.json"))
+        config_for_sim["rng_provenance_path"] = rng_provenance_path
+        # Invalidate a previous receipt before launching; a stale successful run
+        # must never certify an older launcher or a failed new invocation.
+        save_json(rng_provenance_path, Dict("schema_version" => "rng-pending"))
+    end
+    save_json(config_path, config_for_sim)
     daily_path = joinpath(workdir, "output_daily.jld2")
     summary_path = joinpath(workdir, "summary.jld2")
 
@@ -2282,12 +2400,26 @@ function run_external_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, day
             end
         end
     end
+    rng_provenance_verified = nothing
+    if rng_provenance_path !== nothing
+        rng_provenance_verified = try
+            validation_rng_provenance_matches(JSON.parsefile(rng_provenance_path), candidate)
+        catch
+            false
+        end
+        if !rng_provenance_verified
+            success = false
+            @warn "Launcher did not confirm independent trajectory RNG; deploy the updated MocosSimLauncher" rng_provenance_path
+        end
+    end
     invocation = Dict{String,Any}(
         "schema_version" => "adapter-invocation-v1", "command" => cmd_args,
         "working_directory" => workdir, "started_at" => string(started),
         "finished_at" => string(now(UTC)), "timeout_seconds" => timeout_seconds,
         "timed_out" => timed_out, "exit_code" => process === nothing ? nothing : process.exitcode,
-        "success" => success, "stdout" => stdout_path, "stderr" => stderr_path)
+        "success" => success, "stdout" => stdout_path, "stderr" => stderr_path,
+        "rng_provenance_path" => rng_provenance_path,
+        "rng_provenance_verified" => rng_provenance_verified)
     safe_save_json(joinpath(workdir, "adapter_invocation.json"), invocation;
                    label="adapter_invocation")
     return success, daily_path
@@ -2905,6 +3037,16 @@ function weekly_control_score(cfg::OptimizerConfig, daily_path::String, gt::Abst
     return sum(metric_scores .* metric_weights) / sum(metric_weights)
 end
 
+function _active_regularization_values(cfg::OptimizerConfig, candidate::AbstractDict,
+                                       path::String, values::AbstractVector)
+    cfg.temporal_parameterization == "events" || return values
+    stop_day = Float64(get(candidate, "stop_simulation_time", Inf))
+    times = get_nested(candidate, replace(path, "interval_values" => "interval_times"))
+    # An event exactly at the exclusive stop time has no duration in this run.
+    active = min(length(values), 1 + count(t -> Float64(t) < stop_day, times))
+    return values[1:active]
+end
+
 function temporal_jump_penalty(cfg::OptimizerConfig, candidate::AbstractDict)
     # Penalize the raw configured buckets, before MocosSimLauncher applies
     # any runtime seasonal multiplier to infection transmission.
@@ -2915,9 +3057,10 @@ function temporal_jump_penalty(cfg::OptimizerConfig, candidate::AbstractDict)
         catch
             continue
         end
+        values = _active_regularization_values(cfg, candidate, path, values)
         length(values) < 2 && continue
         first_difference = mean(abs.(diff(values)))
-        second_difference = length(values) < 3 ? 0.0 : mean(abs.(diff(values, 2)))
+        second_difference = length(values) < 3 ? 0.0 : mean(abs.(diff(diff(values))))
         push!(penalties, first_difference + second_difference)
     end
     return isempty(penalties) ? 0.0 : mean(penalties)
@@ -2930,6 +3073,7 @@ function infection_extrema_penalty(cfg::OptimizerConfig, candidate::AbstractDict
     catch
         return 0.0
     end
+    values = _active_regularization_values(cfg, candidate, path, values)
     length(values) < 3 && return 0.0
     differences = diff(values)
     signs = [sign(value) for value in differences if abs(value) > 1e-12]
@@ -3231,6 +3375,8 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     gt = load_gt_series(cfg.external_sim.gt_dir)
     sim_ok, daily_path = run_external_sim(cfg, candidate, days; workdir=workdir)
     sim_ok || return Inf, Dict("sim_failed" => true)
+    is_reconstruction_mode(cfg) && return score_reconstruction_from_daily(
+        cfg, daily_path, gt, days, candidate)
     windows = stage_data_split(days, cfg.validation)
     training_days = Int(windows["train"]["end_day"])
     weekly_control = weekly_control_score(cfg, daily_path, gt, training_days)
@@ -3263,6 +3409,8 @@ end
 
 function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int, candidate::Union{Nothing,AbstractDict}=nothing)
     gt = load_gt_series(cfg.external_sim.gt_dir)
+    is_reconstruction_mode(cfg) && return score_reconstruction_from_daily(
+        cfg, daily_path, gt, days, candidate)
     windows = stage_data_split(days, cfg.validation)
     training_days = Int(windows["train"]["end_day"])
     weekly_control = weekly_control_score(cfg, daily_path, gt, training_days)
@@ -3371,6 +3519,8 @@ function objective_score(
     jump_penalty::Float64,
     extrema_penalty::Float64,
 )
+    is_reconstruction_mode(cfg) && return reconstruction_objective_score(
+        cfg, metrics, jump_penalty, extrema_penalty)
     weights = cfg.objective.weights
     total = 0.0
     manifest = effective_metric_manifest(
@@ -3412,6 +3562,12 @@ function objective_score(
 end
 
 function validation_score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int)
+    if is_reconstruction_mode(cfg)
+        cfg.external_sim === nothing && throw(ArgumentError("External simulation config not provided"))
+        _, metrics = score_reconstruction_from_daily(cfg, daily_path,
+            load_gt_series(cfg.external_sim.gt_dir), days, nothing)
+        return metrics["validation_window"]
+    end
     enabled = Bool(get(cfg.validation, "enabled", true))
     enabled || return Dict{String,Any}("enabled" => false, "mean_error" => 0.0,
                                        "retained_indices" => Int[], "count" => 0)
@@ -3665,18 +3821,29 @@ function run_validation_replicates(
     candidate::Dict{String,Any},
     days::Int;
     workdir::String=joinpath(cfg.output_dir, "validation_replicates"),
+    scorer=score_candidate,
 )
     enabled = Bool(get(cfg.validation, "enabled", true))
     enabled || return Dict{String,Any}("enabled" => false)
     seeds = Int.(get(cfg.validation, "seeds", [42, 43, 44]))
+    isempty(seeds) && throw(ArgumentError("validation.seeds must not be empty when validation is enabled"))
+    all(seed -> seed >= 0, seeds) || throw(ArgumentError("validation.seeds must be nonnegative"))
+    length(unique(seeds)) == length(seeds) ||
+        throw(ArgumentError("validation.seeds must be distinct for independent replicates"))
     results = Any[]
     for seed in seeds
         replicate = deepcopy(candidate)
-        replicate["params_seed"] = seed
+        # params_seed controls parameter/population setup, not epidemic events.
+        # Keep it fixed to measure simulator noise at one calibrated parameter set.
+        replicate["trajectory_seed"] = seed
         replicate_dir = joinpath(workdir, "seed_$(seed)")
-        result = score_candidate(replicate, cfg, days; workdir=replicate_dir)
+        result = scorer(replicate, cfg, days; workdir=replicate_dir)
         push!(results, Dict(
             "seed" => seed,
+            "trajectory_seed" => seed,
+            "params_seed" => get(replicate, "params_seed", 0),
+            "num_trajectories" => get(replicate, "num_trajectories", 1),
+            "workdir" => replicate_dir,
             "score" => result["score"],
             "status" => result["status"],
             "metrics" => result["metrics"],
@@ -3690,9 +3857,12 @@ function run_validation_replicates(
     return Dict{String,Any}(
         "enabled" => true,
         "seeds" => seeds,
+        "rng_seed_policy" => "mersenne_twister_seed_and_trajectory_u64_v1",
+        "params_seed_policy" => "fixed_candidate_params_seed",
         "results" => results,
+        "completed_replicates" => length(finite_scores),
         "mean_score" => isempty(finite_scores) ? Inf : mean(finite_scores),
-        "std_score" => length(finite_scores) < 2 ? 0.0 : std(finite_scores),
+        "std_score" => length(finite_scores) < 2 ? nothing : std(finite_scores),
     )
 end
 
@@ -4089,7 +4259,10 @@ function run_stage(
         "weekly_control_metrics" => WEEKLY_CONTROL_METRICS,
         "vector_likelihood" => cfg.posterior.likelihood,
         "survivor_archive" => Dict(
-            "selection" => "adaptive_score_threshold_pareto_parameter_clusters",
+            "selection" => is_reconstruction_mode(cfg) ?
+                "independent_tolerance_gates_fixed_bound_farthest_first" :
+                "adaptive_score_threshold_pareto_parameter_clusters",
+            "all_evaluations_preserved" => is_reconstruction_mode(cfg),
             "max_size" => SURVIVOR_ARCHIVE_SIZE,
             "score_mad_multiplier" => SURVIVOR_SCORE_MAD_MULTIPLIER,
             "relative_score_floor" => SURVIVOR_RELATIVE_SCORE_FLOOR,
@@ -4380,10 +4553,11 @@ function run_stage(
                     "transition_delta_report" => transition_report,
                     "provenance" => Dict{String,Any}(
                         "source" => transfer_entry === nothing ? "cma_population" : "predecessor_archive",
-                        "predecessor_archive_entry" => transfer_entry === nothing ? nothing : get(transfer_entry, "candidate", nothing),
+                        "predecessor_archive_entry" => transfer_entry === nothing ? nothing : archive_entry_id(transfer_entry),
                         "candidate_class" => candidate_class,
                     ),
                 )
+                is_reconstruction_mode(cfg) && persist_family_evaluation!(stage_root, candidate_entry)
                 top_candidates[key] = candidate_entry
                 push!(iteration_top_candidates, candidate_entry)
                 if get(metrics, "status", "failed") == "completed"
@@ -4495,10 +4669,11 @@ function run_stage(
                     "transition_delta_report" => transition_report,
                     "provenance" => Dict{String,Any}(
                         "source" => transfer_entry === nothing ? "cma_population" : "predecessor_archive",
-                        "predecessor_archive_entry" => transfer_entry === nothing ? nothing : get(transfer_entry, "candidate", nothing),
+                        "predecessor_archive_entry" => transfer_entry === nothing ? nothing : archive_entry_id(transfer_entry),
                         "candidate_class" => candidate_class,
                     ),
                 )
+                is_reconstruction_mode(cfg) && persist_family_evaluation!(stage_root, candidate_entry)
                 top_candidates[key] = candidate_entry
                 push!(iteration_top_candidates, candidate_entry)
                 if get(metrics, "status", "failed") == "completed" && isfinite(Float64(score))
@@ -4535,6 +4710,9 @@ function run_stage(
                 append_jsonl(joinpath(stage_root, "iter_metrics.jsonl"), record)
             end
         end
+        family_report = is_reconstruction_mode(cfg) ? persist_family_ledger!(
+            stage_root, Any[], cfg.validation; current_stage=stage.name,
+            current_fit_months=active_months, output_root=cfg.output_dir) : nothing
         isempty(ranked) && error("No completed candidates available for stage $(stage.name) iteration $(iter). Increase max wait or completion fraction.")
         sort!(ranked, by=first)
         @info "Updating CMA state" stage=stage.name iteration=iter completed_candidates=length(ranked) best_iteration_score=ranked[1][1]
@@ -4599,7 +4777,11 @@ function run_stage(
         # resume.  It is replaced only after the iteration has been fully
         # evaluated and is covered by the commit hash manifest.
         safe_save_json(joinpath(stage_root, "top_candidates.json"), iteration_top_payload; label="stage_top_candidates")
-        archive_report = survivor_archive_update(
+        archive_report = is_reconstruction_mode(cfg) ? reconstruction_archive_update(
+            load_family_evaluations(stage_root), cfg.validation;
+            parameter_bounds=[(spec.lower, spec.upper) for spec in specs_stage for _ in 1:spec.length],
+            current_stage=stage.name, current_fit_months=active_months,
+        ) : survivor_archive_update(
             survivor_archive, iteration_top_candidates;
             current_stage=stage.name, current_fit_months=active_months,
             target_size=40, max_size=SURVIVOR_ARCHIVE_SIZE,
@@ -4608,12 +4790,13 @@ function run_stage(
         survivor_archive = archive_report["archive"]
         safe_save_json(archive_path, survivor_archive; label="survivor_archive")
         persist_archive_transfer_manifest(stage_root, survivor_archive;
-            archive_path=archive_path, stage=stage.name, fit_months=active_months)
+            archive_path=archive_path, stage=stage.name, fit_months=active_months,
+            hash_scheme=is_reconstruction_mode(cfg) ? "canonical-json-v1" : "legacy-json-v1")
         safe_save_json(joinpath(stage_root, "survivor_archive_summary.json"),
             archive_report; label="survivor_archive_summary")
         reusable_payload = full_reusable_state_from_cma(stage, specs_stage, state;
             transition_report=stage_transition_report)
-        archive_ids = [get(entry, "candidate", nothing) for entry in survivor_archive]
+        archive_ids = [archive_entry_id(entry) for entry in survivor_archive]
         reusable_payload["historical_trajectory"] = trusted_trajectory
         reusable_payload["trajectory_identity"] = trusted_trajectory["identity"]
         reusable_payload["prefix_hash"] = trusted_prefix_hash
@@ -4635,6 +4818,10 @@ function run_stage(
         committed_stage_state["archive_ids"] = archive_ids
         committed_stage_state["archive_path"] = abspath(archive_path)
         committed_stage_state["archive_lineage"] = reusable_payload["archive_lineage"]
+        if family_report !== nothing
+            committed_stage_state["family_ledger_schema"] = "accepted-families-v1"
+            committed_stage_state["family_evaluation_count"] = family_report["evaluation_count"]
+        end
         safe_save_json(joinpath(stage_root, "stage_state.json"),
             committed_stage_state; label="stage_state_lineage")
         # This is the sole resume authority for an iteration.  It is written
@@ -4648,11 +4835,13 @@ function run_stage(
             joinpath("iter_$(iter)", "cma_sampling_state.json"),
             joinpath("iter_$(iter)", "top_candidates.json"),
         ]
+        family_report !== nothing && push!(committed_artifacts, "accepted_families.json")
         artifact_hashes = Dict{String,Any}(
             relative => bytes2hex(SHA.sha256(read(joinpath(stage_root, relative))))
             for relative in committed_artifacts
         )
-        artifact_digest = bytes2hex(SHA.sha256(JSON.json(artifact_hashes)))
+        hash_scheme = family_report === nothing ? "legacy-json-v1" : "canonical-json-v1"
+        artifact_digest = artifact_manifest_digest(artifact_hashes, hash_scheme)
         atomic_save_json(joinpath(iter_root, "iteration_commit.json"), Dict(
             "status" => "committed",
             "schema_version" => "production-v1",
@@ -4660,6 +4849,7 @@ function run_stage(
             "iteration" => iter,
             "artifact_key_set" => committed_artifacts,
             "artifact_hashes" => artifact_hashes,
+            "artifact_hash_scheme" => hash_scheme,
             "artifact_hash_manifest" => artifact_digest,
             "artifact_integrity_digest" => artifact_digest,
         ); label="iteration_commit")
@@ -4741,7 +4931,9 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
             archive_summary = get(result, "archive_summary", nothing)
             archive_values = get(result, "survivor_archive", Any[])
             archive_summary isa AbstractDict || (archive_summary = Dict{String,Any}())
-            gate = archive_quality_gate(archive_values;
+            gate = is_reconstruction_mode(cfg) ? reconstruction_archive_gate(
+                archive_values, cfg.validation; current_stage=stage.name,
+                current_fit_months=stage.fit_months) : archive_quality_gate(archive_values;
                 current_stage=stage.name, current_fit_months=stage.fit_months,
                 current_best_score=result["best_score"], target_size=40,
                 # These are deliberately external inputs.  The archive's
@@ -4806,12 +4998,12 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
                     posterior_state = posterior_transition["state"]
                     posterior_state["archive_provenance"] = posterior_source === nothing ? nothing :
                         Dict{String,Any}("source_archive_path" => posterior_archive_path,
-                                         "source_archive_entry" => get(posterior_source, "candidate", nothing),
+                                         "source_archive_entry" => archive_entry_id(posterior_source),
                                          "source_stage" => get(posterior_source, "stage", nothing),
                                          "predecessor" => "immediate_admitted_archive")
                     posterior_state["predecessor_provenance"] = posterior_source === nothing ? nothing :
                         Dict{String,Any}("archive_path" => posterior_archive_path,
-                                         "archive_entry_id" => get(posterior_source, "candidate", nothing),
+                                         "archive_entry_id" => archive_entry_id(posterior_source),
                                          "stage" => get(posterior_source, "stage", nothing),
                                          "horizon_months" => get(posterior_source, "fit_months", stage.fit_months))
                     state = build_state_from_reusable(

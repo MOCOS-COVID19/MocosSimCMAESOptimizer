@@ -207,7 +207,8 @@ end
 function _validate_seed_model_inputs(seed::AbstractDict, seed_path::String,
                                      stage_months::Int, monthly_days::Int,
                                      scalar_bounds::AbstractDict,
-                                     temporal_bounds::AbstractDict)
+                                     temporal_bounds::AbstractDict;
+                                     event_mode::Bool=false)
     population_value = _seed_nested(seed, "population_path")
     population_value isa AbstractString ||
         throw(ArgumentError("seed.population_path must be a path string"))
@@ -240,9 +241,9 @@ function _validate_seed_model_inputs(seed::AbstractDict, seed_path::String,
         values isa AbstractVector || throw(ArgumentError("seed.$path must be a vector"))
         times_path = replace(path, r"\.interval_values$" => ".interval_times")
         times = _seed_nested(seed, times_path)
-        times isa AbstractVector && length(times) == length(values) ||
+        times isa AbstractVector && length(times) + (event_mode ? 1 : 0) == length(values) ||
             throw(ArgumentError("seed.$path and $times_path dimensions disagree"))
-        isempty(times) && throw(ArgumentError("seed.$path interval schema is empty"))
+        !event_mode && isempty(times) && throw(ArgumentError("seed.$path interval schema is empty"))
         all(x -> x isa Number && isfinite(Float64(x)) && Float64(x) > 0, times) ||
             throw(ArgumentError("seed.$times_path must contain positive finite days"))
         all(x -> x isa Number && isfinite(Float64(x)), values) ||
@@ -269,6 +270,7 @@ function preflight_config(path::String; readiness::Bool=false)
     isfile(config_path) || throw(ArgumentError("config does not exist: $config_path"))
     raw = load_json(config_path)
     raw isa AbstractDict || throw(ArgumentError("config must be an object"))
+    observation_contract_report(raw)
     base = dirname(config_path)
     for field in ("stages", "scalar_bounds", "temporal_bounds", "objective", "seed_config")
         haskey(raw, field) || throw(ArgumentError("missing required section: $field"))
@@ -291,7 +293,7 @@ function preflight_config(path::String; readiness::Bool=false)
         Int(stage["population_size"]) > 0 || throw(ArgumentError("stages[$i].population_size must be positive"))
         sigma = Float64(stage["sigma"])
         isfinite(sigma) && sigma > 0 || throw(ArgumentError("stages[$i].sigma must be finite and positive"))
-        dimensions[name] = Dict("fit_months"=>Int(stage["fit_months"]),
+        dimensions[name] = Dict{String,Any}("fit_months"=>Int(stage["fit_months"]),
                                 "population_size"=>Int(stage["population_size"]))
     end
     required_horizon_months = maximum(Int(stage["fit_months"]) for stage in stages)
@@ -329,20 +331,40 @@ function preflight_config(path::String; readiness::Bool=false)
                (occursin("immunity", lowercase(k)) ? "immunity_events" : "seed.$k"))
         paths[key] = v
     end
+    event_calendar = load_event_calendar(raw, base)
+    event_mode = !isempty(event_calendar)
+    if event_mode
+        apply_event_calendar!(seed, event_calendar)
+        paths["event_calendar"] = event_calendar["source_path"]
+        for stage in stages
+            days = Int(stage["fit_months"]) * monthly_days
+            counts = Dict(path => 1 + count(t -> t < days, times)
+                          for (path, times) in event_calendar["interval_times_by_parameter"])
+            dimensions[String(stage["name"])]["temporal_coordinates"] = counts
+            dimensions[String(stage["name"])]["active_parameter_count"] = length(scalar_bounds) + sum(values(counts))
+        end
+    end
     model_inputs = _validate_seed_model_inputs(seed, seed_path, first(stages)["fit_months"],
-                                               monthly_days, scalar_bounds, temporal_bounds)
-    for (name, _) in temporal_bounds
-        times_path = replace(String(name), r"\.interval_values$" => ".interval_times")
-        times = _seed_nested(seed, times_path)
-        maximum(Float64.(times)) >= required_horizon_months * monthly_days ||
-            throw(ArgumentError("seed.$times_path does not cover requested horizon " *
-                                string(required_horizon_months * monthly_days) * " days"))
+                                               monthly_days, scalar_bounds, temporal_bounds;
+                                               event_mode=event_mode)
+    if event_mode
+        model_inputs["event_calendar"] = event_calendar
+    else
+        for (name, _) in temporal_bounds
+            times_path = replace(String(name), r"\.interval_values$" => ".interval_times")
+            times = _seed_nested(seed, times_path)
+            maximum(Float64.(times)) >= required_horizon_months * monthly_days ||
+                throw(ArgumentError("seed.$times_path does not cover requested horizon " *
+                                    string(required_horizon_months * monthly_days) * " days"))
+        end
     end
     if haskey(raw, "gt_dir")
         gt_dir = _preflight_path(base, raw["gt_dir"], "gt_dir")
         isdir(gt_dir) || throw(ArgumentError("gt_dir must be a directory"))
         paths["ground_truth"] = gt_dir
         gt_manifest = _validate_gt_dir(gt_dir)
+        observation_report = observation_contract_report(raw, gt_dir)
+        observation_report === nothing || (gt_manifest["observation_contract"] = observation_report)
         if haskey(raw, "data_protocol")
             protocol = raw["data_protocol"]
             protocol isa AbstractDict || throw(ArgumentError("data_protocol must be an object"))
@@ -353,14 +375,20 @@ function preflight_config(path::String; readiness::Bool=false)
             required = String.(get(protocol, "required_metrics", [
                 "daily_detections", "daily_deaths", "daily_hospitalizations"]))
             requested_end = haskey(protocol, "study_end_day") ? Int(protocol["study_end_day"]) : nothing
-            canonical = canonical_data_protocol(gt_dir, day_one;
-                required_metrics=required, study_end_day=requested_end)
             validation = get(raw, "validation", Dict{String,Any}())
-            split = temporal_data_split(Int(canonical["study_end_day"]);
-                validation_days=Int(get(validation, "validation_days", 56)),
-                test_days=Int(get(validation, "test_days", 84)))
+            reconstruction = get(validation, "mode", "") == "reconstruction"
+            metric_files = reconstruction ? merge(CANONICAL_GT_FILES, Dict(
+                "daily_detections" => "daily_age_total_detections.csv",
+                "daily_deaths" => "daily_age_total_deaths.csv")) : CANONICAL_GT_FILES
+            canonical = canonical_data_protocol(gt_dir, day_one;
+                required_metrics=required, study_end_day=requested_end,
+                metric_files=metric_files)
+            split = reconstruction ? stage_data_split(Int(canonical["study_end_day"]), validation) :
+                temporal_data_split(Int(canonical["study_end_day"]);
+                    validation_days=Int(get(validation, "validation_days", 56)),
+                    test_days=Int(get(validation, "test_days", 84)))
             canonical["split"] = split
-            expected = Dict(
+            expected = reconstruction ? Dict{String,Int}() : Dict(
                 "train_end_day" => split["train"]["end_day"],
                 "validation_start_day" => split["validation"]["start_day"],
                 "validation_end_day" => split["validation"]["end_day"],

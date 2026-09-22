@@ -58,17 +58,12 @@ def main():
     modulation = config["infection_modulation"]["params"]
     detection = config["mild_detection_modulation"]["params"]
     tracing = config["tracing_modulation"]["params"]
-    bucket_days = modulation["interval_times"][:26]
-    infection = modulation["interval_values"][:26]
-    detection_values = detection["interval_values"][:26]
-    tracing_values = tracing["interval_values"][:26]
-
     with h5py.File(candidate_dir / "output_daily.jld2", "r") as handle:
         trajectories = [
             np.asarray(handle[key]["daily_detections"], dtype=float).ravel()
             for key in handle.keys()
         ]
-    days = min(180, min(len(values) for values in trajectories))
+    days = min(int(config["stop_simulation_time"]), min(len(values) for values in trajectories))
     gt = load_gt(args.gt_dir / "daily_age_total_detections.csv", days)
     trajectories = [values[:days] for values in trajectories]
     simulation = np.mean(np.asarray(trajectories), axis=0)
@@ -77,14 +72,23 @@ def main():
     fig, axes = plt.subplots(
         4, 1, figsize=(12, 12), gridspec_kw={"height_ratios": [1, 1, 1, 2]}
     )
-    for axis, values, title, color in [
-        (axes[0], infection, "Best infection_modulation", "#1976d2"),
-        (axes[1], detection_values, "Best mild_detection_modulation", "#43a047"),
-        (axes[2], tracing_values, "Best tracing_modulation", "#8e44ad"),
+    for axis, params, title, color in [
+        (axes[0], modulation, "Best infection_modulation", "#1976d2"),
+        (axes[1], detection, "Best mild_detection_modulation", "#43a047"),
+        (axes[2], tracing, "Best tracing_modulation", "#8e44ad"),
     ]:
-        axis.plot(bucket_days, values, marker="o", lw=2, color=color)
-        axis.fill_between(bucket_days, values, alpha=0.15, color=color)
-        axis.set_xlim(0, 182)
+        boundaries = params["interval_times"]
+        values = params["interval_values"]
+        if len(values) != len(boundaries) + 1:
+            raise ValueError("MocosSim interval_values must have one more entry than interval_times")
+        active = 1 + sum(boundary < days for boundary in boundaries)
+        starts = [0] + boundaries[:active - 1]
+        # Output day one starts at simulation t=0; each parameter has its own calendar.
+        plot_days = [start + 1 for start in starts] + [days + 1]
+        plot_values = values[:active] + [values[active - 1]]
+        axis.step(plot_days, plot_values, where="post", lw=2, color=color)
+        axis.fill_between(plot_days, plot_values, step="post", alpha=0.15, color=color)
+        axis.set_xlim(1, days + 1)
         axis.set_ylim(0, 1.05)
         axis.set_ylabel("Raw value")
         axis.set_title(title)

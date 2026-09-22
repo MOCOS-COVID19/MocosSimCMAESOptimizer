@@ -40,8 +40,20 @@ of that stage. Once a stage reaches the frozen test, the predeclared final
 train/validation/test boundaries are used unchanged.
 """
 function stage_data_split(stage_days::Int, validation::AbstractDict)
+    mode = String(get(validation, "mode", "legacy"))
+    mode in ("legacy", "forecast", "reconstruction") || throw(ArgumentError(
+        "validation.mode must be reconstruction or forecast (or absent for legacy profiles)"))
+    if mode == "reconstruction"
+        stage_days > 0 || throw(ArgumentError("a reconstruction stage needs at least one day"))
+        return Dict{String,Any}(
+            "mode" => "reconstruction", "stage_days" => stage_days,
+            "train" => Dict("start_day" => 1, "end_day" => stage_days),
+            # This is an in-sample fit diagnostic, never an unseen holdout.
+            "validation" => Dict("start_day" => 1, "end_day" => stage_days),
+            "validation_is_holdout" => false, "test" => nothing)
+    end
     stage_days > 1 || throw(ArgumentError("a stage needs at least two days"))
-    if !haskey(validation, "stage_validation_days") &&
+    if mode == "legacy" && !haskey(validation, "stage_validation_days") &&
        !haskey(validation, "test_start_day")
         holdout = min(max(Int(get(validation, "holdout_days", 28)), 1), stage_days)
         return Dict{String,Any}(
@@ -113,11 +125,14 @@ function canonical_data_protocol(gt_dir::String, start_date::Date;
                                  required_metrics::Vector{String}=[
                                      "daily_detections", "daily_deaths",
                                      "daily_hospitalizations"],
-                                 study_end_day::Union{Nothing,Int}=nothing)
+                                 study_end_day::Union{Nothing,Int}=nothing,
+                                 metric_files::AbstractDict=CANONICAL_GT_FILES)
     observations = Dict{String,Any}[]
     metric_reports = Dict{String,Any}()
     required_end_days = Int[]
-    for (metric, filename) in sort!(collect(CANONICAL_GT_FILES), by=first)
+    all(haskey(metric_files, metric) for metric in required_metrics) ||
+        throw(ArgumentError("metric_files must declare every required metric"))
+    for (metric, filename) in sort!(collect(metric_files), by=first)
         path = joinpath(gt_dir, filename)
         required = metric in required_metrics
         if !isfile(path)
