@@ -1,23 +1,69 @@
 {
-  "temporal_parameterization": "monthly",
+  "temporal_parameterization": "events",
   "validation": {
-    "mode": "forecast",
-    "enabled": false,
+    "enabled": true,
+    "likelihood_metrics": [
+      "daily_detections",
+      "daily_deaths"
+    ],
+    "likelihood_dispersions": {
+      "daily_detections": 25.0,
+      "daily_deaths": 10.0
+    },
     "stage_validation_days": 28,
-    "adapter_timeout_seconds": 900,
-    "iteration_timeout_seconds": 1200,
-    "seeds": []
+    "validation_days": 56,
+    "test_days": 84,
+    "train_end_day": 760,
+    "validation_start_day": 761,
+    "validation_end_day": 816,
+    "test_start_day": 817,
+    "test_end_day": 900,
+    "frozen_test": true,
+    "adapter_timeout_seconds": 3300,
+    "iteration_timeout_seconds": 14400,
+    "current_quality_band": {
+      "threshold": 1000000.0
+    },
+    "current_minimum_archive_size": 5,
+    "current_diversity_passed": true,
+    "allow_quality_band_reduction": true,
+    "seeds": [
+      42,
+      43,
+      44
+    ]
   },
   "seed_config": "${MOCOSSIM_SEED_CONFIG}",
-  "output_dir": "${MOCOSSIM_SMOKE_OUTPUT}",
+  "output_dir": "./runs/saxony-12m-events-pilot",
   "monthly_days": 30,
   "stages": [
     {
-      "name": "production_smoke_3m",
+      "name": "horizon_3m",
       "fit_months": 3,
-      "max_iterations": 1,
-      "population_size": 2,
-      "sigma": 0.2
+      "max_iterations": 4,
+      "population_size": 16,
+      "sigma": 0.12
+    },
+    {
+      "name": "horizon_6m",
+      "fit_months": 6,
+      "max_iterations": 4,
+      "population_size": 16,
+      "sigma": 0.12
+    },
+    {
+      "name": "horizon_9m",
+      "fit_months": 9,
+      "max_iterations": 4,
+      "population_size": 24,
+      "sigma": 0.12
+    },
+    {
+      "name": "horizon_12m",
+      "fit_months": 12,
+      "max_iterations": 5,
+      "population_size": 24,
+      "sigma": 0.12
     }
   ],
   "scalar_bounds": {
@@ -33,6 +79,23 @@
       0.59,
       0.62
     ]
+  },
+  "scalar_preprocessing": {
+    "transmission_probabilities.school": {
+      "mode": "normalize_to_bounds",
+      "min": 0.05,
+      "max": 0.3
+    },
+    "transmission_probabilities.class": {
+      "mode": "normalize_to_bounds",
+      "min": 0.1,
+      "max": 0.4
+    },
+    "transmission_probabilities.age_coupling_param": {
+      "mode": "normalize_to_bounds",
+      "min": 0.59,
+      "max": 0.62
+    }
   },
   "temporal_bounds": {
     "infection_modulation.params.interval_values": [
@@ -65,7 +128,7 @@
     },
     "top_k": 5,
     "min_completion_fraction": 1.0,
-    "finish_iter_delay": 15,
+    "finish_iter_delay": 0,
     "temporal_jump_weight": 0.5,
     "infection_extrema_weight": 0.1
   },
@@ -105,5 +168,14 @@
     ],
     "day_one_status": "provisional-confirm-against-source-metadata",
     "timezone": "Europe/Berlin"
+  },
+  "event_calendar": "data/saxony_policy_events_2020-09-03_2022-08-31.json",
+  "event_seasonality": {
+    "enabled": true,
+    "applies_to": "out_of_household_contacts",
+    "target_parameter": "infection_modulation.params.interval_values",
+    "summer_reduction": 0.3,
+    "summer_peak": "07-15",
+    "shape": "annual_cosine"
   }
 }

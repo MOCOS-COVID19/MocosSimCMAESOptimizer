@@ -39,6 +39,53 @@ end
     @test O.candidate_selection_score(cfg, 99.0, metrics) == Inf
 end
 
+@testset "protocol mode controls objective days and holdout ranking" begin
+    mktempdir() do root
+        gt_dir = joinpath(root, "gt")
+        mkpath(gt_dir)
+        for name in ("daily_age_total_detections.csv", "daily_hospitalizations.csv",
+                     "daily_age_total_deaths.csv", "sax-scholars-infections-normalized.csv")
+            write(joinpath(gt_dir, name), "day,value\n1,1\n2,1\n3,1\n4,1\n")
+        end
+        daily = joinpath(root, "daily.h5")
+        h5open(daily, "w") do h5
+            grp = create_group(h5, "trajectory_1")
+            for metric in ("daily_detections", "daily_hospitalizations", "daily_deaths")
+                write(grp, metric, [1.0, 1.0, 1.0, 101.0])
+            end
+        end
+        objective = O.ObjectiveConfig(Dict{String,Float64}(
+            "daily_detections" => 1.0, "daily_deaths" => 1.0,
+            "daily_hospitalizations" => 1.0, "weekly_control" => 0.0),
+            1, 1.0, 1, "baseline", 0.0, 0.0)
+        posterior = O.PosteriorConfig(false, "diagonal_gaussian_weekly", 1, 1, 1,
+            0.05, 1.0, 1.0, 1.0, 1.0, 0.0)
+        ext = O.ExternalSimConfig(gt_dir, "julia", root, joinpath(root, "unused.jl"), false)
+        function protocol_config(mode)
+            validation = Dict{String,Any}(
+                "mode" => mode, "enabled" => true, "stage_validation_days" => 1,
+                "rank_on_validation" => true,
+                "validation_metric_weights" => Dict("daily_detections" => 1.0))
+            O.OptimizerConfig("seed", root, 30, O.StageConfig[],
+                Dict{String,Tuple{Float64,Float64}}(), Dict{String,Tuple{Float64,Float64}}(),
+                Dict{String,Dict{String,Any}}(), "monthly", Dict{String,Float64}(),
+                validation, objective, ext, Dict{String,Vector{String}}(), nothing, posterior)
+        end
+        forecast = protocol_config("forecast")
+        reconstruction = protocol_config("reconstruction")
+        forecast_score, forecast_metrics = O.score_from_daily(forecast, daily, 4)
+        reconstruction_score, reconstruction_metrics = O.score_from_daily(reconstruction, daily, 4)
+        @test forecast_metrics["objective_window"] == Dict("start_day" => 1, "end_day" => 3)
+        @test reconstruction_metrics["objective_window"] == Dict("start_day" => 1, "end_day" => 4)
+        @test forecast_score == 0.0
+        @test reconstruction_score > 0.0
+        @test forecast_metrics["validation_window"]["retained_indices"] == [4]
+        @test reconstruction_metrics["validation_window"]["retained_indices"] == collect(1:4)
+        @test O.candidate_selection_score(reconstruction, 7.0,
+            Dict{String,Any}("validation_mean_error" => 1.0)) == 7.0
+    end
+end
+
 @testset "simulator output reset is scoped to one candidate" begin
     root = mktempdir()
     current = joinpath(root, "stage_04", "iter_1", "cand_01")
@@ -226,6 +273,52 @@ end
         @test length(values) == 1
         @test values[1] == 0.0
     end
+end
+
+@testset "final-sum error and trajectory shape remain independent" begin
+    @test O.final_sum_relative_error([1.0, 2.0], [1.0, 2.0]) == 0.0
+    @test O.final_sum_relative_error([2.0, 2.0], [1.0, 1.0]) == 0.5
+    @test O.final_sum_relative_error([2.0, 2.0], [3.0, 3.0]) == 0.5
+    @test O.final_sum_relative_error([0.0, 0.0], [1.0, 2.0]) == 3.0
+
+    mktempdir() do root
+        daily = joinpath(root, "daily.h5")
+        h5open(daily, "w") do h5
+            grp = create_group(h5, "trajectory_1")
+            # Same endpoint total as GT, but clearly shifted in time.
+            write(grp, "daily_detections", [0.0, 0.0, 4.0])
+        end
+        gt = Union{Missing,Float64}[4.0, 0.0, 0.0]
+        @test O.per_trajectory_final_sum_relative_error(
+            daily, "daily_detections", gt, 3) == 0.0
+        @test only(O.cumulative_error_distribution(
+            daily, "daily_detections", gt, 3)) > 0.0
+    end
+end
+
+@testset "final-sum penalty records threshold and weighted contribution" begin
+    objective = O.ObjectiveConfig(Dict{String,Float64}(), 1, 1.0, 1,
+        "baseline", 0.0, 0.0,
+        Dict("daily_detections" => 2.0, "daily_deaths" => 3.0),
+        0.1, 4.0, 2.0)
+    cfg = selection_test_config(Dict{String,Any}())
+    cfg = O.OptimizerConfig(cfg.seed_config, cfg.output_dir, cfg.monthly_days,
+        cfg.stages, cfg.scalar_bounds, cfg.temporal_bounds,
+        cfg.scalar_preprocessing, cfg.temporal_parameterization,
+        cfg.age_population_weights, cfg.validation, objective, cfg.external_sim,
+        cfg.stage_freeze, cfg.initial_state, cfg.posterior)
+    metrics = Dict{String,Any}(
+        "daily_detections_final_sum_relative_error" => 0.05,
+        "daily_deaths_final_sum_relative_error" => 0.30,
+    )
+    score = O.objective_score(cfg, metrics, 0.0, 0.0, 0.0)
+    # detections: 2*0.05; deaths: 3*(0.30 + 4*0.20^2)
+    @test score ≈ 1.48
+    deaths = metrics["effective_metric_manifest"]["daily_deaths_final_sum_relative_error"]
+    @test deaths["raw_error"] == 0.30
+    @test deaths["threshold"] == 0.1
+    @test deaths["excess"] ≈ 0.2
+    @test deaths["objective_contribution"] ≈ 1.38
 end
 
 @testset "daily scoring returns heterogeneous validation diagnostics" begin

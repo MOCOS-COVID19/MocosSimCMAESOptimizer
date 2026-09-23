@@ -13,20 +13,45 @@ using SHA
 const MANAGER_ROOT = abspath(joinpath(@__DIR__, ".."))
 const CURRENT_OPTIMIZER_CONFIG = Ref{Any}(nothing)
 const CMA_SIGMA_MIN = 0.02
-const CMA_SIGMA_MAX = 0.12
+const CMA_SIGMA_MAX = 0.20
 const NEW_TEMPORAL_VARIANCE = 0.04
+
+include("event_calendar.jl")
+"""Return the globally unique identity of one archive evaluation."""
+archive_entry_id(stage, iteration, candidate) = string(stage, ":", iteration, ":", candidate)
+
+"""Read an archive identity, accepting candidate-only artifacts from older runs."""
+function archive_entry_id(entry::AbstractDict)
+    explicit = get(entry, "archive_entry_id", nothing)
+    explicit === nothing || return string(explicit)
+    return string(get(entry, "candidate", get(entry, "id", "")))
+end
+
+function _set_archive_entry_id!(entry::AbstractDict)
+    if !haskey(entry, "archive_entry_id") &&
+       haskey(entry, "stage") && haskey(entry, "iteration") && haskey(entry, "candidate")
+        entry["archive_entry_id"] = archive_entry_id(
+            entry["stage"], entry["iteration"], entry["candidate"])
+    end
+    return entry
+end
 
 export main, run_optimizer, run_long_horizon, run_nuts_from_archive,
        run_nuts_from_stage, posterior_reusable_state, safe_save_json,
        survivor_archive_update, archive_quality_gate, load_transfer_survivor_archive,
-       persist_archive_transfer_manifest, preflight_config, create_candidate_root,
+       evaluate_quality_gates!, append_qualified_candidate_registry!,
+       load_qualified_candidate_registry,
+       persist_archive_transfer_manifest, archive_entry_id, preflight_config, create_candidate_root,
        adapter_failure, candidate_terminal_status, wait_for_iteration_outputs,
        stage_resume_info, materialize_terminal_candidate!, normalized_iteration_result,
+       preserve_incumbent!,
        atomic_save_json, validate_committed_artifacts, load_immediate_predecessor_state,
        canonical_data_protocol, temporal_data_split,
        stage_data_split, negative_binomial_loglikelihood,
        run_production_smoke, validate_simulation_jld2,
-       compare_smoke_manifests
+       compare_smoke_manifests, load_event_calendar, validate_event_calendar,
+       event_change_points, event_calendar_metadata, assert_event_calendar_resume!,
+       seasonal_out_of_household_multiplier, apply_event_seasonality!
 
 struct ExternalSimConfig
     gt_dir::String
@@ -34,6 +59,24 @@ struct ExternalSimConfig
     project_dir::String
     advanced_cli::String
     disable_compiled_modules::Bool
+end
+
+"""Reserve one population slot for the best configuration evaluated so far.
+
+CMA-ES is not elitist: sampling only from its distribution can omit (and, at a
+stage boundary, never evaluate) the incumbent.  The returned index identifies
+the protected slot so callers can record truthful provenance rather than
+mistaking it for an archive transfer or random immigrant.
+"""
+function preserve_incumbent!(candidates, zs, incumbent::AbstractVector)
+    isempty(candidates) && throw(ArgumentError("cannot preserve an incumbent in an empty population"))
+    length(candidates) == length(zs) || throw(ArgumentError("candidate and step populations differ"))
+    slot = length(candidates)
+    length(candidates[slot]) == length(incumbent) ||
+        throw(ArgumentError("incumbent dimension does not match population"))
+    candidates[slot] = Float64.(incumbent)
+    zs[slot] = zeros(Float64, length(incumbent))
+    return slot
 end
 
 struct StageConfig
@@ -52,7 +95,20 @@ struct ObjectiveConfig
     search_policy::String
     temporal_jump_weight::Float64
     infection_extrema_weight::Float64
+    final_sum_weights::Dict{String,Float64}
+    final_sum_tolerance::Float64
+    final_sum_excess_multiplier::Float64
+    final_sum_excess_power::Float64
 end
+
+# Preserve the public constructor used by older reconstruction fixtures;
+# explicit reconstruction configs opt into the new endpoint constraint.
+ObjectiveConfig(weights, top_k, min_completion_fraction, finish_iter_delay,
+                search_policy, temporal_jump_weight, infection_extrema_weight) =
+    ObjectiveConfig(weights, top_k, min_completion_fraction, finish_iter_delay,
+        search_policy, temporal_jump_weight, infection_extrema_weight,
+        Dict("daily_detections" => 0.0, "daily_deaths" => 0.0),
+        0.10, 4.0, 2.0)
 
 struct PosteriorConfig
     enabled::Bool
@@ -85,6 +141,8 @@ struct OptimizerConfig
     initial_state::Union{Nothing,Dict{String,Any}}
     posterior::PosteriorConfig
     runtime_seed::Dict{String,Any}
+    event_calendar::Union{Nothing,EventCalendar}
+    event_seasonality::Dict{String,Any}
 end
 
 # Backwards-compatible constructor for fixture/config callers that do not
@@ -97,6 +155,16 @@ OptimizerConfig(seed_config, output_dir, monthly_days, stages, scalar_bounds,
                     temporal_bounds, scalar_preprocessing, temporal_parameterization,
                     age_population_weights, validation, objective, external_sim,
                     stage_freeze, initial_state, posterior,
+                    Dict{String,Any}(), nothing, Dict{String,Any}())
+
+OptimizerConfig(seed_config, output_dir, monthly_days, stages, scalar_bounds,
+                temporal_bounds, scalar_preprocessing, temporal_parameterization,
+                age_population_weights, validation, objective, external_sim,
+                stage_freeze, initial_state, posterior, runtime_seed, event_calendar) =
+    OptimizerConfig(seed_config, output_dir, monthly_days, stages, scalar_bounds,
+                    temporal_bounds, scalar_preprocessing, temporal_parameterization,
+                    age_population_weights, validation, objective, external_sim,
+                    stage_freeze, initial_state, posterior, runtime_seed, event_calendar,
                     Dict{String,Any}())
 
 const DEFAULT_AGE_POPULATION_WEIGHTS = Dict{String,Float64}(
@@ -747,7 +815,7 @@ function load_immediate_predecessor_state(cfg::OptimizerConfig, stage::StageConf
         expected_fit_months=predecessor.fit_months,
         expected_manifest_path=joinpath(root, "archive_transfer_manifest.json"),
         stage_order=[s.name for s in cfg.stages])
-    archive_ids = [String(get(x, "candidate", get(x, "id", ""))) for x in archive]
+    archive_ids = [archive_entry_id(x) for x in archive]
     prior_ids = get(prior_state, "archive_ids", nothing)
     reusable_ids = get(reusable, "archive_ids", nothing)
     selected_ids = get(reusable, "selected_archive_ids", nothing)
@@ -762,7 +830,7 @@ function load_immediate_predecessor_state(cfg::OptimizerConfig, stage::StageConf
     String(get(lineage, "canonical_archive_path", "")) ==
         abspath(joinpath(root, "survivor_archive.json")) ||
         throw(ArgumentError("trusted predecessor archive lineage path mismatch"))
-    get(lineage, "archive_ids", Any[]) == archive_ids ||
+    string.(get(lineage, "archive_ids", Any[])) == archive_ids ||
         throw(ArgumentError("trusted predecessor archive lineage IDs mismatch"))
     return Dict{String,Any}(
         "stage_state" => prior_state,
@@ -891,6 +959,9 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
         row isa AbstractDict || (push!(contradictions, "non-object iter_metrics row"); continue)
         identity = (String(get(row, "stage", "")), Int(get(row, "iteration", 0)),
             candidate_int(get(row, "candidate", 0)))
+        haskey(row, "archive_entry_id") && archive_entry_id(row) !=
+            archive_entry_id(identity...) &&
+            push!(contradictions, "iter_metrics archive_entry_id mismatch: $identity")
         identity in identities && push!(contradictions, "duplicate iter_metrics identity: $identity")
         push!(identities, identity)
         status_by_id[identity] = String(get(row, "status", ""))
@@ -901,6 +972,9 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
         entry isa AbstractDict || (push!(contradictions, "$label is not an object"); return nothing)
         identity = (String(get(entry, "stage", "")), Int(get(entry, "iteration", 0)),
             candidate_int(get(entry, "candidate", 0)))
+        haskey(entry, "archive_entry_id") && archive_entry_id(entry) !=
+            archive_entry_id(identity...) &&
+            push!(contradictions, "$label archive_entry_id mismatch: $identity")
         identity in identities || push!(contradictions, "$label orphan identity: $identity")
         identity[1] == stage || push!(contradictions, "$label stage mismatch: $identity")
         if require_current_iteration
@@ -939,7 +1013,7 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
     admitted = get(reusable, "archive_ids", Any[])
     admitted isa AbstractVector || push!(contradictions, "reusable state archive_ids is not an array")
     for id in admitted
-        any(string(get(e, "candidate", get(e, "id", ""))) == string(id) for e in archive) ||
+        any(archive_entry_id(e) == string(id) for e in archive) ||
             push!(contradictions, "reusable state references non-admitted archive id: $id")
     end
     counts = Dict("completed" => 0, "failed" => 0, "skipped" => 0, "pending" => 0)
@@ -1006,6 +1080,85 @@ const SURVIVOR_ARCHIVE_SIZE = 200
 const SURVIVOR_MIN_DISTANCE = 0.03
 const SURVIVOR_SCORE_MAD_MULTIPLIER = 2.0
 const SURVIVOR_RELATIVE_SCORE_FLOOR = 0.05
+const QUALITY_GATE_THRESHOLDS = (0.50, 0.30, 0.20, 0.10)
+
+"""Store independent detection/death and trajectory/final-sum quality gates."""
+function evaluate_quality_gates!(metrics::AbstractDict; thresholds=QUALITY_GATE_THRESHOLDS)
+    definitions = (("detections", "trajectory", "daily_detections"),
+        ("detections", "final_sum", "daily_detections_cumulative"),
+        ("deaths", "trajectory", "daily_deaths"),
+        ("deaths", "final_sum", "daily_deaths_cumulative"))
+    gates, achieved = Any[], Float64[]
+    for raw_threshold in thresholds
+        threshold = Float64(raw_threshold)
+        components = Dict{String,Any}()
+        passed = true
+        for (series, kind, metric_name) in definitions
+            value = try Float64(get(metrics, metric_name, Inf)) catch; Inf end
+            component_passed = isfinite(value) && value <= threshold
+            components["$(series)_$(kind)"] = Dict{String,Any}(
+                "metric" => metric_name, "value" => value,
+                "threshold" => threshold, "passed" => component_passed)
+            passed &= component_passed
+        end
+        push!(gates, Dict{String,Any}("threshold" => threshold,
+            "passed" => passed, "components" => components))
+        passed && push!(achieved, threshold)
+    end
+    result = Dict{String,Any}("schema_version" => "quality-gates-v1",
+        "gates" => gates, "achieved_levels" => achieved,
+        "best_level" => isempty(achieved) ? nothing : minimum(achieved))
+    metrics["quality_gates"] = result
+    return result
+end
+
+function load_qualified_candidate_registry(path::String)
+    isfile(path) || return Any[]
+    rows = Any[]
+    for line in eachline(path)
+        isempty(strip(line)) || push!(rows, JSON.parse(line))
+    end
+    return rows
+end
+
+"""Append each newly qualified archive identity; existing rows are immutable."""
+function append_qualified_candidate_registry!(path::String, entries;
+        seeds=Any[], data_hash=nothing, calendar_hash=nothing)
+    existing = load_qualified_candidate_registry(path)
+    seen = Set(string(get(row, "archive_entry_id", "")) for row in existing)
+    appended = Any[]
+    for source in entries
+        source isa AbstractDict || continue
+        entry = deepcopy(source)
+        raw_metrics = get(entry, "metrics", Dict{String,Any}())
+        metrics = raw_metrics isa AbstractDict && haskey(raw_metrics, "metrics") ?
+            raw_metrics["metrics"] : raw_metrics
+        metrics isa AbstractDict || continue
+        gates = haskey(metrics, "quality_gates") ? metrics["quality_gates"] :
+            evaluate_quality_gates!(metrics)
+        levels = get(gates, "achieved_levels", Any[])
+        isempty(levels) && continue
+        identity = Dict("stage" => get(entry, "stage", nothing),
+            "iteration" => get(entry, "iteration", nothing),
+            "candidate" => get(entry, "candidate", nothing),
+            "evaluated_vector" => get(entry, "evaluated_vector", Any[]))
+        id = string(get(entry, "archive_entry_id",
+            bytes2hex(SHA.sha256(JSON.json(identity)))))
+        id in seen && continue
+        entry["archive_entry_id"] = id
+        entry["achieved_quality_levels"] = deepcopy(levels)
+        entry["quality_gates"] = deepcopy(gates)
+        entry["parameters"] = deepcopy(get(entry, "evaluated_vector", Any[]))
+        entry["used_seeds"] = deepcopy(get(entry, "used_seeds", seeds))
+        entry["horizon"] = get(entry, "fit_months", get(entry, "effective_scoring_horizon", nothing))
+        entry["data_hash"] = get(entry, "data_hash", data_hash)
+        entry["calendar_hash"] = get(entry, "calendar_hash", calendar_hash)
+        entry["registered_at"] = string(Dates.now())
+        append_jsonl(path, entry)
+        push!(seen, id); push!(appended, entry)
+    end
+    return appended
+end
 
 function archive_metric(entry::AbstractDict, name::String)
     metrics = get(entry, "metrics", Dict{String,Any}())
@@ -1119,13 +1272,14 @@ function survivor_archive_update(existing, entries;
         reason = _archive_rejection_reason(entry;
             current_stage=current_stage, current_fit_months=current_fit_months)
         reason !== nothing && (rejected[reason] = get(rejected, reason, 0) + 1; continue)
-        id = string(get(entry, "candidate", get(entry, "id", "")))
+        archived_entry = _set_archive_entry_id!(deepcopy(entry))
+        id = archive_entry_id(archived_entry)
         if !isempty(id) && id in seen
             rejected["duplicate"] = get(rejected, "duplicate", 0) + 1
             continue
         end
         !isempty(id) && push!(seen, id)
-        push!(pool, deepcopy(entry))
+        push!(pool, archived_entry)
     end
     isempty(pool) && return return_report ? Dict{String,Any}(
         "archive" => Any[], "archive_count" => 0, "configured_target" => target_size,
@@ -1283,7 +1437,7 @@ function persist_archive_transfer_manifest(stage_root::String, archive;
                                            stage::Union{Nothing,String}=nothing,
                                            fit_months::Union{Nothing,Int}=nothing)
     values = archive isa AbstractVector ? collect(archive) : Any[]
-    ids = [string(get(x, "candidate", get(x, "id", ""))) for x in values if x isa AbstractDict]
+    ids = [archive_entry_id(x) for x in values if x isa AbstractDict]
     payload_hash = _archive_payload_hash(values)
     source = stage === nothing ? basename(stage_root) : stage
     manifest = Dict{String,Any}(
@@ -1417,12 +1571,14 @@ function load_transfer_survivor_archive(output_dir::String, current_stage::Strin
             return reject("expected_horizon_mismatch")
         manifest["admitted_ids"] isa AbstractVector || return reject("admitted_ids_invalid")
         manifest["admitted_order"] isa AbstractVector || return reject("admitted_order_invalid")
-        all(x -> x isa AbstractString && !isempty(x), manifest["admitted_ids"]) ||
+        valid_legacy_id(x) = (x isa AbstractString && !isempty(x)) ||
+            (x isa Integer && !(x isa Bool))
+        all(valid_legacy_id, manifest["admitted_ids"]) ||
             return reject("admitted_ids_invalid")
-        all(x -> x isa AbstractString && !isempty(x), manifest["admitted_order"]) ||
+        all(valid_legacy_id, manifest["admitted_order"]) ||
             return reject("admitted_order_invalid")
-        admitted_ids = String.(manifest["admitted_ids"])
-        admitted_order = String.(manifest["admitted_order"])
+        admitted_ids = string.(manifest["admitted_ids"])
+        admitted_order = string.(manifest["admitted_order"])
         admitted_ids == admitted_order || return reject("admitted_order_mismatch")
         length(unique(admitted_ids)) == length(admitted_ids) ||
             return reject("duplicate_admitted_ids")
@@ -1432,8 +1588,15 @@ function load_transfer_survivor_archive(output_dir::String, current_stage::Strin
         all(x -> x isa AbstractDict, values) || return reject("malformed_archive")
         payload_ids = String[]
         for x in values
-            haskey(x, "candidate") || haskey(x, "id") || return reject("archive_id_missing")
-            id = haskey(x, "candidate") ? x["candidate"] : x["id"]
+            haskey(x, "archive_entry_id") || haskey(x, "candidate") || haskey(x, "id") ||
+                return reject("archive_id_missing")
+            id = archive_entry_id(x)
+            if haskey(x, "archive_entry_id")
+                all(haskey(x, key) for key in ("stage", "iteration", "candidate")) ||
+                    return reject("archive_entry_identity_incomplete")
+                id == archive_entry_id(x["stage"], x["iteration"], x["candidate"]) ||
+                    return reject("archive_entry_identity_mismatch")
+            end
             (id isa AbstractString || id isa Integer) || return reject("archive_id_invalid")
             id isa AbstractString && isempty(id) && return reject("archive_id_invalid")
             push!(payload_ids, String(id))
@@ -1472,7 +1635,7 @@ function stage_vector_from_config(seed::AbstractDict, cfg::AbstractDict,
                                   specs_stage::Vector{ParamSpec})
     projected = deepcopy(cfg isa Dict{String,Any} ? cfg : Dict{String,Any}(cfg))
     if CURRENT_OPTIMIZER_CONFIG[] !== nothing &&
-       CURRENT_OPTIMIZER_CONFIG[].temporal_parameterization == "monthly"
+       CURRENT_OPTIMIZER_CONFIG[].temporal_parameterization in ("monthly", "events")
         for spec in specs_stage
             spec.kind == :temporal || continue
             times_path = replace(spec.name, "interval_values" => "interval_times")
@@ -1501,7 +1664,17 @@ function stage_vector_to_config(seed::AbstractDict, cfg::AbstractDict,
             idx += 1
         else
             current = collect(Float64.(get_nested(effective_cfg, spec.name)))
-            if optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
+            if optcfg !== nothing && optcfg.temporal_parameterization == "events"
+                times_path = replace(spec.name, "interval_values" => "interval_times")
+                interval_times = try get_nested(effective_cfg, times_path) catch; get_nested(seed_dict, times_path); end
+                points = event_change_points(optcfg.event_calendar, event_category_for_parameter(spec.name))
+                for i in eachindex(current)
+                    bucket = findlast(p -> p.day <= Int(ceil(Float64(interval_times[min(i,length(interval_times))]))), points)
+                    bucket === nothing || (spec.offset <= bucket < spec.offset + spec.length &&
+                        (current[i] = values[idx + bucket - spec.offset]))
+                end
+                idx += spec.length
+            elseif optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
                 times_path = replace(spec.name, "interval_values" => "interval_times")
                 interval_times = try get_nested(effective_cfg, times_path) catch
                     get_nested(seed_dict, times_path)
@@ -1682,7 +1855,7 @@ function enforce_posterior_reusable_state(
     report["active_months"] = active_months
     report["source_provenance"] = source_entry isa AbstractDict ?
         Dict{String,Any}(
-            "archive_entry_id" => get(source_entry, "candidate", nothing),
+            "archive_entry_id" => archive_entry_id(source_entry),
             "source_stage" => get(source_entry, "stage", nothing),
             "source_fit_months" => get(source_entry, "fit_months", nothing),
         ) :
@@ -1938,6 +2111,10 @@ function load_config(path::String)
     raw["output_dir"] = isabspath(output_value) ? output_value :
         normpath(joinpath(config_dir, output_value))
     stages = [StageConfig(s["name"], s["fit_months"], s["max_iterations"], s["population_size"], float(s["sigma"])) for s in raw["stages"]]
+    for stage in stages
+        isfinite(stage.sigma) && CMA_SIGMA_MIN <= stage.sigma <= CMA_SIGMA_MAX ||
+            throw(ArgumentError("stage $(stage.name) sigma $(stage.sigma) is outside the optimizer-supported range [$(CMA_SIGMA_MIN), $(CMA_SIGMA_MAX)]"))
+    end
     scalar_bounds = Dict(k => (float(v[1]), float(v[2])) for (k, v) in raw["scalar_bounds"])
     temporal_bounds = Dict(k => (float(v[1]), float(v[2])) for (k, v) in raw["temporal_bounds"])
     scalar_preprocessing = Dict{String,Dict{String,Any}}()
@@ -1946,6 +2123,23 @@ function load_config(path::String)
             scalar_preprocessing[String(k)] = Dict(String(kk) => vv for (kk, vv) in v)
         end
     end
+    final_sum_raw = get(raw["objective"], "final_sum_penalty", Dict{String,Any}())
+    final_sum_weights_raw = get(final_sum_raw, "weights", Dict(
+        "daily_detections" => 1.0, "daily_deaths" => 1.0))
+    final_sum_weights = Dict(String(k) => float(v) for (k, v) in final_sum_weights_raw)
+    all(k -> k in ("daily_detections", "daily_deaths"), keys(final_sum_weights)) ||
+        throw(ArgumentError("objective.final_sum_penalty.weights supports only daily_detections and daily_deaths"))
+    any(v -> !isfinite(v) || v < 0.0, values(final_sum_weights)) &&
+        throw(ArgumentError("objective.final_sum_penalty.weights must be nonnegative and finite"))
+    final_sum_tolerance = float(get(final_sum_raw, "tolerance", 0.10))
+    final_sum_multiplier = float(get(final_sum_raw, "excess_multiplier", 4.0))
+    final_sum_power = float(get(final_sum_raw, "excess_power", 2.0))
+    isfinite(final_sum_tolerance) && final_sum_tolerance >= 0.0 ||
+        throw(ArgumentError("objective.final_sum_penalty.tolerance must be nonnegative and finite"))
+    isfinite(final_sum_multiplier) && final_sum_multiplier >= 0.0 ||
+        throw(ArgumentError("objective.final_sum_penalty.excess_multiplier must be nonnegative and finite"))
+    isfinite(final_sum_power) && final_sum_power > 1.0 ||
+        throw(ArgumentError("objective.final_sum_penalty.excess_power must be finite and greater than one"))
     objective = ObjectiveConfig(
         Dict(k => float(v) for (k, v) in raw["objective"]["weights"]),
         Int(get(raw["objective"], "top_k", 1)),
@@ -1954,6 +2148,10 @@ function load_config(path::String)
         String(get(raw["objective"], "search_policy", "baseline")),
         float(get(raw["objective"], "temporal_jump_weight", 0.2)),
         float(get(raw["objective"], "infection_extrema_weight", 0.1)),
+        final_sum_weights,
+        final_sum_tolerance,
+        final_sum_multiplier,
+        final_sum_power,
     )
     posterior_raw = get(raw, "posterior", Dict{String,Any}())
     posterior = PosteriorConfig(
@@ -1999,12 +2197,26 @@ function load_config(path::String)
     validation = haskey(raw, "validation") ?
         Dict(String(k) => v for (k, v) in raw["validation"]) :
         Dict{String,Any}("enabled" => true, "holdout_days" => 28, "seeds" => [42, 43, 44])
+    validation_mode = String(get(validation, "mode", "legacy"))
+    validation_mode in ("legacy", "reconstruction", "forecast") ||
+        error("validation.mode must be reconstruction or forecast")
     temporal_parameterization = String(get(raw, "temporal_parameterization", "monthly"))
-    temporal_parameterization in ("weekly", "monthly") ||
+    temporal_parameterization in ("weekly", "monthly", "events") ||
         error("Unsupported temporal_parameterization: $(temporal_parameterization)")
     runtime_seed = load_json(raw["seed_config"])
     _normalize_seed_paths!(runtime_seed, dirname(raw["seed_config"]))
-    return OptimizerConfig(raw["seed_config"], raw["output_dir"], Int(raw["monthly_days"]), stages, scalar_bounds, temporal_bounds, scalar_preprocessing, temporal_parameterization, age_population_weights, validation, objective, external_sim, stage_freeze, initial_state, posterior, runtime_seed)
+    calendar = if temporal_parameterization == "events"
+        haskey(raw, "event_calendar") || error("event_calendar is required for event parameterization")
+        value = _expand_environment_variables(String(raw["event_calendar"]), "event_calendar")
+        load_event_calendar(isabspath(value) ? value : normpath(joinpath(config_dir, value)))
+    else
+        nothing
+    end
+    seasonality = Dict{String,Any}(String(k)=>v for (k,v) in get(raw, "event_seasonality", Dict{String,Any}()))
+    temporal_parameterization == "events" && validate_event_seasonality(seasonality)
+    temporal_parameterization != "events" && Bool(get(seasonality, "enabled", false)) &&
+        throw(ArgumentError("event_seasonality requires temporal_parameterization=events"))
+    return OptimizerConfig(raw["seed_config"], raw["output_dir"], Int(raw["monthly_days"]), stages, scalar_bounds, temporal_bounds, scalar_preprocessing, temporal_parameterization, age_population_weights, validation, objective, external_sim, stage_freeze, initial_state, posterior, runtime_seed, calendar, seasonality)
 end
 
 function scalar_preprocessing_entry(cfg::OptimizerConfig, spec::ParamSpec)
@@ -2104,7 +2316,14 @@ function build_specs(seed::Dict{String,Any}, cfg::OptimizerConfig)
     end
     for (name, (lo, hi)) in sort(collect(cfg.temporal_bounds), by=first)
         arr = get_nested(seed, name)
-        push!(specs, ParamSpec(name, :temporal, length(arr), lo, hi))
+        length_ = if cfg.temporal_parameterization == "events"
+            category = event_category_for_parameter(name)
+            category === nothing && throw(ArgumentError("no event category mapping for temporal parameter $name"))
+            length(event_change_points(cfg.event_calendar, category))
+        else
+            length(arr)
+        end
+        push!(specs, ParamSpec(name, :temporal, length_, lo, hi))
     end
     return specs
 end
@@ -2157,7 +2376,15 @@ function initial_vector(seed::Dict{String,Any}, specs::Vector{ParamSpec})
             val = optcfg === nothing ? float(current) : encode_scalar_value(optcfg, seed, spec, current)
             push!(values, val)
         else
-            if optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
+            if optcfg !== nothing && optcfg.temporal_parameterization == "events"
+                interval_times = get_nested(seed, replace(spec.name, "interval_values" => "interval_times"))
+                points = event_change_points(optcfg.event_calendar, event_category_for_parameter(spec.name))
+                for bucket in spec.offset:(spec.offset + spec.length - 1)
+                    day = points[bucket].day
+                    source_idx = findlast(t -> Float64(t) <= day, interval_times)
+                    push!(values, source_idx === nothing ? (isempty(current) ? 0.5 : float(current[1])) : float(current[min(source_idx, length(current))]))
+                end
+            elseif optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
                 interval_times = get_nested(seed, replace(spec.name, "interval_values" => "interval_times"))
                 validate_interval_times(interval_times)
                 for month in spec.offset:(spec.offset + spec.length - 1)
@@ -2210,7 +2437,10 @@ function clip!(x::Vector{Float64}, specs::Vector{ParamSpec})
 end
 
 function temporal_active_length(seed::Dict{String,Any}, spec::ParamSpec, active_months::Int, cfg::OptimizerConfig)
-    if cfg.temporal_parameterization == "monthly"
+    if cfg.temporal_parameterization == "events"
+        points = event_change_points(cfg.event_calendar, event_category_for_parameter(spec.name))
+        return count(p -> p.day <= active_months * cfg.monthly_days, points)
+    elseif cfg.temporal_parameterization == "monthly"
         return min(active_months, spec.length)
     end
     active_days = active_months * cfg.monthly_days
@@ -2228,7 +2458,11 @@ end
 
 function temporal_bucket_day_ranges(seed::Dict{String,Any}, spec::ParamSpec, active_months::Int, cfg::OptimizerConfig)
     active_days = active_months * cfg.monthly_days
-    if cfg.temporal_parameterization == "monthly"
+    if cfg.temporal_parameterization == "events"
+        points = event_change_points(cfg.event_calendar, event_category_for_parameter(spec.name))
+        active = [p.day for p in points if p.day <= active_days]
+        return [(day, (i == length(active) ? active_days : active[i+1]-1)) for (i,day) in enumerate(active)]
+    elseif cfg.temporal_parameterization == "monthly"
         return [
             ((month - 1) * cfg.monthly_days + 1, min(month * cfg.monthly_days, active_days))
             for month in 1:min(spec.length, active_months)
@@ -2269,7 +2503,19 @@ function vector_to_config(seed::Dict{String,Any}, specs::Vector{ParamSpec}, x::V
             else
                 min(spec.length, temporal_active_length(seed, spec, active_months, optcfg))
             end
-            if optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
+            if optcfg !== nothing && optcfg.temporal_parameterization == "events"
+                interval_times = get_nested(seed, replace(spec.name, "interval_values" => "interval_times"))
+                points = event_change_points(optcfg.event_calendar, event_category_for_parameter(spec.name))
+                active == 0 && (idx += spec.length; continue)
+                for i in eachindex(current)
+                    day = Int(ceil(Float64(interval_times[min(i, length(interval_times))])))
+                    bucket = findlast(p -> p.day <= day, points)
+                    bucket === nothing && continue
+                    (bucket < spec.offset || bucket >= spec.offset + active) && continue
+                    current[i] = x[idx + bucket - spec.offset]
+                end
+                idx += spec.length
+            elseif optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
                 interval_times = get_nested(seed, replace(spec.name, "interval_values" => "interval_times"))
                 isempty(interval_times) || validate_interval_times(interval_times)
                 active == 0 && (idx += spec.length; continue)
@@ -2299,6 +2545,9 @@ function vector_to_config(seed::Dict{String,Any}, specs::Vector{ParamSpec}, x::V
             set_nested!(cfg, spec.name, current)
         end
     end
+    optcfg !== nothing && optcfg.temporal_parameterization == "events" &&
+        apply_event_seasonality!(cfg, optcfg.event_calendar, optcfg.event_seasonality,
+                                 active_months * monthly_days)
     return cfg
 end
 
@@ -2711,10 +2960,37 @@ function per_trajectory_cumulative_error(daily_path::String, metric::String, gt_
         isempty(gg) && continue
         gc = cumulative_series(gg)
         sc = cumulative_series(ss)
-        push!(vals, abs(last(sc) - last(gc)) / max(abs(last(gc)), 1.0))
+        # This term measures the entire cumulative curve, not merely its last
+        # point.  Endpoint agreement therefore cannot hide a time-shifted fit.
+        push!(vals, rmae_series(sc, gc))
     end
     isempty(vals) && return Inf
     return sum(vals) / length(vals)
+end
+
+"""Relative endpoint-total error with a denominator safe for zero GT totals."""
+function final_sum_relative_error(gt::AbstractVector{<:Real}, sim::AbstractVector{<:Real})
+    gt_total = sum(Float64.(gt))
+    sim_total = sum(Float64.(sim))
+    return abs(gt_total - sim_total) / max(abs(gt_total), 1.0)
+end
+
+function per_trajectory_final_sum_relative_error(daily_path::String, metric::String,
+        gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int)
+    trajs = read_daily_metric(daily_path, metric)
+    trajs === nothing && return Inf
+    errors = Float64[]
+    for traj in trajs
+        g, s, _ = paired_observations(gt_series, traj, days)
+        isempty(g) || push!(errors, final_sum_relative_error(g, s))
+    end
+    return isempty(errors) ? Inf : mean(errors)
+end
+
+function final_sum_penalty(cfg::ObjectiveConfig, raw_error::Real)
+    error = Float64(raw_error)
+    excess = max(error - cfg.final_sum_tolerance, 0.0)
+    return error + cfg.final_sum_excess_multiplier * excess^cfg.final_sum_excess_power
 end
 
 function per_trajectory_blocked_cumulative_error(
@@ -3155,7 +3431,7 @@ function cumulative_error_distribution(daily_path::String, metric::String, gt_se
         isempty(g) && continue
         gc = cumulative_series(g)
         sc = cumulative_series(s)
-        push!(vals, abs(last(sc) - last(gc)) / max(abs(last(gc)), 1.0))
+        push!(vals, rmae_series(sc, gc))
     end
     return vals
 end
@@ -3168,7 +3444,7 @@ function cumulative_metric_values(daily_path::String, metric::String, gt_series:
         g, s, _ = paired_observations(gt_series, traj, days)
         isempty(g) && continue
         gc, sc = cumulative_series(g), cumulative_series(s)
-        push!(vals, abs(last(sc) - last(gc)) / max(abs(last(gc)), 1.0))
+        push!(vals, rmae_series(sc, gc))
     end
     return vals
 end
@@ -3391,11 +3667,16 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     # Validation carries structured diagnostics (window, retained indices,
     # and per-metric scores), so keep the score manifest heterogeneous.
     metrics = Dict{String,Any}()
+    metrics["protocol_mode"] = windows["protocol_mode"]
+    metrics["objective_window"] = copy(windows["train"])
     for (metric, gtvals) in gt
         isempty(gtvals) && continue
         metrics[metric] = per_trajectory_rmae(daily_path, metric, drop_missing(gtvals), training_days)
         metrics["$(metric)_cumulative"] = per_trajectory_cumulative_error(daily_path, metric, drop_missing(gtvals), training_days)
         metrics["$(metric)_cumulative_blocked"] = per_trajectory_blocked_cumulative_error(daily_path, metric, gtvals, training_days)
+        metric in ("daily_detections", "daily_deaths") &&
+            (metrics["$(metric)_final_sum_relative_error"] =
+                per_trajectory_final_sum_relative_error(daily_path, metric, gtvals, training_days))
     end
     metrics["weekly_control_score"] = weekly_control
     jump_penalty = temporal_jump_penalty(cfg, candidate)
@@ -3409,6 +3690,7 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     validation = validation_score_from_daily(cfg, daily_path, days)
     metrics["validation_mean_error"] = Float64(get(validation, "mean_error", Inf))
     metrics["validation_window"] = validation
+    evaluate_quality_gates!(metrics)
     return objective_score(cfg, metrics, weekly_control, jump_penalty, extrema_penalty), metrics
 end
 
@@ -3423,11 +3705,16 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int, c
     # The validation window is a structured diagnostic, not a scalar metric.
     # A heterogeneous payload prevents assigning it to a Float64-only dict.
     metrics = Dict{String,Any}()
+    metrics["protocol_mode"] = windows["protocol_mode"]
+    metrics["objective_window"] = copy(windows["train"])
     for (metric, gtvals) in gt
         isempty(gtvals) && continue
         metrics[metric] = per_trajectory_rmae(daily_path, metric, gtvals, training_days)
         metrics["$(metric)_cumulative"] = per_trajectory_cumulative_error(daily_path, metric, gtvals, training_days)
         metrics["$(metric)_cumulative_blocked"] = per_trajectory_blocked_cumulative_error(daily_path, metric, gtvals, training_days)
+        metric in ("daily_detections", "daily_deaths") &&
+            (metrics["$(metric)_final_sum_relative_error"] =
+                per_trajectory_final_sum_relative_error(daily_path, metric, gtvals, training_days))
     end
     metrics["weekly_control_score"] = weekly_control
     jump_penalty = candidate === nothing ? 0.0 : temporal_jump_penalty(cfg, candidate)
@@ -3441,6 +3728,7 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int, c
     validation = validation_score_from_daily(cfg, daily_path, days)
     metrics["validation_mean_error"] = Float64(get(validation, "mean_error", Inf))
     metrics["validation_window"] = validation
+    evaluate_quality_gates!(metrics)
     return objective_score(cfg, metrics, weekly_control, jump_penalty, extrema_penalty), metrics
 end
 
@@ -3512,6 +3800,25 @@ function effective_metric_manifest(
         "finite" => isfinite(extrema_penalty),
         "all_missing_policy" => "Inf",
     )
+    for metric in ("daily_detections", "daily_deaths")
+        name = "$(metric)_final_sum_relative_error"
+        weight = get(cfg.objective.final_sum_weights, metric, 0.0)
+        raw = try Float64(get(metrics, name, Inf)) catch; Inf end
+        excess = isfinite(raw) ? max(raw - cfg.objective.final_sum_tolerance, 0.0) : Inf
+        penalized = isfinite(raw) ? final_sum_penalty(cfg.objective, raw) : Inf
+        manifest[name] = Dict(
+            "enabled" => weight > 0.0,
+            "required" => weight > 0.0,
+            "weight" => weight,
+            "source_present" => haskey(metrics, name),
+            "raw_error" => raw,
+            "threshold" => cfg.objective.final_sum_tolerance,
+            "excess" => excess,
+            "penalized_error" => penalized,
+            "objective_contribution" => weight > 0.0 ? weight * penalized : 0.0,
+            "all_missing_policy" => "Inf",
+        )
+    end
     return manifest
 end
 
@@ -3539,6 +3846,17 @@ function objective_score(
     wc_weight = Float64(get(weights, "weekly_control", 1.0))
     wc_weight > 0.0 && !isfinite(weekly_control) && (invalid = true)
     wc_weight > 0.0 && (total += wc_weight * weekly_control)
+    for metric in ("daily_detections", "daily_deaths")
+        weight = get(cfg.objective.final_sum_weights, metric, 0.0)
+        weight <= 0.0 && continue
+        name = "$(metric)_final_sum_relative_error"
+        value = try Float64(get(metrics, name, Inf)) catch; Inf end
+        if !isfinite(value)
+            invalid = true
+        else
+            total += weight * final_sum_penalty(cfg.objective, value)
+        end
+    end
     for (metric, raw_value) in metrics
         metric in keys(OBJECTIVE_METRIC_DEFAULTS) && continue
         metric in ("weekly_control_score", "temporal_jump_penalty",
@@ -3634,6 +3952,8 @@ end
 
 """Choose the CMA ranking loss without discarding the training objective."""
 function candidate_selection_score(cfg::OptimizerConfig, training_score::Real, metrics::AbstractDict)
+    String(get(cfg.validation, "mode", "legacy")) == "reconstruction" &&
+        return Float64(training_score)
     Bool(get(cfg.validation, "rank_on_validation", false)) || return Float64(training_score)
     configured = get(cfg.validation, "selection_objective_weights", nothing)
     if configured !== nothing
@@ -3907,6 +4227,8 @@ function score_candidate(candidate::Dict{String,Any}, cfg::OptimizerConfig, days
     if cfg.external_sim !== nothing
         daily_path = joinpath(workdir, "output_daily.jld2")
         if isfile(daily_path)
+            windows = stage_data_split(days, cfg.validation)
+            objective_days = Int(windows["train"]["end_day"])
             weekly_absolute_errors = Dict{String,Any}()
             weekly_normalized_absolute_errors = Dict{String,Any}()
             weekly_mae = Dict{String,Any}()
@@ -3915,7 +4237,7 @@ function score_candidate(candidate::Dict{String,Any}, cfg::OptimizerConfig, days
             weekly_observations = Dict{String,Any}()
             weekly_predictions = Dict{String,Any}()
             for (metric, gtvals) in load_gt_series(cfg.external_sim.gt_dir)
-                errors = weekly_error_distributions(daily_path, metric, gtvals, days)
+                errors = weekly_error_distributions(daily_path, metric, gtvals, objective_days)
                 weekly_absolute_errors[metric] = errors["absolute_error"]
                 weekly_normalized_absolute_errors[metric] = errors["normalized_absolute_error"]
                 weekly_mae[metric] = errors["mae"]
@@ -3925,7 +4247,7 @@ function score_candidate(candidate::Dict{String,Any}, cfg::OptimizerConfig, days
                 weekly_predictions[metric] = errors["predictions"]
             end
             result["vector_likelihood"] = vector_likelihood_payload(
-                daily_path, load_gt_series(cfg.external_sim.gt_dir), days;
+                daily_path, load_gt_series(cfg.external_sim.gt_dir), objective_days;
                 family=cfg.posterior.likelihood,
                 metric_names=likelihood_metric_names(cfg),
                 dispersions=likelihood_dispersions(cfg),
@@ -4219,6 +4541,7 @@ function append_cma_candidate_record(
         "stage" => stage.name,
         "iteration" => iteration,
         "candidate" => candidate_id,
+        "archive_entry_id" => archive_entry_id(stage.name, iteration, candidate_id),
         "parameter_names" => parameter_names,
         "x_raw" => raw_candidate,
         "x_evaluated" => evaluated_candidate,
@@ -4231,6 +4554,8 @@ function append_cma_candidate_record(
         "simulation_distribution" => Dict(
             "mean" => state.mean,
             "sigma" => state.sigma,
+            "configured_initial_sigma" => stage.sigma,
+            "sigma_limits" => Dict("min" => CMA_SIGMA_MIN, "max" => CMA_SIGMA_MAX),
             "covariance" => state.covariance,
         ),
     ))
@@ -4281,7 +4606,12 @@ function run_stage(
     specs_stage = stage_specs(seed, specs, cfg, stage)
     dim = sum(spec.length for spec in specs_stage)
     stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
+    calendar_metadata = cfg.event_calendar === nothing ? nothing : event_calendar_metadata(cfg.event_calendar; horizon_days=days)
+    calendar_metadata === nothing || (calendar_metadata["seasonality"] = deepcopy(cfg.event_seasonality))
     resume_state = load_stage_state(stage_root)
+    if resume_state !== nothing && cfg.event_calendar !== nothing
+        assert_event_calendar_resume!(resume_state, cfg.event_calendar; seasonality=cfg.event_seasonality)
+    end
     if resume_state !== nothing
         committed_check = validate_committed_artifacts(stage_root, "production-v1")
         committed_check["valid"] ||
@@ -4372,9 +4702,12 @@ function run_stage(
         "fit_months" => active_months,
         "monthly_days" => cfg.monthly_days,
         "simulation_days" => days,
+        "event_calendar" => calendar_metadata,
         "parameter_names" => coordinate_names(specs_stage),
         "population_size" => stage.population_size,
         "max_iterations" => stage.max_iterations,
+        "configured_initial_sigma" => stage.sigma,
+        "sigma_limits" => Dict("min" => CMA_SIGMA_MIN, "max" => CMA_SIGMA_MAX),
         "early_stop" => Dict(
             "min_completion_fraction" => cfg.objective.min_completion_fraction,
             "finish_iter_delay" => cfg.objective.finish_iter_delay,
@@ -4399,6 +4732,7 @@ function run_stage(
     best_candidate = resume_state === nothing ? deepcopy(seed) :
         deepcopy(get(resume_state, "best_candidate_config", seed))
     archive_path = joinpath(stage_root, "survivor_archive.json")
+    registry_path = joinpath(stage_root, "qualified_candidate_registry.jsonl")
     survivor_archive = isfile(archive_path) ? load_json(archive_path) : Any[]
     survivor_archive isa AbstractVector || (survivor_archive = Any[])
     transfer_archive = received_prior ? deepcopy(predecessor_archive) : Any[]
@@ -4413,7 +4747,7 @@ function run_stage(
         state = CMAState(copy(best_vector), sigma_resume, state.covariance, p_c, p_sigma)
     end
     start_iter = max(1, resume_from + 1)
-    @info "Starting stage run" stage=stage.name fit_months=active_months start_iter=start_iter max_iterations=stage.max_iterations population_size=stage.population_size use_slurm=use_slurm search_policy=policy.name
+    @info "Starting stage run" stage=stage.name fit_months=active_months start_iter=start_iter max_iterations=stage.max_iterations population_size=stage.population_size configured_initial_sigma=stage.sigma sigma_min=CMA_SIGMA_MIN sigma_max=CMA_SIGMA_MAX resumed=(resume_state !== nothing) use_slurm=use_slurm search_policy=policy.name
 
     for iter in start_iter:stage.max_iterations
         @info "Starting iteration" stage=stage.name iteration=iter sigma=state.sigma best_score=best_score
@@ -4444,6 +4778,12 @@ function run_stage(
                 end
             end
         end
+        # CMA-ES is non-elitist.  Always evaluate the effective incumbent in a
+        # protected slot, including iteration one where this is the phase seed.
+        # This makes a phase transition monotone under the phase's declared
+        # selection objective instead of silently discarding the predecessor.
+        incumbent_vector = initial_vector(best_candidate, specs_stage)
+        incumbent_candidate_id = preserve_incumbent!(candidates, zs, incumbent_vector)
         iter_root = joinpath(cfg.output_dir, "real_sims", stage.name, "iter_$(iter)")
         mkpath(iter_root)
         # An incomplete iteration is regenerated from its saved CMA state.  Do
@@ -4456,6 +4796,8 @@ function run_stage(
             "param_names" => coordinate_names(specs_stage),
             "mean" => state.mean,
             "sigma" => state.sigma,
+            "configured_initial_sigma" => stage.sigma,
+            "sigma_limits" => Dict("min" => CMA_SIGMA_MIN, "max" => CMA_SIGMA_MAX),
             "covariance" => state.covariance,
             "p_c" => state.p_c,
             "p_sigma" => state.p_sigma,
@@ -4474,14 +4816,16 @@ function run_stage(
                     candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
                     inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
                     inject_temporal_prefix_locks!(candidate_cfg, seed, previous_specs)
-                    transfer_entry = ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
-                    candidate_class = transfer_entry === nothing ? "immigrant/escape" : "archive_transfer"
+                    is_incumbent = ci == incumbent_candidate_id
+                    transfer_entry = !is_incumbent && ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
+                    candidate_class = is_incumbent ? "stage_incumbent" :
+                        (transfer_entry === nothing ? "immigrant/escape" : "archive_transfer")
                     if transfer_entry !== nothing
                         x = archive_vector_for_stage(transfer_entry, specs_stage, x)
                         x, clip_info = clip_candidate(x, specs_stage)
-                        cand_cfg = vector_to_config(seed, specs_stage, x, active_months)
-                        inject_frozen!(cand_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
-                        inject_temporal_prefix_locks!(cand_cfg, seed, previous_specs)
+                        candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
+                        inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
+                        inject_temporal_prefix_locks!(candidate_cfg, seed, previous_specs)
                     end
                     transition = enforce_transition_policy(seed, candidate_cfg, specs_stage, transfer_entry;
                         candidate_class=candidate_class, policy="reject")
@@ -4531,8 +4875,10 @@ function run_stage(
                 cand_cfg = vector_to_config(seed, specs_stage, x, active_months)
                 inject_frozen!(cand_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
                 inject_temporal_prefix_locks!(cand_cfg, seed, previous_specs)
-                transfer_entry = ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
-                candidate_class = transfer_entry === nothing ? "immigrant/escape" : "archive_transfer"
+                is_incumbent = ci == incumbent_candidate_id
+                transfer_entry = !is_incumbent && ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
+                candidate_class = is_incumbent ? "stage_incumbent" :
+                    (transfer_entry === nothing ? "immigrant/escape" : "archive_transfer")
                 if transfer_entry !== nothing
                     x = archive_vector_for_stage(transfer_entry, specs_stage, x)
                     x, clip_info = clip_candidate(x, specs_stage)
@@ -4562,6 +4908,8 @@ function run_stage(
                 elseif isfile(daily_path)
                     combined, comp = score_from_daily(cfg, daily_path, days, cand_cfg)
                     gt = load_gt_series(cfg.external_sim.gt_dir)
+                    windows = stage_data_split(days, cfg.validation)
+                    objective_days = Int(windows["train"]["end_day"])
                     bucket_errors = Dict{String,Any}()
                     weekly_absolute_errors = Dict{String,Any}()
                     weekly_normalized_absolute_errors = Dict{String,Any}()
@@ -4572,12 +4920,12 @@ function run_stage(
                     weekly_predictions = Dict{String,Any}()
                     household = household_readout(daily_path, days)
                     vector_likelihood = vector_likelihood_payload(
-                        daily_path, gt, days; family=cfg.posterior.likelihood,
+                        daily_path, gt, objective_days; family=cfg.posterior.likelihood,
                         metric_names=likelihood_metric_names(cfg),
                         dispersions=likelihood_dispersions(cfg)
                     )
                     for (metric, gtvals) in gt
-                        weekly_errors = weekly_error_distributions(daily_path, metric, gtvals, days)
+                        weekly_errors = weekly_error_distributions(daily_path, metric, gtvals, objective_days)
                         weekly_absolute_errors[metric] = weekly_errors["absolute_error"]
                         weekly_normalized_absolute_errors[metric] = weekly_errors["normalized_absolute_error"]
                         weekly_mae[metric] = weekly_errors["mae"]
@@ -4589,6 +4937,8 @@ function run_stage(
                     metrics_payload = Dict(
                         "schema_version" => "experiment-v1",
                         "experiment_type" => "cma_candidate",
+                        "protocol_mode" => windows["protocol_mode"],
+                        "objective_window" => windows["train"],
                         "score" => combined,
                         "daily_detections" => comp["daily_detections"],
                         "daily_hospitalizations" => comp["daily_hospitalizations"],
@@ -4597,12 +4947,12 @@ function run_stage(
                         "daily_hospitalizations_cumulative" => comp["daily_hospitalizations_cumulative"],
                         "daily_deaths_cumulative" => comp["daily_deaths_cumulative"],
                         "weekly_control_score" => comp["weekly_control_score"],
-                        "daily_detections_per_trajectory" => trajectory_metric_values(daily_path, "daily_detections", gt["daily_detections"], days),
-                        "daily_hospitalizations_per_trajectory" => trajectory_metric_values(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], days),
-                        "daily_deaths_per_trajectory" => trajectory_metric_values(daily_path, "daily_deaths", gt["daily_deaths"], days),
-                        "daily_detections_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_detections", gt["daily_detections"], days),
-                        "daily_hospitalizations_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], days),
-                        "daily_deaths_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_deaths", gt["daily_deaths"], days),
+                        "daily_detections_per_trajectory" => trajectory_metric_values(daily_path, "daily_detections", gt["daily_detections"], objective_days),
+                        "daily_hospitalizations_per_trajectory" => trajectory_metric_values(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], objective_days),
+                        "daily_deaths_per_trajectory" => trajectory_metric_values(daily_path, "daily_deaths", gt["daily_deaths"], objective_days),
+                        "daily_detections_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_detections", gt["daily_detections"], objective_days),
+                        "daily_hospitalizations_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], objective_days),
+                        "daily_deaths_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_deaths", gt["daily_deaths"], objective_days),
                         "weekly_absolute_errors" => weekly_absolute_errors,
                         "weekly_normalized_absolute_errors" => weekly_normalized_absolute_errors,
                         "weekly_mae" => weekly_mae,
@@ -4613,20 +4963,21 @@ function run_stage(
                         "vector_likelihood" => vector_likelihood,
                         "household_infections" => household["household_infections"],
                         "household_infection_rate" => household["household_infection_rate"],
+                        "quality_gates" => comp["quality_gates"],
                         "simulated" => "real",
                     )
                     for spec in specs_stage
                         spec.kind == :temporal || continue
                         bucket_errors[spec.name] = weekly_control_bucket_errors(
-                            daily_path, gt, days, spec, active_months, cfg
+                            daily_path, gt, objective_days, spec, active_months, cfg
                         )
                     end
                     metrics_payload["bucket_errors"] = bucket_errors
                     if haskey(comp, "daily_student_detections")
                         metrics_payload["daily_student_detections"] = comp["daily_student_detections"]
                         metrics_payload["daily_student_detections_cumulative"] = get(comp, "daily_student_detections_cumulative", NaN)
-                        metrics_payload["daily_student_detections_per_trajectory"] = trajectory_metric_values(daily_path, "daily_student_detections", gt["daily_student_detections"], days)
-                        metrics_payload["daily_student_detections_cumulative_per_trajectory"] = cumulative_error_distribution(daily_path, "daily_student_detections", gt["daily_student_detections"], days)
+                        metrics_payload["daily_student_detections_per_trajectory"] = trajectory_metric_values(daily_path, "daily_student_detections", gt["daily_student_detections"], objective_days)
+                        metrics_payload["daily_student_detections_cumulative_per_trajectory"] = cumulative_error_distribution(daily_path, "daily_student_detections", gt["daily_student_detections"], objective_days)
                     end
                     if haskey(comp, "household_infections")
                         metrics_payload["household_infections"] = comp["household_infections"]
@@ -4656,6 +5007,7 @@ function run_stage(
                     "stage" => stage.name,
                     "iteration" => iter,
                     "candidate" => ci,
+                    "archive_entry_id" => archive_entry_id(stage.name, iter, ci),
                     "search_policy" => policy.name,
                     "score" => score,
                     "simulated" => metrics["simulated"],
@@ -4673,6 +5025,7 @@ function run_stage(
                     "stage" => stage.name,
                     "iteration" => iter,
                     "candidate" => ci,
+                    "archive_entry_id" => archive_entry_id(stage.name, iter, ci),
                     "search_policy" => policy.name,
                     "fit_months" => active_months,
                     "score" => score,
@@ -4684,6 +5037,7 @@ function run_stage(
                     "stage" => stage.name,
                     "iteration" => iter,
                     "candidate" => ci,
+                    "archive_entry_id" => archive_entry_id(stage.name, iter, ci),
                     "search_policy" => policy.name,
                     "fit_months" => active_months,
                     "score" => score,
@@ -4694,8 +5048,9 @@ function run_stage(
                     "metrics" => metrics,
                     "transition_delta_report" => transition_report,
                     "provenance" => Dict{String,Any}(
-                        "source" => transfer_entry === nothing ? "cma_population" : "predecessor_archive",
-                        "predecessor_archive_entry" => transfer_entry === nothing ? nothing : get(transfer_entry, "candidate", nothing),
+                        "source" => is_incumbent ? "stage_incumbent" :
+                            (transfer_entry === nothing ? "cma_population" : "predecessor_archive"),
+                        "predecessor_archive_entry" => transfer_entry === nothing ? nothing : archive_entry_id(transfer_entry),
                         "candidate_class" => candidate_class,
                     ),
                 )
@@ -4728,14 +5083,16 @@ function run_stage(
                 candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
                 inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
                 inject_temporal_prefix_locks!(candidate_cfg, seed, previous_specs)
-                transfer_entry = ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
-                candidate_class = transfer_entry === nothing ? "immigrant/escape" : "archive_transfer"
+                is_incumbent = ci == incumbent_candidate_id
+                transfer_entry = !is_incumbent && ci <= length(transfer_archive) ? transfer_archive[ci] : nothing
+                candidate_class = is_incumbent ? "stage_incumbent" :
+                    (transfer_entry === nothing ? "immigrant/escape" : "archive_transfer")
                 if transfer_entry !== nothing
                     x = archive_vector_for_stage(transfer_entry, specs_stage, x)
                     x, clip_info = clip_candidate(x, specs_stage)
-                    cand_cfg = vector_to_config(seed, specs_stage, x, active_months)
-                    inject_frozen!(cand_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
-                    inject_temporal_prefix_locks!(cand_cfg, seed, previous_specs)
+                    candidate_cfg = vector_to_config(seed, specs_stage, x, active_months)
+                    inject_frozen!(candidate_cfg, seed, specs, get(cfg.stage_freeze, stage.name, String[]))
+                    inject_temporal_prefix_locks!(candidate_cfg, seed, previous_specs)
                 end
                 transition = enforce_transition_policy(seed, candidate_cfg, specs_stage, transfer_entry;
                     candidate_class=candidate_class, policy="reject")
@@ -4796,6 +5153,7 @@ function run_stage(
                     "stage" => stage.name,
                     "iteration" => iter,
                     "candidate" => ci,
+                    "archive_entry_id" => archive_entry_id(stage.name, iter, ci),
                     "search_policy" => policy.name,
                     "fit_months" => active_months,
                     "score" => score,
@@ -4806,6 +5164,7 @@ function run_stage(
                     "stage" => stage.name,
                     "iteration" => iter,
                     "candidate" => ci,
+                    "archive_entry_id" => archive_entry_id(stage.name, iter, ci),
                     "search_policy" => policy.name,
                     "fit_months" => active_months,
                     "score" => score,
@@ -4816,8 +5175,9 @@ function run_stage(
                     "metrics" => metrics,
                     "transition_delta_report" => transition_report,
                     "provenance" => Dict{String,Any}(
-                        "source" => transfer_entry === nothing ? "cma_population" : "predecessor_archive",
-                        "predecessor_archive_entry" => transfer_entry === nothing ? nothing : get(transfer_entry, "candidate", nothing),
+                        "source" => is_incumbent ? "stage_incumbent" :
+                            (transfer_entry === nothing ? "cma_population" : "predecessor_archive"),
+                        "predecessor_archive_entry" => transfer_entry === nothing ? nothing : archive_entry_id(transfer_entry),
                         "candidate_class" => candidate_class,
                     ),
                 )
@@ -4833,6 +5193,7 @@ function run_stage(
                 end
                 push!(local_iter_records, Dict(
                     "stage" => stage.name, "iteration" => iter, "candidate" => ci,
+                    "archive_entry_id" => archive_entry_id(stage.name, iter, ci),
                     "status" => get(metrics, "status", "unknown"),
                     "score" => score,
                     "threshold_reached" => false,
@@ -4904,8 +5265,11 @@ function run_stage(
             "param_names" => coordinate_names(specs_stage),
             "search_policy" => policy.name,
             "fit_months" => active_months,
+            "event_calendar" => calendar_metadata,
             "best_score" => best_score,
             "sigma" => state.sigma,
+            "configured_initial_sigma" => stage.sigma,
+            "sigma_limits" => Dict("min" => CMA_SIGMA_MIN, "max" => CMA_SIGMA_MAX),
             "covariance_trace" => tr(state.covariance),
             "covariance" => state.covariance,
             "p_c" => state.p_c,
@@ -4930,8 +5294,19 @@ function run_stage(
         # resume.  It is replaced only after the iteration has been fully
         # evaluated and is covered by the commit hash manifest.
         safe_save_json(joinpath(stage_root, "top_candidates.json"), iteration_top_payload; label="stage_top_candidates")
+        data_hash = cfg.external_sim === nothing ? nothing : bytes2hex(SHA.sha256(join(
+            [bytes2hex(SHA.sha256(read(joinpath(cfg.external_sim.gt_dir, file))))
+             for file in sort(readdir(cfg.external_sim.gt_dir))
+             if isfile(joinpath(cfg.external_sim.gt_dir, file))], ":")))
+        calendar_hash = bytes2hex(SHA.sha256(JSON.json(Dict(
+            "monthly_days" => cfg.monthly_days, "fit_months" => active_months,
+            "simulation_days" => days))))
+        append_qualified_candidate_registry!(registry_path, iteration_top_candidates;
+            seeds=get(cfg.validation, "seeds", [42, 43, 44]),
+            data_hash=data_hash, calendar_hash=calendar_hash)
+        qualified_registry = load_qualified_candidate_registry(registry_path)
         archive_report = survivor_archive_update(
-            survivor_archive, iteration_top_candidates;
+            Any[], qualified_registry;
             current_stage=stage.name, current_fit_months=active_months,
             target_size=40, max_size=SURVIVOR_ARCHIVE_SIZE,
             return_report=true,
@@ -4944,7 +5319,8 @@ function run_stage(
             archive_report; label="survivor_archive_summary")
         reusable_payload = full_reusable_state_from_cma(stage, specs_stage, state;
             transition_report=stage_transition_report)
-        archive_ids = [get(entry, "candidate", nothing) for entry in survivor_archive]
+        archive_ids = [archive_entry_id(entry) for entry in survivor_archive]
+        reusable_payload["event_calendar"] = calendar_metadata
         reusable_payload["historical_trajectory"] = trusted_trajectory
         reusable_payload["trajectory_identity"] = trusted_trajectory["identity"]
         reusable_payload["prefix_hash"] = trusted_prefix_hash
@@ -5161,12 +5537,12 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
                     posterior_state = posterior_transition["state"]
                     posterior_state["archive_provenance"] = posterior_source === nothing ? nothing :
                         Dict{String,Any}("source_archive_path" => posterior_archive_path,
-                                         "source_archive_entry" => get(posterior_source, "candidate", nothing),
+                                         "source_archive_entry" => archive_entry_id(posterior_source),
                                          "source_stage" => get(posterior_source, "stage", nothing),
                                          "predecessor" => "immediate_admitted_archive")
                     posterior_state["predecessor_provenance"] = posterior_source === nothing ? nothing :
                         Dict{String,Any}("archive_path" => posterior_archive_path,
-                                         "archive_entry_id" => get(posterior_source, "candidate", nothing),
+                                         "archive_entry_id" => archive_entry_id(posterior_source),
                                          "stage" => get(posterior_source, "stage", nothing),
                                          "horizon_months" => get(posterior_source, "fit_months", stage.fit_months))
                     state = build_state_from_reusable(

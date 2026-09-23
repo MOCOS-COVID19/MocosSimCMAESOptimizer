@@ -1,6 +1,7 @@
 {
   "temporal_parameterization": "monthly",
   "validation": {
+    "mode": "forecast",
     "enabled": true,
     "likelihood_metrics": [
       "daily_detections",

@@ -375,6 +375,18 @@ function preflight_config(path::String; readiness::Bool=false)
     seed_paths = Dict{String,String}()
     _walk_seed_paths!(seed_paths, seed, "", dirname(seed_path))
     paths = Dict{String,String}("config"=>config_path, "seed_config"=>seed_path)
+    if String(get(raw, "temporal_parameterization", "monthly")) == "events"
+        haskey(raw, "event_calendar") || throw(ArgumentError("event_calendar is required for event parameterization"))
+        calendar_path = _preflight_path(base, raw["event_calendar"], "event_calendar")
+        calendar = load_event_calendar(calendar_path)
+        seasonality = Dict{String,Any}(String(k)=>v for (k,v) in get(raw, "event_seasonality", Dict{String,Any}()))
+        validate_event_seasonality(seasonality)
+        paths["event_calendar"] = calendar.path
+        if haskey(raw, "data_protocol") && haskey(raw["data_protocol"], "day_one")
+            Date(String(raw["data_protocol"]["day_one"])) == calendar.start_date ||
+                throw(ArgumentError("event calendar start date differs from data_protocol.day_one"))
+        end
+    end
     for (k, v) in seed_paths
         key = k == "population_path" ? "population" :
               (occursin("covimod", lowercase(k)) ? "covimod" :

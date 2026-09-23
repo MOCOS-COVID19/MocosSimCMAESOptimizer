@@ -43,6 +43,7 @@ for command in sbatch squeue scancel srun timeout; do
 done
 
 cd "$REPO"
+echo "[INFO] Optimizer checkout: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 [[ "$CONFIG" = /* ]] || CONFIG="$REPO/$CONFIG"
 [[ -f "$REPO/Project.toml" ]] || {
   echo "[ERROR] Optimizer project not found under REPO=$REPO" >&2

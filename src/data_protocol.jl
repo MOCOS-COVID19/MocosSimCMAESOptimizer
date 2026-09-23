@@ -41,11 +41,22 @@ train/validation/test boundaries are used unchanged.
 """
 function stage_data_split(stage_days::Int, validation::AbstractDict)
     stage_days > 1 || throw(ArgumentError("a stage needs at least two days"))
+    protocol_mode = String(get(validation, "mode", "legacy"))
+    protocol_mode in ("legacy", "reconstruction", "forecast") ||
+        throw(ArgumentError("validation.mode must be reconstruction or forecast"))
+    if protocol_mode == "reconstruction"
+        full_window = Dict("start_day" => 1, "end_day" => stage_days)
+        return Dict{String,Any}(
+            "mode" => "reconstruction", "protocol_mode" => protocol_mode,
+            "stage_days" => stage_days, "train" => copy(full_window),
+            "validation" => copy(full_window), "test" => nothing)
+    end
     if !haskey(validation, "stage_validation_days") &&
        !haskey(validation, "test_start_day")
         holdout = min(max(Int(get(validation, "holdout_days", 28)), 1), stage_days)
         return Dict{String,Any}(
-            "mode" => "legacy_diagnostic_holdout", "stage_days" => stage_days,
+            "mode" => "legacy_diagnostic_holdout", "protocol_mode" => protocol_mode,
+            "stage_days" => stage_days,
             "train" => Dict("start_day" => 1, "end_day" => stage_days),
             "validation" => Dict("start_day" => stage_days - holdout + 1,
                                  "end_day" => stage_days),
@@ -60,7 +71,8 @@ function stage_data_split(stage_days::Int, validation::AbstractDict)
         train_end < validation_start <= validation_end < test_start ||
             throw(ArgumentError("final train/validation/test windows overlap or are empty"))
         return Dict{String,Any}(
-            "mode" => "frozen_test", "stage_days" => stage_days,
+            "mode" => "frozen_test", "protocol_mode" => protocol_mode,
+            "stage_days" => stage_days,
             "train" => Dict("start_day" => 1, "end_day" => train_end),
             "validation" => Dict("start_day" => validation_start,
                                  "end_day" => validation_end),
@@ -74,7 +86,8 @@ function stage_data_split(stage_days::Int, validation::AbstractDict)
     validation_days = min(max(requested, 1), stage_days - 1)
     train_end = stage_days - validation_days
     return Dict{String,Any}(
-        "mode" => "rolling_origin", "stage_days" => stage_days,
+        "mode" => "rolling_origin", "protocol_mode" => protocol_mode,
+        "stage_days" => stage_days,
         "train" => Dict("start_day" => 1, "end_day" => train_end),
         "validation" => Dict("start_day" => train_end + 1,
                              "end_day" => stage_days),

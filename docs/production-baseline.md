@@ -72,7 +72,7 @@ provide a first go/no-go signal, not by themselves to establish convergence.
 
 | Setting | Pilot value | Reason |
 |---|---:|---|
-| Initial `sigma` | `0.12` | This is the implementation's maximum sigma component. With an identity covariance it is a 12%-of-range marginal standard deviation; after covariance learning or transfer, the actual coordinate deviation is `sigma[i] * sqrt(covariance[i,i])`. Larger configured values are clamped and are therefore misleading. |
+| Initial `sigma` | `0.12` | This pilot deliberately retains a 12%-of-range marginal standard deviation, although the implementation now permits up to `0.20`. After covariance learning or transfer, the actual coordinate deviation is `sigma[i] * sqrt(covariance[i,i])`. |
 | Scalar preprocessing | normalized to `[0, 1]` | Puts the three scalar ranges on the same coordinate scale as the temporal modulation bounds, so one `sigma` has a consistent interpretation. |
 | Population | `16/16/24/24` | Exceeds the usual small CMA population heuristic for the active 12/21/30/39-dimensional stages while remaining affordable. |
 | Iterations | `4/4/4/5` | Enough for a pilot trend and staged transfer check, but explicitly not a convergence claim. |
@@ -112,7 +112,7 @@ These values must not be read as four independently applied marginal standard
 deviations. On a stage transition, inherited coordinates carry their learned
 sigma/covariance and are expanded by transition settings; new coordinates get
 transition uncertainty. The configured stage sigma participates in floors and
-initialization, and every sigma component is finally clamped to `[0.02, 0.12]`.
+initialization, and every sigma component is finally clamped to `[0.02, 0.20]`.
 Consequently, changing only the later-stage JSON values does not define the
 actual sampling radius.
 

@@ -11,6 +11,7 @@ const ROOT = normpath(joinpath(@__DIR__, ".."))
     @test [s["max_iterations"] for s in raw["stages"]] == [10, 15, 20]
     @test raw["validation"]["active_temporal_tail_months"] == 3
     @test raw["validation"]["rank_on_validation"] == true
+    @test raw["validation"]["mode"] == "forecast"
     @test raw["validation"]["plateau_patience"] == 3
     @test raw["validation"]["require_finite_validation_replicates"] == 3
     @test raw["validation"]["selection_replicate_seeds"] == [43, 44]
@@ -20,14 +21,42 @@ end
 
 @testset "two-phase calibration configuration" begin
     p1 = JSON.parsefile(joinpath(ROOT, "optimizer_config.saxony.phase1-scalars.json"))
+    p1_alt = JSON.parsefile(joinpath(ROOT, "optimizer_config.saxony.phase1-scalars-alternative.json"))
     p2 = JSON.parsefile(joinpath(ROOT, "optimizer_config.saxony.phase2-vectors.json"))
     @test sort(p1["stage_freeze"]["phase1_scalar_6m"]) == sort(collect(keys(p1["temporal_bounds"])))
     @test sort(p2["stage_freeze"]["phase2_vector_6m"]) == sort(collect(keys(p2["scalar_bounds"])))
     @test p2["seed_config"] == "./runs/saxony-corrected-phase1-scalars/final_best_candidate.json"
+    @test p1["stages"][1]["sigma"] == 0.2
+    @test p1_alt["stages"][1]["sigma"] == 0.2
+    @test p1_alt["stages"][1]["fit_months"] == 3
+    @test p1_alt["output_dir"] == "./runs/saxony-corrected-phase1-scalars-3m-alt"
+    @test p1_alt["validation"]["mode"] == "reconstruction"
+    @test p1_alt["validation"]["rank_on_validation"] == false
+    @test p2["stages"][1]["sigma"] == 0.2
+    @test O.CMA_SIGMA_MAX == 0.2
     @test p1["validation"]["selection_objective_weights"] == p2["validation"]["selection_objective_weights"]
     @test isempty(p1["validation"]["selection_replicate_seeds"])
     @test length(p1["validation"]["validation_metric_weights"]) == 14
     @test sum(values(p1["validation"]["validation_metric_weights"])) ≈ 1.0
+end
+
+@testset "configured sigma must fit executable limits" begin
+    raw = JSON.parsefile(joinpath(ROOT, "optimizer_config.saxony.phase1-scalars-alternative.json"))
+    raw["stages"][1]["sigma"] = 0.21
+    mktempdir() do dir
+        path = joinpath(dir, "invalid-sigma.json")
+        open(path, "w") do io
+            JSON.print(io, raw)
+        end
+        withenv(
+            "MOCOSSIM_SEED_CONFIG" => joinpath(ROOT, "seed", "config2.json"),
+            "JULIA_BIN" => joinpath(Sys.BINDIR, Base.julia_exename()),
+            "MOCOSSIM_LAUNCHER_DIR" => ROOT,
+            "MOCOSSIM_ADVANCED_CLI" => joinpath(ROOT, "run_optimizer.jl"),
+        ) do
+            @test_throws ArgumentError O.load_config(path)
+        end
+    end
 end
 
 @testset "tail-only temporal coordinates preserve prefix" begin

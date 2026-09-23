@@ -75,12 +75,12 @@ remain there. Univariate correlations of each scalar with validation and
 cumulative errors are all weak (absolute value at most `0.09`). These are not
 causal sensitivity estimates because all twelve coordinates moved together.
 
-Configured sigma is already the implementation ceiling (`0.12`). At iteration
+For the audited run, configured sigma was the then-used ceiling (`0.12`). At iteration
 8 the normalized coordinate-wise sigmas for `(age coupling, class, school)`
 were `(0.1069, 0.1200, 0.0611)`; several temporal coordinates also remained at
-`0.12`. Raising only the JSON value cannot increase those coordinates while
-the global `CMA_SIGMA_MAX` remains `0.12`, and wider exploration cannot repair
-an objective that rewards the wrong temporal trade-off.
+`0.12`. The ceiling is now `0.20`, and the two-phase configs use it; wider
+exploration still cannot by itself repair an objective that rewards the wrong
+temporal trade-off.
 
 ## Recommended experiment design
 

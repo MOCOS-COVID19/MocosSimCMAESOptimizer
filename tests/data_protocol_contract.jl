@@ -19,6 +19,7 @@ end
 
 @testset "each calibration stage gets its own rolling validation" begin
     validation = Dict{String,Any}(
+        "mode" => "forecast",
         "stage_validation_days" => 28,
         "train_end_day" => 760, "validation_start_day" => 761,
         "validation_end_day" => 816, "test_start_day" => 817,
@@ -36,6 +37,28 @@ end
     @test final["train"]["end_day"] == 760
     @test final["validation"] == Dict("start_day" => 761, "end_day" => 816)
     @test final["test"]["start_day"] == 817
+end
+
+@testset "protocol modes declare exact objective and validation windows" begin
+    reconstruction = O.stage_data_split(180, Dict{String,Any}(
+        "mode" => "reconstruction", "stage_validation_days" => 28,
+        "test_start_day" => 151, "test_end_day" => 180))
+    @test reconstruction["mode"] == "reconstruction"
+    @test reconstruction["train"] == Dict("start_day" => 1, "end_day" => 180)
+    @test reconstruction["validation"] == Dict("start_day" => 1, "end_day" => 180)
+    @test reconstruction["test"] === nothing
+
+    forecast = O.stage_data_split(180, Dict{String,Any}(
+        "mode" => "forecast", "stage_validation_days" => 28,
+        "train_end_day" => 120, "validation_start_day" => 121,
+        "validation_end_day" => 150, "test_start_day" => 151,
+        "test_end_day" => 180))
+    @test forecast["mode"] == "frozen_test"
+    @test forecast["train"] == Dict("start_day" => 1, "end_day" => 120)
+    @test forecast["validation"] == Dict("start_day" => 121, "end_day" => 150)
+    @test forecast["test"] == Dict("start_day" => 151, "end_day" => 180,
+                                     "frozen" => true)
+    @test_throws ArgumentError O.stage_data_split(180, Dict("mode" => "unknown"))
 end
 
 @testset "canonical calendar and data quality" begin

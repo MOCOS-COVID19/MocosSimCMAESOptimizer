@@ -105,6 +105,25 @@ The rolling validation term covers total detections/deaths plus detections and
 deaths for all six age groups. Totals receive 25% each; each family of age-group
 metrics receives 25%, distributed by the configured population shares.
 
+Both phases start with normalized sigma `0.20` (20% of each
+parameter range); the optimizer ceiling is also `0.20`, so this value is not
+silently clamped back to the former `0.12` limit. Incumbent preservation keeps
+the wider initial search from discarding the best configuration already found.
+
+The three-month alternative is checked in as
+`optimizer_config.saxony.phase1-scalars-alternative.json`. Submit it explicitly:
+
+```sh
+sbatch scripts/run_cmaes.slurm optimizer_config.saxony.phase1-scalars-alternative.json
+```
+
+The configured initial sigma only initializes a new CMA state. A run resumed
+in an existing output directory correctly restores its adaptive sigma from
+`stage_state.json`; changing the JSON does not reset that state. Use a fresh
+output directory to start at `0.20`. Startup logs and newly written CMA
+artifacts report both `configured_initial_sigma` and the executable's
+`sigma_limits`, making an old checkout (with the former `0.12` ceiling) visible.
+
 ## Explicitly deferred
 
 The following are **DEFERRED** and are not claimed by the reliable pipeline:

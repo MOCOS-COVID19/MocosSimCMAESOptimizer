@@ -421,3 +421,20 @@ and verify that:
 ```
 
 Adjust weights as needed for your fitting priorities.
+
+## Event-calendar seasonality layer
+
+For `temporal_parameterization = "events"`, the optional `event_seasonality`
+configuration applies a deterministic annual multiplier to
+`infection_modulation.params.interval_values`. This path represents
+out-of-household contact infectivity; household transmission probabilities are
+not modified. The event-optimized value remains the policy/contact baseline and
+is multiplied by a cosine curve whose minimum occurs on `summer_peak`:
+
+```text
+multiplier(day) = 1 - summer_reduction * (1 + cos(2π Δday / 365.2425)) / 2
+```
+
+Consequently, `summer_reduction = 0.30` gives a multiplier of 0.70 at the
+summer peak and approximately 1.00 six months later. The complete seasonal
+configuration is persisted with calendar provenance and must match on resume.

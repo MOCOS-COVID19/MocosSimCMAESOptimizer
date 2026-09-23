@@ -1,7 +1,7 @@
 {
   "temporal_parameterization": "monthly",
   "validation": {
-    "mode": "forecast",
+    "mode": "reconstruction",
     "enabled": true,
     "likelihood_metrics": [
       "daily_detections",
@@ -23,48 +23,57 @@
     "adapter_timeout_seconds": 3300,
     "iteration_timeout_seconds": 14400,
     "current_quality_band": {
-      "threshold": 1000000.0
+      "threshold": 1.0
     },
-    "current_minimum_archive_size": 5,
+    "current_minimum_archive_size": 8,
     "current_diversity_passed": true,
-    "allow_quality_band_reduction": true,
+    "allow_quality_band_reduction": false,
     "seeds": [
       42,
       43,
       44
-    ]
+    ],
+    "active_temporal_tail_months": 3,
+    "rank_on_validation": false,
+    "plateau_patience": 3,
+    "plateau_min_iterations": 6,
+    "plateau_relative_tolerance": 0.01,
+    "optimizer_seed": 42,
+    "require_finite_validation_replicates": 3,
+    "selection_replicate_seeds": [],
+    "selection_standard_error_penalty": 1.0,
+    "selection_objective_weights": {
+      "validation_mean_error": 0.4,
+      "daily_detections_cumulative": 0.3,
+      "daily_deaths_cumulative": 0.3
+    },
+    "validation_metric_weights": {
+      "daily_detections": 0.25,
+      "daily_deaths": 0.25,
+      "daily_age_00_04_detections": 0.01083174086975,
+      "daily_age_00_04_deaths": 0.01083174086975,
+      "daily_age_05_14_detections": 0.02300023596325,
+      "daily_age_05_14_deaths": 0.02300023596325,
+      "daily_age_15_34_detections": 0.047954094507,
+      "daily_age_15_34_deaths": 0.047954094507,
+      "daily_age_35_59_detections": 0.082963537985,
+      "daily_age_35_59_deaths": 0.082963537985,
+      "daily_age_60_79_detections": 0.06223277900925,
+      "daily_age_60_79_deaths": 0.06223277900925,
+      "daily_age_80_plus_detections": 0.02301761166575,
+      "daily_age_80_plus_deaths": 0.02301761166575
+    }
   },
   "seed_config": "${MOCOSSIM_SEED_CONFIG}",
-  "output_dir": "./runs/saxony-12m-pilot",
+  "output_dir": "./runs/saxony-corrected-phase1-scalars-3m-alt",
   "monthly_days": 30,
   "stages": [
     {
-      "name": "horizon_3m",
+      "name": "phase1_scalar_3m",
       "fit_months": 3,
-      "max_iterations": 4,
-      "population_size": 16,
-      "sigma": 0.12
-    },
-    {
-      "name": "horizon_6m",
-      "fit_months": 6,
-      "max_iterations": 4,
-      "population_size": 16,
-      "sigma": 0.12
-    },
-    {
-      "name": "horizon_9m",
-      "fit_months": 9,
-      "max_iterations": 4,
-      "population_size": 24,
-      "sigma": 0.12
-    },
-    {
-      "name": "horizon_12m",
-      "fit_months": 12,
-      "max_iterations": 5,
-      "population_size": 24,
-      "sigma": 0.12
+      "max_iterations": 8,
+      "population_size": 12,
+      "sigma": 0.2
     }
   ],
   "scalar_bounds": {
@@ -94,7 +103,7 @@
     },
     "transmission_probabilities.age_coupling_param": {
       "mode": "normalize_to_bounds",
-      "min": 0.59,
+      "min": 0.58,
       "max": 0.62
     }
   },
@@ -131,7 +140,8 @@
     "min_completion_fraction": 1.0,
     "finish_iter_delay": 0,
     "temporal_jump_weight": 0.5,
-    "infection_extrema_weight": 0.1
+    "infection_extrema_weight": 0.1,
+    "search_policy": "baseline"
   },
   "age_population_weights": {
     "00_04": 0.043326963479,
@@ -169,5 +179,12 @@
     ],
     "day_one_status": "provisional-confirm-against-source-metadata",
     "timezone": "Europe/Berlin"
+  },
+  "stage_freeze": {
+    "phase1_scalar_3m": [
+      "infection_modulation.params.interval_values",
+      "mild_detection_modulation.params.interval_values",
+      "tracing_modulation.params.interval_values"
+    ]
   }
 }

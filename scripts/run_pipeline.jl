@@ -76,8 +76,8 @@ end
 
 function validate_fixture_provenance(stage_root, entries, archive, report, state, reusable)
     contradictions = String[]
-    ids = Set(String(get(x, "candidate", "")) for x in archive)
-    entry_ids = Set(String(get(x, "candidate", "")) for x in entries)
+    ids = Set(O.archive_entry_id(x) for x in archive)
+    entry_ids = Set(O.archive_entry_id(x) for x in entries)
     ids ⊆ entry_ids || push!(contradictions, "archive candidate is absent from metrics")
     Int(get(report, "archive_count", -1)) == length(archive) ||
         push!(contradictions, "selection report archive_count disagrees with archive")
@@ -85,11 +85,11 @@ function validate_fixture_provenance(stage_root, entries, archive, report, state
        sum(values(get(report, "rejected_counts", Dict())))
         push!(contradictions, "selection report rejected_total disagrees with rejected_counts")
     end
-    get(state, "archive_ids", Any[]) == [get(x, "candidate", nothing) for x in archive] ||
+    get(state, "archive_ids", Any[]) == [O.archive_entry_id(x) for x in archive] ||
         push!(contradictions, "stage state archive_ids disagree with archive order")
     get(reusable, "admitted_ids", Any[]) == get(state, "transfer_archive_ids", Any[]) ||
         push!(contradictions, "reusable state admitted_ids disagree with transfer ids")
-    get(reusable, "selected_archive_ids", Any[]) == [get(x, "candidate", nothing) for x in archive] ||
+    get(reusable, "selected_archive_ids", Any[]) == [O.archive_entry_id(x) for x in archive] ||
         push!(contradictions, "reusable state selected_archive_ids disagree with archive")
     for entry in entries
         for field in ("provenance", "score_evidence", "output_paths", "horizon",
@@ -155,7 +155,7 @@ function validate_consumed_trusted_state(stage_root::String,
     String(get(state, "archive_path", "")) == archive_path ||
         error("trusted predecessor archive path mismatch: $expected_stage")
     archive = JSON.parsefile(archive_path)
-    archive_ids = [String(get(x, "candidate", "")) for x in archive]
+    archive_ids = [O.archive_entry_id(x) for x in archive]
     get(state, "archive_ids", Any[]) == archive_ids ||
         error("trusted predecessor archive ordering mismatch: $expected_stage")
     get(reusable, "selected_archive_ids", Any[]) == archive_ids ||
@@ -300,6 +300,7 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
             push!(entries, Dict{String,Any}(
                 "candidate" => id, "status" => "completed",
                 "stage" => stage["name"], "iteration" => 1,
+                "archive_entry_id" => O.archive_entry_id(stage["name"], 1, id),
                 "fit_months" => stage["fit_months"],
                 "requested_horizon" => stage["fit_months"],
                 "effective_scoring_horizon" => stage["fit_months"],
@@ -389,7 +390,7 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
                          label="fixture_stage_gate")
         transfer_ids = incoming_manifest === nothing ? String[] :
             String.(incoming_manifest["admitted_order"])
-        current_ids = [String(x["candidate"]) for x in archive]
+        current_ids = [O.archive_entry_id(x) for x in archive]
         # Transfer records are immutable lineage records.  Add target-stage
         # classification without changing the canonical predecessor archive.
         transfer_archive = [
@@ -398,7 +399,7 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
                 "trajectory_identity" => trajectory_identity,
                 "historical_trajectory" => deepcopy(historical_trajectory),
                 "prefix_hash" => prefix_hash,
-                "admitted_predecessor_id" => get(entry, "candidate", nothing),
+                "admitted_predecessor_id" => O.archive_entry_id(entry),
                 "source_archive_id" => incoming_manifest === nothing ? nothing : incoming_manifest["archive_id"],
                 "locked_intervals" => deepcopy(locked_intervals),
             )) for entry in incoming_archive]
@@ -492,7 +493,7 @@ function run_fixture_pipeline(batch_path::String, base_config::AbstractDict,
             let commit = Dict("status" => "committed", "stage" => stage["name"],
                               "iteration" => 1,
                               "schema_version" => "fixture-v1",
-                              "candidate_ids" => [String(x["candidate"]) for x in entries],
+                              "candidate_ids" => [O.archive_entry_id(x) for x in entries],
                               "artifact_hashes" => artifact_hashes,
                               "artifact_key_set" => committed_files)
                 commit["artifact_hash_manifest"] = fixture_hash_manifest_digest(artifact_hashes)
@@ -583,7 +584,7 @@ function validate_fixture_stage_root(root::String, previous_root::Union{Nothing,
         all(get(state_cma, field, nothing) == get(cma, field, nothing)
             for field in ("parameter_names", "mean", "sigma", "covariance", "p_c", "p_sigma")) ||
         error("fixture stage/reusable CMA state mismatch: $stage")
-    archive_ids = [String(get(x, "candidate", "")) for x in archive]
+    archive_ids = [O.archive_entry_id(x) for x in archive]
     get(state, "archive_ids", Any[]) == archive_ids ||
         error("fixture state/archive IDs disagree: $stage")
     get(reusable, "selected_archive_ids", Any[]) == archive_ids ||
@@ -659,9 +660,9 @@ function reconstruct_fixture_summary(output_root::String)
             "remaining_months" => 0, "stage_root" => root,
             "archive_path" => abspath(joinpath(root, "survivor_archive.json")),
             "archive_manifest_path" => abspath(joinpath(root, "archive_transfer_manifest.json")),
-            "archive_ids" => [String(get(x, "candidate", "")) for x in archive],
+            "archive_ids" => [O.archive_entry_id(x) for x in archive],
             "transfer_archive_ids" => get(state, "transfer_archive_ids", Any[]),
-            "current_archive_ids" => [String(get(x, "candidate", "")) for x in archive],
+            "current_archive_ids" => [O.archive_entry_id(x) for x in archive],
             "selection_report_path" => joinpath(root, "survivor_selection_report.json"),
             "provenance_validation_path" => joinpath(root, "provenance_validation.json"),
             "source_archive_path" => get(state, "source_archive_path", nothing),
@@ -782,9 +783,9 @@ function resume_fixture_pipeline(output_root::String)
         admitted = get(reusable, "admitted_ids", Any[])
         transfer_rows = JSON.parsefile(joinpath(root, "transfer_candidates.json"))
         known_ids = Set{Any}(vcat(
-            [get(entry, "candidate", nothing) for entry in archive],
+            [O.archive_entry_id(entry) for entry in archive],
             transfer_rows isa AbstractVector ?
-                [get(entry, "candidate", nothing) for entry in transfer_rows] : Any[]))
+                [O.archive_entry_id(entry) for entry in transfer_rows] : Any[]))
         all(id in known_ids for id in admitted) ||
             error("fixture reusable state references an unarchived candidate: $name")
         if previous_name !== nothing

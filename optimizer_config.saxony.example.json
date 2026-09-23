@@ -1,6 +1,7 @@
 {
   "temporal_parameterization": "monthly",
   "validation": {
+    "mode": "forecast",
     "enabled": true,
     "stage_validation_days": 28,
     "validation_days": 56,
